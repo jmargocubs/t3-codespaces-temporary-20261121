@@ -298,8 +298,12 @@ struct SearchView: View {
         let isCombined = selectedFilter == .all
         let visibleItems = isCombined ? Array(viewModel.results.prefix(6)) : viewModel.results
         let hasMoreTitles = viewModel.hasMore || viewModel.total > visibleItems.count
-        let contentCount = viewModel.results.count + viewModel.people.count + visibleRequestResults.count
-            + iptvOnlyTitles.count
+        #if os(iOS)
+        let vodCount = iptvOnlyTitles.count
+        #else
+        let vodCount = 0
+        #endif
+        let contentCount = viewModel.results.count + viewModel.people.count + visibleRequestResults.count + vodCount
 
         return VStack(alignment: .leading, spacing: SiloTheme.padding) {
             sectionHeader(
@@ -353,17 +357,13 @@ struct SearchView: View {
         #endif
     }
 
+    #if os(iOS)
     private var iptvOnlyTitles: [UnifiedVODTitle] {
-        #if os(iOS)
         let entries = viewModel.results.filter { $0.type == "movie" || $0.type == "series" }
             .map(UnifiedVODEntry.init(silo:)) + currentVODItems.map(UnifiedVODEntry.init(iptv:))
         return UnifiedVODCatalog.aggregate(entries).filter { $0.siloItem == nil }
-        #else
-        return []
-        #endif
     }
 
-    #if os(iOS)
     private var currentVODItems: [XtreamVODItem] {
         vodSearch.isCurrent(query: viewModel.query) ? vodSearch.items : []
     }
