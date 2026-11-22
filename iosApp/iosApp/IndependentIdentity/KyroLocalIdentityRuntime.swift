@@ -2,6 +2,15 @@ import Foundation
 import KyroFoundation
 import KyroIdentity
 
+enum KyroLocalIdentityDefaults {
+    static let householdIDKey = "kyro.identity.household-id"
+    static let activeProfileIDKey = "kyro.identity.active-profile-id"
+
+    static var activeProfileID: String? {
+        UserDefaults.standard.string(forKey: activeProfileIDKey)
+    }
+}
+
 /// The local household identity used when no Silo server is configured.
 /// Silo sessions remain owned by AuthService; this store only backs the
 /// existing profile picker in standalone mode.
@@ -16,7 +25,7 @@ final class KyroLocalIdentityRuntime {
 
     private init() {
         let defaults = UserDefaults.standard
-        let key = "kyro.identity.household-id"
+        let key = KyroLocalIdentityDefaults.householdIDKey
         let householdID: HouseholdID
         if let value = defaults.string(forKey: key),
            let uuid = UUID(uuidString: value) {
@@ -91,7 +100,7 @@ final class KyroLocalIdentityRuntime {
                 throw RuntimeError.incorrectPIN
             }
         }
-        UserDefaults.standard.set(profile.id, forKey: "kyro.identity.active-profile-id")
+        UserDefaults.standard.set(profile.id, forKey: KyroLocalIdentityDefaults.activeProfileIDKey)
     }
 
     func verify(_ pin: String, profileID: UUID) async throws -> Bool {

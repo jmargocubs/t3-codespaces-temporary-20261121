@@ -733,7 +733,9 @@ struct LiveTVChannelBrowserScreen: View {
                 }
             }
         }
+        #if os(iOS)
         .scrollContentBackground(.hidden)
+        #endif
         .scrollPosition($browse.listPosition)
         // Build 82.1: changing category / favorites / search must not keep another list's offset.
         .id(browse.browserListIdentity)
@@ -741,8 +743,15 @@ struct LiveTVChannelBrowserScreen: View {
         .liveTVBrowserSearchField {
             LiveTVChannelSearchField(text: $browse.searchText, isActive: $browse.isSearchPresented)
         }
-        #else
-        .searchable(text: $browse.searchText, isPresented: $browse.isSearchPresented, prompt: "Search channels")
+        #elseif os(tvOS)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if browse.isSearchPresented {
+                TextField("Search channels", text: $browse.searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.horizontal, 64)
+                    .padding(.vertical, 12)
+            }
+        }
         #endif
         // A pushed page of the browser: choosing applies the filter and pops back; Back or a swipe
         // changes nothing. Declared on this screen, which is itself on the stack.
@@ -812,7 +821,9 @@ struct LiveTVChannelBrowserScreen: View {
                             .foregroundStyle(Color.siloSecondaryText)
                     }
                 }
+                #if os(iOS)
                 .listRowSeparator(.hidden)
+                #endif
                 providerMenu
             }
             #if os(iOS)
@@ -853,17 +864,14 @@ struct LiveTVChannelBrowserScreen: View {
                     ForEach(browse.browserMatches) { channel in
                         channelRow(channel)
                             .onAppear { browse.loadMoreIfNeeded(after: channel) }
-                            .swipeActions(edge: .trailing) {
-                                Button(role: .destructive) { service.toggleFavorite(channel) } label: {
-                                    Label("Remove from Favorites", systemImage: "star.slash")
-                                }
-                            }
                     }
                 }
                 .accessibilityIdentifier("liveTVFavoritesList")
             }
         }
+        #if os(iOS)
         .scrollContentBackground(.hidden)
+        #endif
         .scrollPosition($browse.listPosition)
         .id(browse.browserListIdentity)
     }

@@ -906,7 +906,8 @@ struct ContentView: View {
 
     private var isShowingKyroIntroduction: Bool {
         #if os(iOS)
-        isPresentingKyroIntroduction && router.authState == .needsServerSetup
+        isPresentingKyroIntroduction
+            && (router.authState == .needsServerSetup || router.authState == .needsProfile)
         #else
         false
         #endif

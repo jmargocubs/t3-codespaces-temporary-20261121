@@ -15,6 +15,8 @@ import XCTest
     let store = IdentityStore(database: db, household: household)
     try await store.create(profile)
     try await store.setPIN("5837", for: profile.id)
+    let hasPIN = try await store.hasPIN(for: profile.id)
+    XCTAssertTrue(hasPIN)
     let now = Date(timeIntervalSince1970: 1_000)
     for _ in 0..<5 {
       let valid = try await store.verifyPIN("0000", for: profile.id, now: now)

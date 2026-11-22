@@ -117,7 +117,10 @@ final class AuthService: @unchecked Sendable {
     /// Active request profile. Mutations must use the transition APIs below so
     /// profile ID, verification proof, caches, diagnostics, and Top Shelf stay
     /// on one identity boundary.
-    var profileId: String? { defaults.string(forKey: SharedStorage.profileIdKey) }
+    var profileId: String? {
+        defaults.string(forKey: SharedStorage.profileIdKey)
+            ?? (!hasServer ? KyroLocalIdentityDefaults.activeProfileID : nil)
+    }
 
     var hasServer: Bool { serverRegistry.hasActiveServer }
 

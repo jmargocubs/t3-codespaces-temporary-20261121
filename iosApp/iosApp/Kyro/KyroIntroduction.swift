@@ -1,7 +1,7 @@
 import Foundation
 
 /// Kyro's three-page introduction, shown once per install to genuinely new
-/// iPhone users before Silo's server setup.
+/// iPhone users before the local profile picker or optional provider setup.
 ///
 /// It is local and separate from Silo's server-synced onboarding tour
 /// (`OnboardingTourGate`), which runs per profile after sign-in. It sets
@@ -58,7 +58,7 @@ enum KyroIntroduction {
         isEligibleDevice: Bool
     ) -> Bool {
         guard isEligibleDevice, !isCompleted, !hasSavedServers else { return false }
-        return initialState == .needsServerSetup
+        return initialState == .needsServerSetup || initialState == .needsProfile
     }
 
     /// Decides at the first committed route of a launch. An existing user is

@@ -96,7 +96,11 @@ class ProfileSelectionViewModel {
             throw ProfileManagementError.temporaryContextCleanupFailed
         }
         if isKyroLocalMode {
-            try await KyroLocalIdentityRuntime.shared.select(profile, pin: pin)
+            do {
+                try await KyroLocalIdentityRuntime.shared.select(profile, pin: pin)
+            } catch KyroLocalIdentityRuntime.RuntimeError.incorrectPIN {
+                throw ProfileTransitionError.incorrectPIN
+            }
             router.resetToHome()
             return
         }

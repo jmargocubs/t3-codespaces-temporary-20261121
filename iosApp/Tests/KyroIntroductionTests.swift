@@ -41,6 +41,13 @@ final class KyroIntroductionTests: XCTestCase {
         XCTAssertFalse(resolve(.needsServerSetup))
     }
 
+    func testStandaloneFirstLaunchCanIntroduceBeforeLocalProfilePicker() {
+        XCTAssertTrue(resolve(.needsProfile))
+        XCTAssertTrue(resolve(.needsProfile))
+        KyroIntroduction.markCompleted(defaults: defaults)
+        XCTAssertFalse(resolve(.needsProfile))
+    }
+
     func testExistingUsersBypassAndStayBypassed() {
         for state in [AppRouter.AuthState.authenticated, .needsProfile, .needsLogin] {
             XCTAssertFalse(resolve(state, hasSavedServers: true), "\(state)")
