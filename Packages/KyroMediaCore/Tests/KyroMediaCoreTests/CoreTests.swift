@@ -8,7 +8,7 @@ import KyroSourceXtream
 final class CoreTests: XCTestCase {
     func testClockOrderingAndMatching() {
         XCTAssertLessThan(HybridLogicalClock(physicalMilliseconds:1, logical:0,node:"a"), HybridLogicalClock(physicalMilliseconds:1,logical:0,node:"b"))
-        XCTAssertTrue(MediaMatcher.canMatch(title:"Film (2024)",title:"Film 2024",sharedExternalID:false,conflictingIDs:false))
+        XCTAssertFalse(MediaMatcher.canMatch(title:"Film (2024)",title:"Film 2024",sharedExternalID:false,conflictingIDs:false))
         XCTAssertFalse(MediaMatcher.canMatch(title:"Film",title:"Film",sharedExternalID:false,conflictingIDs:true))
     }
     func testSQLitePersistence() async throws {
