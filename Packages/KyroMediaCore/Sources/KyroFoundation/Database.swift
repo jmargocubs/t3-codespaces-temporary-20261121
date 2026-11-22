@@ -10,6 +10,21 @@ public actor SQLiteDatabase {
         try Self.execute(opened, "CREATE TABLE IF NOT EXISTS kyro_migrations(version INTEGER PRIMARY KEY)")
     }
     isolated deinit { if let handle { sqlite3_close_v2(handle) } }
+    public func close() throws {
+        guard let handle else { return }
+        guard sqlite3_close(handle) == SQLITE_OK else { throw DatabaseError.statement("Connection busy") }
+        self.handle = nil
+    }
+    public func migrate(version: Int, sql: String) throws {
+        guard version > 0 else { throw DatabaseError.statement("Invalid migration version") }
+        try transaction { database in
+            let applied = try database.scalarInt("SELECT count(*) FROM kyro_migrations WHERE version=\(version)")
+            if applied == 0 {
+                try database.execute(sql)
+                try database.execute("INSERT INTO kyro_migrations VALUES(\(version))")
+            }
+        }
+    }
     public func execute(_ sql: String) throws {
         guard let handle else { throw DatabaseError.closed }
         try Self.execute(handle, sql)
