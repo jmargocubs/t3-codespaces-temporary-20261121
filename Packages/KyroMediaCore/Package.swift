@@ -23,8 +23,9 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3", providers: [.apt(["libsqlite3-dev"])]),
+        .target(name: "CArgon2", exclude: ["LICENSE", "PROVENANCE.md"], cSettings: [.headerSearchPath("src"), .define("ARGON2_NO_THREADS")]),
         .target(name: "KyroFoundation", dependencies: ["CSQLite"]),
-        .target(name: "KyroCredentials", dependencies: [.product(name: "Crypto", package: "swift-crypto")]),
+        .target(name: "KyroCredentials", dependencies: ["CArgon2", .product(name: "Crypto", package: "swift-crypto")]),
         .target(name: "KyroIdentity", dependencies: ["KyroFoundation", "KyroCredentials"]),
         .target(name: "KyroLedger", dependencies: ["KyroFoundation"]),
         .target(name: "KyroCatalog", dependencies: ["KyroFoundation"]),
@@ -34,7 +35,7 @@ let package = Package(
         .target(name: "KyroSourceXtream", dependencies: ["KyroSources"]),
         .target(name: "KyroPlayback", dependencies: ["KyroFoundation"]),
         .target(name: "KyroCapabilities", dependencies: ["KyroFoundation"]),
-        .testTarget(name: "KyroMediaCoreTests", dependencies: ["KyroFoundation", "KyroIdentity", "KyroLedger", "KyroCatalog", "KyroMatching", "KyroSources", "KyroSourceJellyfin", "KyroSourceXtream", "KyroPlayback", "KyroCapabilities"])
+        .testTarget(name: "KyroMediaCoreTests", dependencies: ["CArgon2", "KyroCredentials", "KyroFoundation", "KyroIdentity", "KyroLedger", "KyroCatalog", "KyroMatching", "KyroSources", "KyroSourceJellyfin", "KyroSourceXtream", "KyroPlayback", "KyroCapabilities"])
     ],
     swiftLanguageModes: [.v6]
 )

@@ -12,6 +12,7 @@ public actor SQLiteDatabase {
         try connection.execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON")
         guard try connection.text("PRAGMA journal_mode") == "wal" else { throw DatabaseError.walUnavailable }
         try connection.execute("CREATE TABLE IF NOT EXISTS kyro_migrations(version INTEGER PRIMARY KEY)")
+        try connection.execute("CREATE TABLE IF NOT EXISTS kyro_documents(key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         self.connection = connection
         readers = try (0..<readerCount).map { _ in try SQLiteReader(path: path) }
     }
@@ -23,6 +24,23 @@ public actor SQLiteDatabase {
     public func execute(_ sql: String) throws { try connection.execute(sql) }
     public func scalarInt(_ sql: String) throws -> Int64 { try connection.integer(sql) }
     public func scalarText(_ sql: String) throws -> String { try connection.text(sql) }
+    public func textRows(_ sql: String) throws -> [String] { try connection.textRows(sql) }
+    public func load<T: Decodable & Sendable>(_ type: T.Type, key: String) throws -> T? {
+        let value = try scalarText("SELECT coalesce((SELECT payload FROM kyro_documents WHERE key=\(Self.literal(key))), '')")
+        guard !value.isEmpty else { return nil }
+        guard let data = Data(base64Encoded: value) else { throw DatabaseError.statement(SQLITE_CORRUPT) }
+        return try JSONDecoder().decode(type, from: data)
+    }
+    public func save<T: Encodable & Sendable>(_ value: T, key: String) throws {
+        let data = try JSONEncoder().encode(value).base64EncodedString()
+        try execute("INSERT INTO kyro_documents VALUES(\(Self.literal(key)), '\(data)') ON CONFLICT(key) DO UPDATE SET payload=excluded.payload")
+    }
+    /// SQL text literals are UTF-8 hex encoded, never concatenated as raw input.
+    public nonisolated static func literal(_ value: String) -> String {
+        let digits = Array("0123456789abcdef".utf8)
+        let hex = value.utf8.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }
+        return "CAST(X'" + String(decoding: hex, as: UTF8.self) + "' AS TEXT)"
+    }
     public func readInt(_ sql: String) async throws -> Int64 {
         try connection.requireOpen()
         let reader = readers[nextReader]
@@ -119,5 +137,19 @@ private final class SQLiteConnection {
     func integer(_ sql: String) throws -> Int64 { try query(sql) { sqlite3_column_int64($0, 0) } }
     func text(_ sql: String) throws -> String {
         try query(sql) { sqlite3_column_text($0, 0).map { String(cString: $0) } ?? "" }
+    }
+    func textRows(_ sql: String) throws -> [String] {
+        try requireOpen()
+        var statement: OpaquePointer?
+        let prepared = sqlite3_prepare_v2(handle, sql, -1, &statement, nil)
+        defer { sqlite3_finalize(statement) }
+        guard prepared == SQLITE_OK, let statement, sqlite3_stmt_readonly(statement) != 0 else { throw SQLiteDatabase.DatabaseError.statement(prepared) }
+        var rows: [String] = []
+        while true {
+            let code = sqlite3_step(statement)
+            if code == SQLITE_DONE { return rows }
+            guard code == SQLITE_ROW else { throw SQLiteDatabase.DatabaseError.statement(code) }
+            rows.append(sqlite3_column_text(statement, 0).map { String(cString: $0) } ?? "")
+        }
     }
 }
