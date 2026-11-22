@@ -1,0 +1,236 @@
+{
+  "events": [
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "MLB.TV"
+              ]
+            },
+            {
+              "names": [
+                "CLEGuardians.TV"
+              ]
+            },
+            {
+              "names": [
+                "Tigers.TV"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": null,
+              "homeAway": "home",
+              "id": "5",
+              "linescores": [
+                {
+                  "displayValue": "1",
+                  "period": 1,
+                  "value": 1.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 2,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 3,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 4,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "1",
+                  "period": 5,
+                  "value": 1.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 6,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 7,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 8,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 9,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "1",
+                  "period": 10,
+                  "value": 1.0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "73-71",
+                  "type": "total"
+                }
+              ],
+              "score": "3",
+              "team": {
+                "abbreviation": "CLE",
+                "color": "002b5c",
+                "displayName": "Cleveland Guardians",
+                "id": "5",
+                "location": "Cleveland",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/cle.png",
+                "name": "Guardians",
+                "shortDisplayName": "Guardians"
+              }
+            },
+            {
+              "curatedRank": null,
+              "homeAway": "away",
+              "id": "6",
+              "linescores": [
+                {
+                  "displayValue": "2",
+                  "period": 1,
+                  "value": 2.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 2,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 3,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 4,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 5,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 6,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 7,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 8,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 9,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 10,
+                  "value": 0.0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "65-78",
+                  "type": "total"
+                }
+              ],
+              "score": "2",
+              "team": {
+                "abbreviation": "DET",
+                "color": "0a2240",
+                "displayName": "Detroit Tigers",
+                "id": "6",
+                "location": "Detroit",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/det.png",
+                "name": "Tigers",
+                "shortDisplayName": "Tigers"
+              }
+            }
+          ],
+          "date": "2026-09-06T17:40Z",
+          "id": "401816831",
+          "notes": [],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 10,
+            "type": {
+              "completed": true,
+              "description": "Final",
+              "detail": "Final/10",
+              "id": "3",
+              "name": "STATUS_FINAL",
+              "shortDetail": "Final/10",
+              "state": "post"
+            }
+          },
+          "venue": {
+            "fullName": "Progressive Field"
+          }
+        }
+      ],
+      "date": "2026-09-06T17:40Z",
+      "id": "401816831",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 10,
+        "type": {
+          "completed": true,
+          "description": "Final",
+          "detail": "Final/10",
+          "id": "3",
+          "name": "STATUS_FINAL",
+          "shortDetail": "Final/10",
+          "state": "post"
+        }
+      },
+      "week": null
+    }
+  ],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "post",
+          "id": "3",
+          "name": "Postseason",
+          "type": 3
+        },
+        "year": 2026
+      }
+    }
+  ],
+  "week": null
+}

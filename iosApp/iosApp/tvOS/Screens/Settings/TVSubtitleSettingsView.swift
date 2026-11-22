@@ -1,0 +1,518 @@
+#if os(tvOS)
+import SwiftUI
+
+/// Subtitles pane of tvOS Settings, rendered inline in the right pane of
+/// the two-pane `TVSettingsView`. Profile-wide prefs (language / behavior
+/// / forced / metadata language) save through the `ProfilePrefsEditor`
+/// `set…` methods their controls call; the appearance block writes a
+/// profile value, or this Apple TV's own while its override is on.
+struct TVSubtitleSettingsPane: View {
+    @Bindable var viewModel: SettingsViewModel
+    let detailFocus: FocusState<TVSettingsDetailFocus?>.Binding
+    let presentPicker: (TVSettingsPickerRequest) -> Void
+    @State private var showResetConfirmation = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            profileSection
+            if AICapabilities.shared.metadataEnabled {
+                metadataLanguageSection
+            }
+            appearanceSection
+        }
+        .alert("Reset Appearance?", isPresented: $showResetConfirmation) {
+            Button("Reset", role: .destructive) {
+                Task { await viewModel.setSubtitleAppearance(.default) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(viewModel.subtitleUsesDeviceAppearanceOverride
+                 ? "This restores this Apple TV's subtitle appearance to the defaults."
+                 : "This restores this profile's subtitle appearance to the defaults on all devices.")
+        }
+    }
+
+    // MARK: - Sections
+
+    @ViewBuilder
+    private var profileSection: some View {
+        TVSettingsSectionHeader("PROFILE")
+
+        TVSettingsPickerRow(
+            title: "Language",
+            value: TVSettingsOptions.label(
+                for: viewModel.prefs.subtitleLanguage,
+                in: TVSettingsOptions.subtitleLanguage(viewModel.subtitleLanguageOptions)
+            )
+        ) { showPicker(.language) }
+        .focused(detailFocus, equals: .top)
+        .disabled(viewModel.prefs.serverUpgradeRequired || viewModel.subtitleMatchesSystemAppearance)
+
+        TVSettingsPickerRow(
+            title: "Behavior",
+            value: TVSettingsOptions.label(for: viewModel.prefs.subtitleMode, in: TVSettingsOptions.subtitleMode)
+        ) { showPicker(.mode) }
+        .focused(detailFocus, equals: .subtitleBehavior)
+        .disabled(viewModel.prefs.serverUpgradeRequired || viewModel.subtitleMatchesSystemAppearance)
+
+        TVSettingsToggleRow(
+            title: "Show Forced Subtitles",
+            isOn: viewModel.prefs.showForcedSubtitles == "on"
+        ) {
+            Task { await viewModel.prefs.setShowForcedSubtitles(viewModel.prefs.showForcedSubtitles != "on") }
+        }
+        .disabled(viewModel.prefs.serverUpgradeRequired || viewModel.subtitleMatchesSystemAppearance)
+
+        if viewModel.subtitleMatchesSystemAppearance {
+            TVSettingsFooter("Language, display behavior, forced captions, and CC/SDH preference follow this Apple TV's Accessibility settings.")
+        } else if viewModel.prefs.serverUpgradeRequired {
+            TVSettingsWarningFooter(ProfilePrefsEditor.serverUpgradeMessage)
+        } else {
+            TVSettingsFooter("Used to pick a matching track when one is available. Forced subtitles cover foreign-language dialogue even when subtitles are off or set to auto.")
+            if let overrideMessage = viewModel.prefs.subtitleProfileOverrideMessage {
+                TVSettingsFooter("Override active — \(overrideMessage)")
+            }
+        }
+        prefSaveFooter
+        if viewModel.prefs.hasHeldChanges {
+            TVHeldSettingChangesRows(
+                retry: { await viewModel.prefs.retryHeldChanges() },
+                discard: { await viewModel.prefs.discardHeldChanges() }
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var metadataLanguageSection: some View {
+        TVSettingsSectionHeader("METADATA")
+
+        TVSettingsPickerRow(
+            title: "Metadata Language",
+            value: TVSettingsOptions.label(
+                for: viewModel.prefs.preferredMetadataLanguage,
+                in: TVSettingsOptions.metadataLanguage(viewModel.metadataLanguageOptions)
+            )
+        ) { showPicker(.metadataLanguage) }
+        .focused(detailFocus, equals: .subtitleMetadataLanguage)
+        .disabled(viewModel.prefs.serverUpgradeRequired)
+
+        TVSettingsFooter("Translates descriptions and taglines into your preferred language when available. Titles are never translated.")
+    }
+
+    @ViewBuilder
+    private var appearanceSection: some View {
+        TVSettingsSectionHeader("APPEARANCE")
+
+        TVSettingsSubtitlePreview(appearance: viewModel.effectiveSubtitleAppearance)
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
+
+        if !viewModel.subtitleMatchesSystemAppearance
+            && viewModel.subtitleAppearance.isLowLegibilityRisk {
+            TVSettingsFooter("Low legibility — very transparent or dark text without a box or outline can be hard to read.")
+        }
+
+        TVSettingsToggleRow(
+            title: "Use Device Settings",
+            isOn: viewModel.subtitleMatchesSystemAppearance
+        ) {
+            let enabled = !viewModel.subtitleMatchesSystemAppearance
+            viewModel.setSubtitleMatchesSystemAppearance(enabled)
+        }
+        .focused(detailFocus, equals: .subtitleUseDeviceSettings)
+
+        TVSettingsToggleRow(
+            title: "Only on This Apple TV",
+            isOn: viewModel.subtitleUsesDeviceAppearanceOverride
+        ) {
+            let enabled = !viewModel.subtitleUsesDeviceAppearanceOverride
+            Task { await viewModel.setSubtitleDeviceOverrideEnabled(enabled) }
+        }
+        .disabled(viewModel.subtitleMatchesSystemAppearance)
+
+        TVSettingsNestedGroup(
+            enabled: appearanceEditable,
+            disabledHint: "Turn off Use Device Settings to make changes"
+        ) {
+            pickerRow("Font Size", options: TVSettingsOptions.subtitleSize,
+                      selection: viewModel.subtitleAppearance.fontSize.rawValue, kind: .fontSize)
+            pickerRow("Font Family", options: TVSettingsOptions.fontFamily,
+                      selection: viewModel.subtitleAppearance.fontFamily.rawValue, kind: .fontFamily)
+            pickerRow("Font Color", options: TVSettingsOptions.fontColor,
+                      selection: viewModel.subtitleAppearance.fontColor.lowercased(), kind: .fontColor)
+
+            if viewModel.offersSubtitleTextOpacity {
+                TVSettingsPickerRow(
+                    title: "Text Opacity",
+                    value: "\(viewModel.subtitleAppearance.textOpacity)%"
+                ) {
+                    guard appearanceEditable else { return }
+                    showPicker(.textOpacity)
+                }
+                .focused(detailFocus, equals: .subtitleTextOpacity)
+            }
+
+            TVSettingsToggleRow(
+                title: "Text Outline",
+                isOn: viewModel.subtitleAppearance.textOutline
+            ) {
+                guard appearanceEditable else { return }
+                var next = viewModel.subtitleAppearance
+                next.textOutline.toggle()
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+
+            TVSettingsPickerRow(
+                title: "Outline Color",
+                value: viewModel.subtitleAppearance.textOutline
+                    ? TVSettingsOptions.label(
+                        for: viewModel.subtitleAppearance.textOutlineColor.lowercased(),
+                        in: TVSettingsOptions.outlineColor
+                    )
+                    : "—"
+            ) {
+                guard appearanceEditable else { return }
+                showPicker(.outlineColor)
+            }
+            .focused(detailFocus, equals: .subtitleOutlineColor)
+
+            pickerRow("Background Style", options: TVSettingsOptions.backgroundStyle,
+                      selection: viewModel.subtitleAppearance.backgroundStyle.rawValue, kind: .backgroundStyle)
+
+            TVSettingsPickerRow(
+                title: "Background Opacity",
+                value: viewModel.subtitleAppearance.backgroundStyle == .box
+                    ? "\(viewModel.subtitleAppearance.backgroundOpacity)%"
+                    : "—"
+            ) {
+                guard appearanceEditable else { return }
+                showPicker(.backgroundOpacity)
+            }
+            .focused(detailFocus, equals: .subtitleBackgroundOpacity)
+
+            TVSettingsPickerRow(
+                title: "Background Color",
+                value: viewModel.subtitleAppearance.backgroundStyle == .box
+                    ? TVSettingsOptions.label(
+                        for: viewModel.subtitleAppearance.backgroundColor.lowercased(),
+                        in: TVSettingsOptions.backgroundColor
+                    )
+                    : "—"
+            ) {
+                guard appearanceEditable else { return }
+                showPicker(.backgroundColor)
+            }
+            .focused(detailFocus, equals: .subtitleBackgroundColor)
+
+            pickerRow("Position", options: TVSettingsOptions.position,
+                      selection: viewModel.subtitleAppearance.position.rawValue, kind: .position)
+
+            Button("Reset Appearance", role: .destructive) {
+                guard appearanceEditable else { return }
+                showResetConfirmation = true
+            }
+            .buttonStyle(TVSettingsPaneRowStyle(isDestructive: true))
+        }
+
+        TVSettingsFooter(appearanceFooterText)
+    }
+
+    /// Appearance edits save for the profile, or for this Apple TV while its
+    /// override is on; only following the system captions locks them.
+    private var appearanceEditable: Bool {
+        !viewModel.subtitleMatchesSystemAppearance
+    }
+
+    private var appearanceFooterText: String {
+        let source: String
+        if viewModel.subtitleMatchesSystemAppearance {
+            source = "Following this Apple TV's caption language, display behavior, CC/SDH preference, font, colors, opacity, edges, size, and caption window from Settings → Accessibility."
+        } else if viewModel.subtitleUsesDeviceAppearanceOverride {
+            source = "Saved only on this Apple TV. Other devices use the profile's settings."
+        } else {
+            source = "Saved for this profile on all devices."
+        }
+        let authoredStyleBehavior = viewModel.subtitleMatchesSystemAppearance
+            ? " Subtitles with built-in styling follow each device caption option's Video Overrides Style choice."
+            : " Subtitles with their own built-in styling keep their original appearance; image-based subtitles keep their authored fonts and colors but follow the size, position, and background settings."
+        return source + authoredStyleBehavior
+    }
+
+    @ViewBuilder
+    private var prefSaveFooter: some View {
+        if let state = viewModel.prefs.saveState,
+           !(viewModel.prefs.serverUpgradeRequired && state == .serverUpgradeRequired) {
+            switch state {
+            case .saving:
+                TVSettingsFooter("Saving…")
+            case .saved:
+                TVSettingsFooter("Saved")
+            case .failed(let err):
+                TVSettingsWarningFooter("Couldn't save: \(err)")
+            case .serverUpgradeRequired:
+                TVSettingsWarningFooter(ProfilePrefsEditor.serverUpgradeMessage)
+            case .held:
+                // TVHeldSettingChangesRows below carries the message.
+                EmptyView()
+            }
+        }
+    }
+
+    // MARK: - Rows
+
+    private func pickerRow(
+        _ title: String,
+        options: [TVSettingsOption],
+        selection: String,
+        kind: PickerKind
+    ) -> some View {
+        TVSettingsPickerRow(
+            title: title,
+            value: TVSettingsOptions.label(for: selection, in: options)
+        ) {
+            guard appearanceEditable else { return }
+            showPicker(kind)
+        }
+        .focused(detailFocus, equals: kind.returnFocus)
+    }
+
+    // MARK: - Pickers
+
+    private func showPicker(_ kind: PickerKind) {
+        presentPicker(pickerRequest(for: kind))
+    }
+
+    private func pickerRequest(for kind: PickerKind) -> TVSettingsPickerRequest {
+        return switch kind {
+        case .language:
+            TVSettingsPickerRequest(
+                title: "Language",
+                options: TVSettingsOptions.subtitleLanguage(viewModel.subtitleLanguageOptions),
+                selection: Binding(
+                    get: { viewModel.prefs.subtitleLanguage },
+                    set: { value in Task { await viewModel.prefs.setSubtitleLanguage(value) } }
+                ),
+                returnFocus: kind.returnFocus
+            )
+        case .mode:
+            TVSettingsPickerRequest(
+                title: "Behavior",
+                options: TVSettingsOptions.subtitleMode,
+                selection: Binding(
+                    get: { viewModel.prefs.subtitleMode },
+                    set: { value in Task { await viewModel.prefs.setSubtitleMode(value) } }
+                ),
+                returnFocus: kind.returnFocus
+            )
+        case .metadataLanguage:
+            TVSettingsPickerRequest(
+                title: "Metadata Language",
+                options: TVSettingsOptions.metadataLanguage(viewModel.metadataLanguageOptions),
+                selection: Binding(
+                    get: { viewModel.prefs.preferredMetadataLanguage },
+                    set: { value in Task { await viewModel.prefs.setPreferredMetadataLanguage(value) } }
+                ),
+                returnFocus: kind.returnFocus
+            )
+        case .fontSize:
+            TVSettingsPickerRequest(
+                title: "Font Size",
+                options: TVSettingsOptions.subtitleSize,
+                selection: appearanceEnumBinding(\.fontSize, SubtitleFontSizePreset.self),
+                returnFocus: kind.returnFocus
+            )
+        case .fontFamily:
+            TVSettingsPickerRequest(
+                title: "Font Family",
+                options: TVSettingsOptions.fontFamily,
+                selection: appearanceEnumBinding(\.fontFamily, SubtitleFontFamilyPreset.self),
+                subtitlePreviewAppearance: viewModel.subtitleAppearance,
+                returnFocus: kind.returnFocus
+            )
+        case .fontColor:
+            TVSettingsPickerRequest(
+                title: "Font Color",
+                options: TVSettingsOptions.fontColor,
+                selection: appearanceStringBinding(\.fontColor),
+                returnFocus: kind.returnFocus
+            )
+        case .textOpacity:
+            TVSettingsPickerRequest(
+                title: "Text Opacity",
+                options: TVSettingsOptions.textOpacity(current: viewModel.subtitleAppearance.textOpacity),
+                selection: textOpacityBinding,
+                returnFocus: kind.returnFocus
+            )
+        case .outlineColor:
+            TVSettingsPickerRequest(
+                title: "Outline Color",
+                options: TVSettingsOptions.outlineColor,
+                selection: outlineColorBinding,
+                returnFocus: kind.returnFocus
+            )
+        case .backgroundStyle:
+            TVSettingsPickerRequest(
+                title: "Background Style",
+                options: TVSettingsOptions.backgroundStyle,
+                selection: backgroundStyleBinding,
+                returnFocus: kind.returnFocus
+            )
+        case .backgroundOpacity:
+            TVSettingsPickerRequest(
+                title: "Background Opacity",
+                options: TVSettingsOptions.backgroundOpacity(current: viewModel.subtitleAppearance.backgroundOpacity),
+                selection: backgroundOpacityBinding,
+                returnFocus: kind.returnFocus
+            )
+        case .backgroundColor:
+            TVSettingsPickerRequest(
+                title: "Background Color",
+                options: TVSettingsOptions.backgroundColor,
+                selection: backgroundColorBinding,
+                returnFocus: kind.returnFocus
+            )
+        case .position:
+            TVSettingsPickerRequest(
+                title: "Position",
+                options: TVSettingsOptions.position,
+                selection: appearanceEnumBinding(\.position, SubtitlePositionPreset.self),
+                returnFocus: kind.returnFocus
+            )
+        }
+    }
+
+    enum PickerKind {
+        case language
+        case mode
+        case metadataLanguage
+        case fontSize
+        case fontFamily
+        case fontColor
+        case textOpacity
+        case outlineColor
+        case backgroundStyle
+        case backgroundOpacity
+        case backgroundColor
+        case position
+
+        var returnFocus: TVSettingsDetailFocus {
+            switch self {
+            case .language: .top
+            case .mode: .subtitleBehavior
+            case .metadataLanguage: .subtitleMetadataLanguage
+            case .fontSize: .subtitleFontSize
+            case .fontFamily: .subtitleFontFamily
+            case .fontColor: .subtitleFontColor
+            case .textOpacity: .subtitleTextOpacity
+            case .outlineColor: .subtitleOutlineColor
+            case .backgroundStyle: .subtitleBackgroundStyle
+            case .backgroundOpacity: .subtitleBackgroundOpacity
+            case .backgroundColor: .subtitleBackgroundColor
+            case .position: .subtitlePosition
+            }
+        }
+    }
+
+    // MARK: - Appearance bindings
+
+    /// Editing a setting that the current style ignores makes it take
+    /// effect ("touch it and it applies"): picking an outline color turns
+    /// the outline on, and picking a background color or opacity switches
+    /// the style to Box. Matches the player HUD's behavior.
+
+    private var outlineColorBinding: Binding<String> {
+        Binding(
+            get: { viewModel.subtitleAppearance.textOutlineColor.lowercased() },
+            set: { value in
+                var next = viewModel.subtitleAppearance
+                next.textOutlineColor = value
+                next.textOutline = true
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private var backgroundStyleBinding: Binding<String> {
+        Binding(
+            get: { viewModel.subtitleAppearance.backgroundStyle.rawValue },
+            set: { rawValue in
+                guard let style = SubtitleBackgroundStylePreset(rawValue: rawValue) else { return }
+                var next = viewModel.subtitleAppearance
+                next.backgroundStyle = style
+                if style == .box && next.backgroundOpacity == 0 {
+                    next.backgroundOpacity = SubtitleAppearance.default.backgroundOpacity
+                }
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private var textOpacityBinding: Binding<String> {
+        Binding(
+            get: { String(viewModel.subtitleAppearance.textOpacity) },
+            set: { value in
+                guard let opacity = Int(value) else { return }
+                var next = viewModel.subtitleAppearance
+                next.textOpacity = opacity
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private var backgroundOpacityBinding: Binding<String> {
+        Binding(
+            get: { String(viewModel.subtitleAppearance.backgroundOpacity) },
+            set: { value in
+                guard let opacity = Int(value) else { return }
+                var next = viewModel.subtitleAppearance
+                next.backgroundOpacity = opacity
+                if opacity > 0 {
+                    next.backgroundStyle = .box
+                }
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private var backgroundColorBinding: Binding<String> {
+        Binding(
+            get: { viewModel.subtitleAppearance.backgroundColor.lowercased() },
+            set: { value in
+                var next = viewModel.subtitleAppearance
+                next.backgroundColor = value
+                next.backgroundStyle = .box
+                if next.backgroundOpacity == 0 {
+                    next.backgroundOpacity = SubtitleAppearance.default.backgroundOpacity
+                }
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private func appearanceStringBinding(_ keyPath: WritableKeyPath<SubtitleAppearance, String>) -> Binding<String> {
+        Binding(
+            get: { viewModel.subtitleAppearance[keyPath: keyPath].lowercased() },
+            set: { value in
+                var next = viewModel.subtitleAppearance
+                next[keyPath: keyPath] = value
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private func appearanceEnumBinding<Value>(
+        _ keyPath: WritableKeyPath<SubtitleAppearance, Value>,
+        _ type: Value.Type
+    ) -> Binding<String> where Value: RawRepresentable, Value.RawValue == String {
+        Binding(
+            get: { viewModel.subtitleAppearance[keyPath: keyPath].rawValue },
+            set: { rawValue in
+                guard let value = Value(rawValue: rawValue) else { return }
+                var next = viewModel.subtitleAppearance
+                next[keyPath: keyPath] = value
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+}
+#endif

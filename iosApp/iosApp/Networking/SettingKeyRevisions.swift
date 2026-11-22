@@ -1,0 +1,157 @@
+//  The manifest revision that introduced each generated key.
+//
+//  The Swift bindings carry only the newest revision they were generated from,
+//  and treating every server older than that as "upgrade required" would turn a
+//  binding refresh into an outage for every feature on every older server.
+//  Gating per key instead matches the web client
+//  (`manifest_revision >= introducedIn`): a revision-8 server keeps serving the
+//  keys it has always served, and only features built on newer keys fall back.
+//
+//  The generator does not emit `introduced_in` for Swift, so this table is
+//  hand-maintained. `SettingsConformanceTests` checks it against the vendored
+//  manifest, and the exhaustive switch makes a regenerated key a compile error
+//  here until its revision is recorded.
+//
+
+import Foundation
+
+extension SettingKey {
+    /// The oldest contract revision whose pre-existing features this build
+    /// relies on. Servers below it keep the behavior they had before per-key
+    /// gating: every settings read reports ``SettingsAPIError/serverUpgradeRequired``.
+    ///
+    /// Revision 8 because features without a per-key fallback read keys up to
+    /// it: the player batch carries `playback.intro_skip_mode` (revision 7),
+    /// and the card overlay keys arrived in revision 8. The server's
+    /// `/api/v2/settings` routes shipped at revision 8, so no v2 server
+    /// reports less. Raise this only together with every feature that stops
+    /// working below the new value; a feature that can fall back gates on its
+    /// own keys instead.
+    static let minimumServerRevision = 8
+
+    /// The manifest revision that introduced this key.
+    var introducedIn: Int {
+        switch self {
+        case .catalogMetadataLanguageOverrides:
+            return 3
+        case .navPrimaryMenu, .navShortcuts, .uiCardPresentation:
+            return 5
+        case .playbackIntroSkipMode:
+            return 7
+        case .uiCardOverlaysEnabled, .uiCardQuickActions, .uiCardQuickActionsEnabled:
+            return 8
+        case .playerVideoSkipBackSeconds, .playerVideoSkipForwardSeconds,
+             .playerAudiobookSkipBackSeconds, .playerAudiobookSkipForwardSeconds:
+            return 9
+        case .catalogShowAdvisoryAge:
+            return 10
+        case .uiThemeMusicEnabled, .uiThemeMusicLoop:
+            return 11
+        case .homeHideWatchedItems:
+            return 12
+        case .requestsWatchlistAutoRequest:
+            return 15
+        case .uiTitleArt:
+            return 16
+        case .catalogHideUnwatchedEpisodeImages, .catalogHideUnwatchedEpisodeOverviews:
+            return 17
+        case .uiNextUpNewReleasesFirst:
+            return 18
+        case .playbackCellularPreferredQuality, .playbackCellularMaxBitrateKbps:
+            return Self.cellularQualityRevision
+        case .playbackBufferingQualityMode:
+            return 23
+        case .catalogMetadataLanguage, .downloadsDefaultQuality, .downloadsKeepWatched,
+             .downloadsWifiOnly, .navShowAudiobooks, .playbackAudioLanguage,
+             .playbackAutoPlayNext, .playbackAutoPlayNextPreview, .playbackAutoSkipCredits,
+             .playbackAutoSkipIntro, .playbackAutoSkipRecap, .playbackMaxBitrateKbps,
+             .playbackNextUpPromptSeconds, .playbackPreferredQuality,
+             .playbackShowForcedSubtitles, .playbackSubtitleAppearance,
+             .playbackSubtitleLanguage, .playbackSubtitleMode, .playerAudioSyncMs,
+             .playerDolbyVisionEnabled, .playerDvProfile7Hdr10Fallback, .playerHdrEnabled,
+             .playerMatchFrameRate, .playerOrientationMode, .playerPassoutThreshold,
+             .playerPictureInPictureEnabled, .playerPlaybackSpeed, .playerResumeRewindSeconds,
+             .playerSeekCacheEnabled, .playerSleepTimerDefaultMinutes, .playerSubtitleSyncMs,
+             .playerVideoGravity, .searchMediaScope, .subtitleMatchesDevice, .uiCardOverlays,
+             .uiCustomCss, .uiCustomThemeVars, .uiDateFormat, .uiDisabledLibraryIds,
+             .uiHighContrast, .uiLibraryOrder, .uiLibraryPageState, .uiNextUpMode,
+             .uiRememberLibraryPageState, .uiSidebarPins, .uiTextScale, .uiTextWeight,
+             .uiTheme, .uiTimeFormat:
+            return 1
+        }
+    }
+
+    /// Whether a server answering at `revision` knows this key.
+    func isServed(atRevision revision: Int) -> Bool {
+        revision >= Self.minimumServerRevision && revision >= introducedIn
+    }
+
+    /// The manifest revision that added `textOpacity` to
+    /// `playback.subtitle_appearance`'s object schema.
+    static let subtitleTextOpacityRevision = 14
+
+    /// The manifest revision that let `player.subtitle_sync_ms` be stored at
+    /// `profile` scope. Older servers only accept `profile_device` for it.
+    static let subtitleSyncProfileScopeRevision = 19
+
+    /// The manifest revision that added the cellular quality pair
+    /// (`playback.cellular_preferred_quality` and
+    /// `playback.cellular_max_bitrate_kbps`).
+    static let cellularQualityRevision = 20
+
+    /// Whether sending this key depends on the server's manifest revision
+    /// because the key is newer than ``minimumServerRevision``: an older
+    /// server answers `unknown_setting` for it. The player's settings queue
+    /// keeps such a write on this device until the server serves the key.
+    var isNewerThanMinimumServer: Bool {
+        introducedIn > Self.minimumServerRevision
+    }
+
+    /// The manifest revision from which the server accepts this key at
+    /// `profile` scope, for a key that gained that scope after it was
+    /// introduced. Nil when the scope has always been accepted, or never is.
+    ///
+    /// The flusher holds a `profile` write for such a key until the revision
+    /// is known, and sends it as this device's value to an older server.
+    var profileScopeRevision: Int? {
+        switch self {
+        case .playerSubtitleSyncMs:
+            return Self.subtitleSyncProfileScopeRevision
+        default:
+            return nil
+        }
+    }
+
+    /// Whether a server answering at `revision` accepts this key at
+    /// `profile` scope, as far as ``profileScopeRevision`` gates it.
+    func acceptsProfileScope(atRevision revision: Int) -> Bool {
+        profileScopeRevision.map { revision >= $0 } ?? true
+    }
+
+    /// Object members added to this key's value schema after the key itself,
+    /// with the revision that added each.
+    ///
+    /// ``introducedIn`` cannot gate these: the key is served, but its schema is
+    /// `additionalProperties: false`, so an older server rejects the *whole*
+    /// write for one member it does not know. The flusher removes them at send
+    /// time for such a server, and holds the write while the server's revision
+    /// is not yet known.
+    var revisionGatedMembers: [String: Int] {
+        switch self {
+        case .playbackSubtitleAppearance:
+            return ["textOpacity": Self.subtitleTextOpacityRevision]
+        default:
+            return [:]
+        }
+    }
+
+    /// `value` as a server answering at `revision` accepts it: object members
+    /// newer than that revision are removed, everything else is untouched.
+    func wireValue(_ value: SettingJSONValue, forServerRevision revision: Int) -> SettingJSONValue {
+        guard case .object(var fields) = value else { return value }
+        for (member, introducedIn) in revisionGatedMembers where revision < introducedIn {
+            fields.removeValue(forKey: member)
+        }
+        return .object(fields)
+    }
+}

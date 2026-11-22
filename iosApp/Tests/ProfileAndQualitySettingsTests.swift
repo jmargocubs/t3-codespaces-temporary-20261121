@@ -1,0 +1,1993 @@
+import XCTest
+@testable import Silo
+
+/// Tests for the two things C2c moved onto the canonical settings contract:
+/// the shared quality presets (`playback.preferred_quality` +
+/// `playback.max_bitrate_kbps`) and the profile-scoped preferences that used
+/// to travel as fields on `PUT /profiles/{id}`.
+///
+/// The preset table is asserted against the *contract*, not against a copy of
+/// itself: a preset whose resolution is not a member of the manifest's enum is
+/// a permanent `invalid_value` on the server, and the failure would otherwise
+/// only show up as a preference that silently stops syncing.
+@MainActor
+final class ProfileAndQualitySettingsTests: XCTestCase {
+
+    // MARK: - Language catalog
+
+    func testLanguageOptionsUnionContractRuntimeAndExactCurrentValue() {
+        let options = PlaybackLanguageOption.options(
+            for: .playbackSubtitleLanguage,
+            currentValue: "pt-BR",
+            runtimeValues: ["eng", "es-MX"]
+        ).map(\.code)
+
+        XCTAssertTrue(options.contains("en"))
+        XCTAssertFalse(options.contains("eng"), "a true ISO alias must not create a duplicate row")
+        XCTAssertTrue(options.contains("te"), "the generated contract floor must be present")
+        XCTAssertTrue(options.contains("es-MX"), "deployment-observed region tags must be present")
+        XCTAssertTrue(options.contains("pt"), "a base language is not an alias for a region choice")
+        XCTAssertTrue(options.contains("pt-BR"), "the exact current wire value must stay selectable")
+    }
+
+    func testLegacyOriginalSpellingSharesTheSentinelIdentity() {
+        XCTAssertEqual(
+            PlaybackLanguageOption.languageIdentity("original"),
+            PlaybackLanguageOption.languageIdentity(PlaybackPrefSentinel.originalLanguage)
+        )
+        XCTAssertEqual(
+            PlaybackLanguageOption.languageIdentity("Original"),
+            PlaybackLanguageOption.languageIdentity("X-Silo-Original")
+        )
+    }
+
+    func testCurrentAliasReplacesTheContractWireValue() {
+        let options = PlaybackLanguageOption.options(
+            for: .playbackAudioLanguage,
+            currentValue: "eng"
+        ).map(\.code)
+
+        XCTAssertTrue(options.contains("eng"))
+        XCTAssertFalse(options.contains("en"))
+    }
+
+    func testBibliographicAliasesReplaceTheirCanonicalContractRows() {
+        let aliases = [
+            "fre": "fr",
+            "ger": "de",
+            "chi": "zh",
+            "mao": "mi",
+            "iw": "he",
+            "in": "id",
+            "ji": "yi",
+        ]
+
+        for (alias, canonical) in aliases {
+            let options = PlaybackLanguageOption.options(
+                for: .playbackAudioLanguage,
+                currentValue: alias
+            ).map(\.code)
+
+            XCTAssertTrue(options.contains(alias), "the exact current value \(alias) must win")
+            XCTAssertFalse(options.contains(canonical), "\(alias) must replace its alias \(canonical)")
+        }
+    }
+
+    // MARK: - Preset table
+
+    /// The contract's `playback.preferred_quality` members. Spelled out here
+    /// rather than read from the generated bindings because the bindings
+    /// generate the key list, not each key's enum — so this is the pin that
+    /// catches a preset naming a resolution the server would refuse.
+    private static let contractResolutions: Set<String> = [
+        "auto", "480p", "720p", "1080p", "2160p", "original",
+    ]
+
+    func testEveryPresetResolutionIsAContractEnumMember() {
+        for preset in SiloQualityPresets.all {
+            XCTAssertTrue(
+                Self.contractResolutions.contains(preset.resolution),
+                "preset \(preset.id) sends resolution \(preset.resolution), which the contract's enum does not define"
+            )
+        }
+    }
+
+    func testEveryPresetBitrateIsWithinTheContractsBounds() {
+        for preset in SiloQualityPresets.all {
+            guard let bitrate = preset.bitrateKbps else { continue }
+            // The manifest declares minimum 100, maximum 200000 on
+            // playback.max_bitrate_kbps.
+            XCTAssertGreaterThanOrEqual(bitrate, 100, "preset \(preset.id) is below the contract minimum")
+            XCTAssertLessThanOrEqual(bitrate, 200_000, "preset \(preset.id) is above the contract maximum")
+        }
+    }
+
+    /// The preset ids, labels and pairs the web and Android clients ship, in
+    /// order. A divergence here is a user seeing "1080p High" mean one thing on
+    /// the phone and another in a browser, which is exactly what the shared
+    /// table exists to prevent.
+    func testPresetTableMatchesTheOtherClients() {
+        let expected: [(id: String, label: String, resolution: String, bitrate: Int?)] = [
+            ("auto", "Auto", "auto", nil),
+            ("2160p", "4K", "2160p", nil),
+            ("1080p-high", "1080p High", "1080p", 10_000),
+            ("1080p", "1080p", "1080p", 6_000),
+            ("1080p-low", "1080p Low", "1080p", 3_000),
+            ("720p-high", "720p High", "720p", 4_000),
+            ("720p", "720p", "720p", 2_000),
+            ("480p", "480p", "480p", 1_500),
+        ]
+
+        XCTAssertEqual(SiloQualityPresets.all.count, expected.count)
+        for (actual, want) in zip(SiloQualityPresets.all, expected) {
+            XCTAssertEqual(actual.id, want.id)
+            XCTAssertEqual(actual.label, want.label, "\(want.id) label")
+            XCTAssertEqual(actual.resolution, want.resolution, "\(want.id) resolution")
+            XCTAssertEqual(actual.bitrateKbps, want.bitrate, "\(want.id) bitrate")
+        }
+    }
+
+    func testEveryPresetRoundTripsFromItsStoredPair() {
+        for preset in SiloQualityPresets.all {
+            let recovered = SiloQualityPresets.preset(
+                resolution: preset.resolution,
+                bitrateKbps: preset.bitrateKbps
+            )
+            XCTAssertEqual(recovered?.id, preset.id, "\(preset.id) did not round-trip")
+        }
+    }
+
+    /// Two presets share the `1080p` resolution and differ only by bitrate, so
+    /// a lookup that ignored the bitrate axis would collapse them.
+    func testPresetsAreDistinguishedByBothAxes() {
+        XCTAssertEqual(SiloQualityPresets.preset(resolution: "1080p", bitrateKbps: 10_000)?.id, "1080p-high")
+        XCTAssertEqual(SiloQualityPresets.preset(resolution: "1080p", bitrateKbps: 6_000)?.id, "1080p")
+        XCTAssertEqual(SiloQualityPresets.preset(resolution: "1080p", bitrateKbps: 3_000)?.id, "1080p-low")
+    }
+
+    /// A pair no preset covers must report itself rather than resolve to a
+    /// nearby preset: showing "1080p" for a stored 1080p/8000 would tell the
+    /// user their cap is 6 Mbps when it is 8.
+    func testAPairNoPresetCoversHasNoPresetAndDescribesItself() {
+        XCTAssertNil(SiloQualityPresets.preset(resolution: "1080p", bitrateKbps: 8_000))
+        XCTAssertEqual(SiloQualityPresets.describe(resolution: "1080p", bitrateKbps: 8_000), "1080p at 8 Mbps")
+        XCTAssertEqual(SiloQualityPresets.describe(resolution: "720p", bitrateKbps: 1_800), "720p at 1.8 Mbps")
+        // A covered pair answers with the preset's own label.
+        XCTAssertEqual(SiloQualityPresets.describe(resolution: "720p", bitrateKbps: 4_000), "720p High")
+        XCTAssertEqual(SiloQualityPresets.describe(resolution: "auto", bitrateKbps: nil), "Auto")
+        XCTAssertEqual(SiloQualityPresets.describe(resolution: "2160p", bitrateKbps: nil), "4K")
+    }
+
+    /// Legacy compound spellings reduce to the contract's enum. The bitrate
+    /// half is dropped rather than guessed at — the bitrate axis carries it,
+    /// and inventing a cap would silently throttle playback.
+    func testCompoundLegacyResolutionsNormalizeToContractMembers() {
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("1080p-high"), "1080p")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("720p-medium"), "720p")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("1080p-8"), "1080p")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("4k"), "2160p")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("uhd"), "2160p")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("  1080P  "), "1080p")
+        // 328p and 420p predate the contract's ladder and have no member.
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("328p"), "auto")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution(nil), "auto")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution(""), "auto")
+        XCTAssertEqual(SiloQualityPresets.normalizeResolution("1440p"), "auto")
+
+        for resolution in SiloQualityPresets.all.map(\.resolution) {
+            XCTAssertTrue(
+                Self.contractResolutions.contains(SiloQualityPresets.normalizeResolution(resolution)),
+                "normalizing \(resolution) escaped the contract's enum"
+            )
+        }
+    }
+
+    // MARK: - Preset writes
+
+    func testApplyingAPresetWritesBothAxes() async throws {
+        let harness = try PlayerSettingsHarness()
+        let preset = try XCTUnwrap(SiloQualityPresets.preset(id: "720p-high"))
+
+        harness.settings.setQualityPreset(preset)
+        await harness.settings.flushPendingDeviceSettings()
+
+        let byKey = harness.transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackPreferredQuality]?.value, .string("720p"))
+        XCTAssertEqual(byKey[.playbackMaxBitrateKbps]?.value, .int(4_000))
+        XCTAssertEqual(harness.settings.currentQualityPreset?.id, "720p-high")
+    }
+
+    /// An uncapped preset must send an explicit null, not omit the write:
+    /// leaving the previous cap in place would keep throttling a preference the
+    /// user just widened.
+    func testAnUncappedPresetClearsTheBitrateAxis() async throws {
+        let harness = try PlayerSettingsHarness()
+
+        harness.settings.setQualityPreset(try XCTUnwrap(SiloQualityPresets.preset(id: "480p")))
+        await harness.settings.flushPendingDeviceSettings()
+        harness.transport.reset()
+
+        harness.settings.setQualityPreset(try XCTUnwrap(SiloQualityPresets.preset(id: "2160p")))
+        await harness.settings.flushPendingDeviceSettings()
+
+        let byKey = harness.transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackPreferredQuality]?.value, .string("2160p"))
+        XCTAssertEqual(byKey[.playbackMaxBitrateKbps]?.value, .null)
+        XCTAssertNil(harness.settings.maxBitrateKbps)
+    }
+
+    /// Every preset must survive a write/read cycle unchanged. This is the
+    /// regression that motivated storing the pair: `1080p-high` names 10 Mbps
+    /// in the preset table and 20 Mbps in the in-player ladder, so a client
+    /// that stored the *id* would reinterpret the user's choice depending on
+    /// which table read it back.
+    func testEveryPresetSurvivesAServerRoundTrip() async throws {
+        for preset in SiloQualityPresets.all {
+            let harness = try PlayerSettingsHarness()
+            harness.settings.setQualityPreset(preset)
+            await harness.settings.flushPendingDeviceSettings()
+
+            let byKey = harness.transport.writesByKey()
+            let sentResolution = try XCTUnwrap(byKey[.playbackPreferredQuality]?.value.stringValue)
+            let sentBitrate = byKey[.playbackMaxBitrateKbps]?.value.intValue
+
+            // Feed exactly what was sent back as the server's answer.
+            harness.transport.effective = [
+                .init(
+                    key: SettingKey.playbackPreferredQuality.rawValue,
+                    value: .string(sentResolution),
+                    source: .scope(.profileDevice),
+                    scope: .profileDevice
+                ),
+                .init(
+                    key: SettingKey.playbackMaxBitrateKbps.rawValue,
+                    value: sentBitrate.map { .int($0) } ?? .null,
+                    source: .scope(.profileDevice),
+                    scope: .profileDevice
+                ),
+            ]
+            await harness.settings.refreshFromServer()
+
+            XCTAssertEqual(
+                harness.settings.currentQualityPreset?.id, preset.id,
+                "\(preset.id) did not survive the round trip"
+            )
+        }
+    }
+
+    /// A pair authored elsewhere is adopted verbatim rather than snapped onto
+    /// this client's ladder. Quantizing here would rewrite the profile's stored
+    /// choice on the next edit made from this device.
+    func testAForeignPairIsAdoptedWithoutBeingQuantized() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = [
+            .init(
+                key: SettingKey.playbackPreferredQuality.rawValue,
+                value: .string("1080p"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+            .init(
+                key: SettingKey.playbackMaxBitrateKbps.rawValue,
+                value: .int(8_000),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+        ]
+        await harness.settings.refreshFromServer()
+
+        XCTAssertEqual(harness.settings.preferredQualityResolution, "1080p")
+        XCTAssertEqual(harness.settings.maxBitrateKbps, 8_000)
+        // No preset covers it, so the UI describes the pair rather than
+        // showing a preset the user never chose.
+        XCTAssertNil(harness.settings.currentQualityPreset)
+        XCTAssertEqual(harness.settings.preferredQualityLabel, "1080p at 8 Mbps")
+    }
+
+    /// The server spells uncapped as JSON null; the client must read that as
+    /// "no cap" rather than as the integer 0, which the contract would refuse.
+    func testANullBitrateReadsBackAsUncapped() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = [
+            .init(
+                key: SettingKey.playbackPreferredQuality.rawValue,
+                value: .string("2160p"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+            .init(
+                key: SettingKey.playbackMaxBitrateKbps.rawValue,
+                value: .null,
+                source: .contractDefault
+            ),
+        ]
+        await harness.settings.refreshFromServer()
+
+        XCTAssertNil(harness.settings.maxBitrateKbps)
+        XCTAssertEqual(harness.settings.currentQualityPreset?.id, "2160p")
+    }
+
+    /// "original" is deprecated but older servers may still store it. It reads
+    /// as Auto, with or without a cap, and never as a custom "Original" pair.
+    func testAStoredOriginalQualityReadsAsAuto() async throws {
+        for (bitrate, label) in [(nil, "Auto"), (6_000, "Auto at 6 Mbps")] as [(Int?, String)] {
+            let harness = try PlayerSettingsHarness()
+            harness.transport.effective = [
+                .init(
+                    key: SettingKey.playbackPreferredQuality.rawValue,
+                    value: .string("original"),
+                    source: .scope(.profile),
+                    scope: .profile
+                ),
+                .init(
+                    key: SettingKey.playbackMaxBitrateKbps.rawValue,
+                    value: bitrate.map { .int($0) } ?? .null,
+                    source: .scope(.profile),
+                    scope: .profile
+                ),
+            ]
+            await harness.settings.refreshFromServer()
+
+            XCTAssertEqual(harness.settings.preferredQualityResolution, "auto")
+            XCTAssertEqual(harness.settings.preferredQuality, ApplePlaybackQuality.autoId)
+            XCTAssertEqual(harness.settings.preferredQualityLabel, label)
+            XCTAssertEqual(harness.settings.currentQualityPreset?.id, bitrate == nil ? "auto" : nil)
+        }
+        XCTAssertNil(SiloQualityPresets.preset(id: "original"))
+        XCTAssertEqual(SiloQualityPresets.describe(resolution: "original", bitrateKbps: 6_000),
+                       SiloQualityPresets.describe(resolution: "auto", bitrateKbps: 6_000))
+        XCTAssertEqual(APIv2QualityPreference(wireValue: "original"), .auto)
+        XCTAssertEqual(APIv2QualityPreference(wireValue: "original").wireValue, "auto")
+    }
+
+    // MARK: - Resolution and Maximum Bitrate pickers
+
+    private static func qualityRows(
+        resolution: String,
+        bitrateKbps: Int?,
+        scope: SettingScope = .profile
+    ) -> [EffectiveSettingValue] {
+        [
+            .init(
+                key: SettingKey.playbackPreferredQuality.rawValue,
+                value: .string(resolution),
+                source: .scope(scope),
+                scope: scope
+            ),
+            .init(
+                key: SettingKey.playbackMaxBitrateKbps.rawValue,
+                value: bitrateKbps.map { .int($0) } ?? .null,
+                source: .scope(scope),
+                scope: scope
+            ),
+        ]
+    }
+
+    /// Each picker writes only its own key, as on the web, so the other one
+    /// keeps following the profile. That includes a cap from another client
+    /// that no Maximum Bitrate choice covers.
+    func testEachQualityPickerWritesOnlyItsOwnKey() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = Self.qualityRows(resolution: "1080p", bitrateKbps: 3_000)
+        await harness.settings.refreshFromServer()
+        harness.transport.reset()
+
+        harness.settings.setQualityResolution("720p")
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertEqual(harness.transport.writes().map(\.key), [.playbackPreferredQuality])
+        XCTAssertEqual(harness.transport.writesByKey()[.playbackPreferredQuality]?.value, .string("720p"))
+        XCTAssertEqual(harness.transport.writesByKey()[.playbackPreferredQuality]?.scope, .profileDevice)
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.resolution))
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.maxBitrate), "the profile's 3 Mbps cap still applies")
+        XCTAssertEqual(harness.settings.maxBitrateKbps, 3_000)
+
+        harness.transport.reset()
+        harness.settings.setMaxBitrateKbps(20_000)
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertEqual(harness.transport.writes().map(\.key), [.playbackMaxBitrateKbps])
+        XCTAssertEqual(harness.transport.writesByKey()[.playbackMaxBitrateKbps]?.value, .int(20_000))
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.maxBitrate))
+
+        // "No limit" is an explicit null on this device, so the profile's cap
+        // does not come back underneath it.
+        harness.transport.reset()
+        harness.settings.setMaxBitrateKbps(nil)
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertEqual(harness.transport.writes().map(\.key), [.playbackMaxBitrateKbps])
+        XCTAssertEqual(harness.transport.writesByKey()[.playbackMaxBitrateKbps]?.value, .null)
+        XCTAssertNil(harness.settings.maxBitrateKbps)
+        XCTAssertEqual(harness.settings.preferredQualityResolution, "720p")
+    }
+
+    /// A stored cap no choice covers reads back as itself and is listed in
+    /// its place, so the picker can show it selected.
+    func testAStoredCapNoChoiceCoversStaysListedAndSelected() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = Self.qualityRows(resolution: "2160p", bitrateKbps: 3_000)
+        await harness.settings.refreshFromServer()
+
+        XCTAssertEqual(SiloQualityPresets.resolutionLabel(harness.settings.preferredQualityResolution), "4K")
+        XCTAssertEqual(SiloQualityPresets.bitrateLabel(harness.settings.maxBitrateKbps), "3 Mbps")
+        let choices = SiloQualityPresets.bitrateChoices(including: harness.settings.maxBitrateKbps)
+        XCTAssertEqual(
+            choices,
+            [200_000, 100_000, 60_000, 40_000, 20_000, 15_000, 10_000, 6_000, 4_000, 3_000, 2_000, 1_500]
+        )
+        XCTAssertEqual(harness.settings.preferredQualityLabel, "4K at 3 Mbps")
+
+        // A cap a choice already covers is not listed twice.
+        XCTAssertEqual(SiloQualityPresets.bitrateChoices(including: 6_000), SiloQualityPresets.bitrateChoicesKbps)
+        XCTAssertEqual(SiloQualityPresets.bitrateChoices(including: nil), SiloQualityPresets.bitrateChoicesKbps)
+        XCTAssertEqual(SiloQualityPresets.bitrateLabel(nil), "No limit")
+    }
+
+    func testEveryResolutionChoiceIsAContractMemberThatRoundTrips() {
+        for resolution in SiloQualityPresets.resolutionChoices {
+            XCTAssertTrue(Self.contractResolutions.contains(resolution), resolution)
+            XCTAssertEqual(SiloQualityPresets.normalizeResolution(resolution), resolution)
+        }
+        XCTAssertFalse(SiloQualityPresets.resolutionChoices.contains("original"))
+    }
+
+    // MARK: - Cellular quality
+
+    private static func cellularRows(
+        resolution: String,
+        bitrateKbps: Int?,
+        scope: SettingScope = .profile
+    ) -> [EffectiveSettingValue] {
+        [
+            .init(
+                key: SettingKey.playbackCellularPreferredQuality.rawValue,
+                value: .string(resolution),
+                source: .scope(scope),
+                scope: scope
+            ),
+            .init(
+                key: SettingKey.playbackCellularMaxBitrateKbps.rawValue,
+                value: bitrateKbps.map { .int($0) } ?? .null,
+                source: .scope(scope),
+                scope: scope
+            ),
+        ]
+    }
+
+    func testTheCellularPairDefaultsToThe720pPresetAndSavesAPresetAsBothKeys() async throws {
+        let harness = try PlayerSettingsHarness()
+        XCTAssertEqual(harness.settings.cellularQualityAxes, PlayerSettings.defaultCellularQuality)
+        XCTAssertEqual(harness.settings.currentCellularQualityPreset?.id, "720p")
+
+        await harness.settings.refreshFromServer()
+        harness.transport.reset()
+        harness.settings.setCellularQualityPreset(try XCTUnwrap(SiloQualityPresets.preset(id: "auto")))
+        await harness.settings.flushPendingDeviceSettings()
+
+        let byKey = harness.transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackCellularPreferredQuality]?.value, .string("auto"))
+        XCTAssertEqual(byKey[.playbackCellularMaxBitrateKbps]?.value, .null)
+        // The same scope as the main pair.
+        XCTAssertEqual(byKey[.playbackCellularPreferredQuality]?.scope, .profileDevice)
+        XCTAssertEqual(byKey[.playbackCellularMaxBitrateKbps]?.scope, .profileDevice)
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.cellularQuality))
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.resolution), "the main pair is untouched")
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.maxBitrate), "the main pair is untouched")
+
+        // Uncapped survives a relaunch rather than reading back as the 2 Mbps
+        // default an absent value means.
+        let relaunched = PlayerSettings(
+            defaults: harness.defaults,
+            flusher: PlayerSettingsFlusher(transport: harness.transport)
+        )
+        XCTAssertEqual(relaunched.cellularQualityAxes, .auto)
+    }
+
+    /// A server older than revision 20 does not define the keys: the pair is
+    /// not read, and a change stays on this device, still applied, until the
+    /// server serves the keys.
+    func testOnAnOlderServerTheCellularPairStaysOnThisDeviceUntilAnUpgrade() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.revision = SettingKey.cellularQualityRevision - 1
+        await harness.settings.refreshFromServer()
+        XCTAssertFalse(harness.transport.effectiveCalls().contains { $0.contains(.playbackCellularPreferredQuality) })
+
+        let preset = try XCTUnwrap(SiloQualityPresets.preset(id: "1080p"))
+        harness.settings.setCellularQualityPreset(preset)
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertTrue(harness.transport.writes().isEmpty, "nothing an older server would refuse is sent")
+        XCTAssertFalse(harness.settings.rejectedDeviceSettingChange)
+        XCTAssertTrue(harness.settings.heldDeviceSettingKeys.isEmpty)
+
+        await harness.settings.refreshFromServer()
+        let stored = AppleQualityAxes(resolution: "1080p", bitrateKbps: 6_000)
+        XCTAssertEqual(harness.settings.cellularQualityAxes, stored)
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.cellularQuality))
+        #if os(iOS)
+        XCTAssertEqual(harness.settings.playbackQualityAxes(onMeteredNetwork: true), stored)
+        #endif
+
+        // After the upgrade the owed change goes.
+        harness.transport.revision = SettingKey.cellularQualityRevision
+        await harness.settings.refreshFromServer()
+        let byKey = harness.transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackCellularPreferredQuality]?.value, .string("1080p"))
+        XCTAssertEqual(byKey[.playbackCellularMaxBitrateKbps]?.value, .int(6_000))
+    }
+
+    /// Before any read says which revision the server runs (an offline
+    /// launch), a change waits rather than risking a refusal.
+    func testACellularChangeWaitsForTheServersRevision() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.settings.setCellularQualityPreset(try XCTUnwrap(SiloQualityPresets.preset(id: "480p")))
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertTrue(harness.transport.writes().isEmpty)
+
+        await harness.settings.refreshFromServer()
+        let byKey = harness.transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackCellularPreferredQuality]?.value, .string("480p"))
+        XCTAssertEqual(byKey[.playbackCellularMaxBitrateKbps]?.value, .int(1_500))
+    }
+
+    /// An older server has no profile value to go back to, so "Use Profile
+    /// Setting" leaves the contract default and sends nothing.
+    func testUsingTheProfileCellularQualityOnAnOlderServerRestoresTheDefault() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.revision = SettingKey.cellularQualityRevision - 1
+        await harness.settings.refreshFromServer()
+        harness.settings.setCellularQualityPreset(try XCTUnwrap(SiloQualityPresets.preset(id: "480p")))
+        await harness.settings.flushPendingDeviceSettings()
+
+        await harness.settings.useProfileSetting(.cellularQuality)
+
+        XCTAssertTrue(harness.transport.deletes().isEmpty)
+        XCTAssertTrue(harness.transport.writes().isEmpty)
+        XCTAssertEqual(harness.settings.cellularQualityAxes, PlayerSettings.defaultCellularQuality)
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.cellularQuality))
+    }
+
+    #if os(iOS)
+    /// A current server's cellular pair comes from a batch of its own, so the
+    /// player batch stays readable on servers that predate the pair.
+    func testACurrentServersCellularPairIsReadInItsOwnBatch() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = Self.cellularRows(resolution: "480p", bitrateKbps: 1_500)
+        await harness.settings.refreshFromServer()
+
+        let calls = harness.transport.effectiveCalls()
+        XCTAssertEqual(calls.count, 3, "the player batch, the cellular pair and the buffering mode")
+        XCTAssertFalse(calls[0].contains(.playbackCellularPreferredQuality))
+        XCTAssertEqual(calls[1], SettingKey.playerCellularQualitySettings)
+        XCTAssertEqual(harness.settings.cellularQualityAxes, AppleQualityAxes(resolution: "480p", bitrateKbps: 1_500))
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.cellularQuality), "the profile's value")
+    }
+
+    /// When the cellular read fails, this device keeps its pair and whether
+    /// that pair is its own.
+    func testAMissingCellularAnswerKeepsThisDevicesPair() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = Self.cellularRows(resolution: "1080p", bitrateKbps: 3_000, scope: .profileDevice)
+        await harness.settings.refreshFromServer()
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.cellularQuality))
+
+        harness.transport.revision = SettingKey.cellularQualityRevision - 1
+        harness.transport.effective = []
+        await harness.settings.refreshFromServer()
+
+        XCTAssertEqual(harness.settings.cellularQualityAxes, AppleQualityAxes(resolution: "1080p", bitrateKbps: 3_000))
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.cellularQuality))
+        XCTAssertEqual(harness.settings.deviceChangedSettingCount, 1, "the pair counts once")
+    }
+
+    /// Discarding a held cellular change repaints the server's pair. While
+    /// the cellular read fails, the hold stays, as for any other key.
+    func testDiscardingAHeldCellularChangeRepaintsTheServersPair() async throws {
+        let harness = try PlayerSettingsHarness(retryPolicy: .init(maximumAutomaticRetries: 0))
+        let settings = harness.settings
+        let transport = harness.transport
+        transport.effective = Self.cellularRows(resolution: "480p", bitrateKbps: 1_500)
+        await settings.refreshFromServer()
+
+        transport.failNextWrites(100, with: .transport(description: "offline"))
+        settings.setCellularQualityPreset(try XCTUnwrap(SiloQualityPresets.preset(id: "1080p")))
+        await settings.flushPendingDeviceSettings()
+        try await waitUntil("the change is held") {
+            Set(settings.heldDeviceSettingKeys).isSuperset(of: SettingKey.playerCellularQualitySettings)
+        }
+        let edited = AppleQualityAxes(resolution: "1080p", bitrateKbps: 6_000)
+        XCTAssertEqual(settings.cellularQualityAxes, edited)
+
+        transport.onEffectiveValues = { [unowned transport] keys in
+            transport.effectiveError = keys == SettingKey.playerCellularQualitySettings
+                ? .transport(description: "offline")
+                : nil
+        }
+        let discardedOffline = await settings.discardHeldDeviceSettingChanges()
+        XCTAssertFalse(discardedOffline)
+        XCTAssertEqual(settings.cellularQualityAxes, edited)
+        XCTAssertFalse(settings.heldDeviceSettingKeys.isEmpty, "the change is still held, not silently dropped")
+
+        // Any failure of the cellular read keeps the holds, including one
+        // that would mean "no settings at all" if the player batch said it.
+        transport.onEffectiveValues = { [unowned transport] keys in
+            transport.effectiveError = keys == SettingKey.playerCellularQualitySettings
+                ? .serverUpgradeRequired
+                : nil
+        }
+        let discardedOnUpgradeAnswer = await settings.discardHeldDeviceSettingChanges()
+        XCTAssertFalse(discardedOnUpgradeAnswer)
+        XCTAssertEqual(settings.cellularQualityAxes, edited)
+        XCTAssertFalse(settings.heldDeviceSettingKeys.isEmpty)
+
+        transport.onEffectiveValues = nil
+        transport.effectiveError = nil
+        let discardedOnline = await settings.discardHeldDeviceSettingChanges()
+        XCTAssertTrue(discardedOnline)
+        XCTAssertEqual(settings.cellularQualityAxes, AppleQualityAxes(resolution: "480p", bitrateKbps: 1_500))
+        try await waitUntil("the hold clears") { settings.heldDeviceSettingKeys.isEmpty }
+    }
+    #endif
+
+    // MARK: - Buffering quality mode
+
+    private static func bufferingRow(_ mode: BufferingQualityMode, scope: SettingScope = .profile) -> EffectiveSettingValue {
+        .init(
+            key: SettingKey.playbackBufferingQualityMode.rawValue,
+            value: .string(mode.wireValue),
+            source: .scope(scope),
+            scope: scope
+        )
+    }
+
+    func testTheBufferingModeDefaultsToAutomaticAndIsSavedForThisDevice() async throws {
+        let harness = try PlayerSettingsHarness()
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .always)
+
+        await harness.settings.refreshFromServer()
+        harness.transport.reset()
+        harness.settings.setBufferingQualityMode(.never)
+        await harness.settings.flushPendingDeviceSettings()
+
+        let write = try XCTUnwrap(harness.transport.writesByKey()[.playbackBufferingQualityMode])
+        XCTAssertEqual(write.value, .string("never"))
+        XCTAssertEqual(write.scope, .profileDevice)
+        XCTAssertEqual(harness.transport.writes().count, 1, "only the mode is written")
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.bufferingQualityMode))
+
+        let relaunched = PlayerSettings(
+            defaults: harness.defaults,
+            flusher: PlayerSettingsFlusher(transport: harness.transport)
+        )
+        XCTAssertEqual(relaunched.bufferingQualityMode, .never)
+    }
+
+    /// The profile mode applies until this device overrides it.
+    func testTheBufferingModeUsesTheProfileValueAndCanClearItsDeviceOverride() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = [Self.bufferingRow(.ask)]
+        await harness.settings.refreshFromServer()
+
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .ask)
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.bufferingQualityMode), "the profile's value")
+
+        // "Use Profile Setting" clears this device's value and reads the
+        // profile's back.
+        harness.transport.effective = [Self.bufferingRow(.never, scope: .profileDevice)]
+        await harness.settings.refreshFromServer()
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.bufferingQualityMode))
+        harness.transport.reset()
+        harness.transport.effective = [Self.bufferingRow(.ask)]
+        await harness.settings.useProfileSetting(.bufferingQualityMode)
+        XCTAssertEqual(harness.transport.deletes(), [.playbackBufferingQualityMode])
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .ask)
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.bufferingQualityMode))
+    }
+
+    /// A server whose settings don't define the key plays `always`: the
+    /// player uses the default whatever this device chose before, and
+    /// Settings hides the row. A server that gains the key shows it again.
+    func testAServerWithoutTheBufferingSettingPlaysAutomatically() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = [Self.bufferingRow(.never, scope: .profileDevice)]
+        await harness.settings.refreshFromServer()
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .never)
+        XCTAssertFalse(harness.settings.serverLacksBufferingQualityMode)
+
+        harness.transport.revision = SettingKey.playbackBufferingQualityMode.introducedIn - 1
+        let result = await harness.settings.refreshFromServer()
+        XCTAssertEqual(result, .refreshed, "the player batch still refreshes")
+        XCTAssertTrue(harness.settings.serverLacksBufferingQualityMode)
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .always)
+        let relaunched = PlayerSettings(
+            defaults: harness.defaults,
+            flusher: PlayerSettingsFlusher(transport: harness.transport)
+        )
+        XCTAssertEqual(relaunched.bufferingQualityMode, .always, "offline at the next launch too")
+        XCTAssertTrue(relaunched.serverLacksBufferingQualityMode, "and the row stays hidden")
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.bufferingQualityMode),
+                       "the device value it had is not one this server keeps")
+
+        harness.transport.revision = SettingKey.playbackBufferingQualityMode.introducedIn
+        harness.transport.effective = [Self.bufferingRow(.ask)]
+        await harness.settings.refreshFromServer()
+        XCTAssertFalse(harness.settings.serverLacksBufferingQualityMode)
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .ask)
+    }
+
+    /// Once the server is known to lack the setting, a picker still open
+    /// stores nothing: playback stays on Automatically.
+    func testAServerWithoutTheBufferingSettingTakesNoChoice() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.revision = SettingKey.playbackBufferingQualityMode.introducedIn - 1
+        await harness.settings.refreshFromServer()
+        XCTAssertTrue(harness.settings.serverLacksBufferingQualityMode)
+        harness.transport.reset()
+        harness.settings.setBufferingQualityMode(.never)
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .always)
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.bufferingQualityMode))
+        XCTAssertTrue(harness.transport.writes().isEmpty)
+    }
+
+    /// The setting is found by its key, not by the manifest revision: a
+    /// server that answers the key has it.
+    func testTheBufferingSettingIsFoundByItsKey() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.onEffectiveValues = { [unowned transport = harness.transport] keys in
+            transport.effectiveError = keys == SettingKey.playerBufferingQualitySettings
+                ? .unknownSetting(key: SettingKey.playbackBufferingQualityMode.rawValue)
+                : nil
+        }
+        await harness.settings.refreshFromServer()
+        XCTAssertTrue(harness.settings.serverLacksBufferingQualityMode, "a current revision that refuses the key")
+    }
+
+    /// A server that answers the key has the setting, even at a revision
+    /// below the one this build records for it: the row shows, and a change
+    /// is saved there.
+    func testAServerThatAnswersTheKeyHasTheSettingWhateverItsRevision() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.revision = SettingKey.playbackBufferingQualityMode.introducedIn - 2
+        harness.transport.alsoDefines = [.playbackBufferingQualityMode]
+        harness.transport.effective = [Self.bufferingRow(.ask)]
+        await harness.settings.refreshFromServer()
+        XCTAssertFalse(harness.settings.serverLacksBufferingQualityMode)
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .ask)
+
+        harness.transport.reset()
+        harness.settings.setBufferingQualityMode(.never)
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertEqual(harness.transport.writesByKey()[.playbackBufferingQualityMode]?.value, .string("never"))
+    }
+
+    /// A server that stops answering the key no longer takes writes to it,
+    /// though an earlier read had its row.
+    func testAServerThatDropsTheKeyTakesNoWrites() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.revision = SettingKey.playbackBufferingQualityMode.introducedIn - 2
+        harness.transport.alsoDefines = [.playbackBufferingQualityMode]
+        harness.transport.effective = [Self.bufferingRow(.ask)]
+        await harness.settings.refreshFromServer()
+
+        harness.transport.alsoDefines = []
+        await harness.settings.refreshFromServer()
+        XCTAssertTrue(harness.settings.serverLacksBufferingQualityMode)
+        harness.transport.reset()
+        harness.settings.setBufferingQualityMode(.never)
+        await harness.settings.flushPendingDeviceSettings()
+        XCTAssertTrue(harness.transport.writes().isEmpty)
+    }
+
+    /// An answer that carries a key's row serves that key, whatever revision
+    /// it reports; one without the row, from a revision before the key,
+    /// doesn't.
+    func testAResponseServesAKeyItHasARowFor() {
+        let key = SettingKey.playbackBufferingQualityMode
+        let older = key.introducedIn - 2
+        let withRow = EffectiveSettingValuesResponse(settings: [Self.bufferingRow(.ask)], revision: older)
+        XCTAssertTrue(withRow.servesAll([key]))
+        XCTAssertFalse(EffectiveSettingValuesResponse(settings: [], revision: older).servesAll([key]))
+        XCTAssertTrue(EffectiveSettingValuesResponse(settings: [], revision: key.introducedIn).servesAll([key]))
+    }
+
+    /// An older server has no profile value to go back to, so "Use Profile
+    /// Setting" leaves the contract default and sends nothing.
+    func testUsingTheProfileBufferingModeOnAnOlderServerRestoresTheDefault() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.revision = SettingKey.playbackBufferingQualityMode.introducedIn - 1
+        await harness.settings.refreshFromServer()
+
+        await harness.settings.useProfileSetting(.bufferingQualityMode)
+
+        XCTAssertTrue(harness.transport.deletes().isEmpty)
+        XCTAssertTrue(harness.transport.writes().isEmpty)
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .default)
+        XCTAssertFalse(harness.settings.hasDeviceOverride(.bufferingQualityMode))
+    }
+
+    /// When the mode's read fails, this device keeps its mode and whether it
+    /// is its own.
+    func testAFailedBufferingModeReadKeepsThisDevicesMode() async throws {
+        let harness = try PlayerSettingsHarness()
+        harness.transport.effective = [Self.bufferingRow(.never, scope: .profileDevice)]
+        await harness.settings.refreshFromServer()
+
+        harness.transport.onEffectiveValues = { [unowned transport = harness.transport] keys in
+            transport.effectiveError = keys == SettingKey.playerBufferingQualitySettings
+                ? .transport(description: "offline")
+                : nil
+        }
+        harness.transport.effective = []
+        let result = await harness.settings.refreshFromServer()
+
+        XCTAssertEqual(result, .refreshed, "the player batch still refreshes")
+        XCTAssertEqual(harness.settings.bufferingQualityMode, .never)
+        XCTAssertTrue(harness.settings.hasDeviceOverride(.bufferingQualityMode))
+    }
+
+    // MARK: - Profile-scoped writes
+
+    func testSubtitlePrefsAreWrittenAtProfileScope() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.setSubtitleLanguage("ja")
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+        await editor.setShowForcedSubtitles(false)
+
+        let byKey = transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackSubtitleLanguage]?.value, .string("ja"))
+        XCTAssertEqual(byKey[.playbackSubtitleMode]?.value, .string("always"))
+        XCTAssertEqual(byKey[.playbackShowForcedSubtitles]?.value, .bool(false))
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// "No preference" is the contract's null. The legacy profile endpoint
+    /// spelled it as the empty string, which the `language_tag` validator
+    /// rejects outright — so sending "" here would be a permanent
+    /// `invalid_value`.
+    func testNoLanguagePreferenceIsSentAsNullNotAnEmptyString() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        // The fields start at the sentinel, so choose a language first.
+        await editor.setSubtitleLanguage("ja")
+        await editor.setSubtitleLanguage(PlaybackPrefSentinel.none)
+        await editor.setPreferredMetadataLanguage("ja")
+        await editor.setPreferredMetadataLanguage(PlaybackPrefSentinel.none)
+
+        let byKey = transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackSubtitleLanguage]?.value, .null)
+        XCTAssertEqual(byKey[.catalogMetadataLanguage]?.value, .null)
+        for write in transport.writes() {
+            XCTAssertNotEqual(write.value, .string(""), "\(write.key.rawValue) sent an empty language tag")
+        }
+    }
+
+    func testMetadataLanguageIsWrittenAtProfileScope() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.setPreferredMetadataLanguage("de")
+
+        XCTAssertEqual(transport.writesByKey()[.catalogMetadataLanguage]?.value, .string("de"))
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// The spoken-language picker must NOT write here. It is a device-scoped
+    /// setting, and the contract resolves `profile_device` above `profile` —
+    /// so a profile write would be shadowed by this device's own row and look
+    /// like it never saved. Old Apple builds already wrote those device rows,
+    /// so the shadowing is real on existing installs.
+    func testProfileScopeNeverWritesTheAudioLanguage() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.setSubtitleLanguage("fr")
+        await editor.setPreferredMetadataLanguage("fr")
+
+        XCTAssertFalse(
+            transport.writes().contains { $0.key == .playbackAudioLanguage },
+            "playback.audio_language is device-scoped; a profile write would be shadowed by the device row"
+        )
+        XCTAssertFalse(ProfileSettingKeys.all.contains(.playbackAudioLanguage))
+    }
+
+    /// The only no-op filter left: re-selecting what a control shows is not
+    /// an edit. For the metadata language it also keeps the cached overviews
+    /// from being flushed for nothing.
+    func testChoosingTheShownValueSendsNothing() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(key: SettingKey.playbackSubtitleLanguage.rawValue, value: .string("es"),
+                  source: .scope(.profile), scope: .profile),
+            .init(key: SettingKey.playbackSubtitleMode.rawValue, value: .string("off"),
+                  source: .scope(.profile), scope: .profile),
+            .init(key: SettingKey.playbackShowForcedSubtitles.rawValue, value: .bool(false),
+                  source: .scope(.profile), scope: .profile),
+            .init(key: SettingKey.catalogMetadataLanguage.rawValue, value: .string("it"),
+                  source: .scope(.profile), scope: .profile),
+        ]
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        await editor.load()
+
+        await editor.setSubtitleLanguage("es")
+        await editor.setSubtitleMode(SubtitleMode.off.rawValue)
+        await editor.setShowForcedSubtitles(false)
+        await editor.setPreferredMetadataLanguage("it")
+
+        XCTAssertTrue(transport.writes().isEmpty)
+        XCTAssertNil(editor.saveState)
+    }
+
+    func testEveryProfileKeyIsReadInOneBatch() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.load()
+
+        XCTAssertEqual(transport.effectiveCalls().count, 1, "the screen must not fan out one call per key")
+        XCTAssertEqual(Set(transport.effectiveCalls().first ?? []), Set(ProfileSettingKeys.all))
+    }
+
+    // MARK: - Reads
+
+    func testLoadAdoptsTheResolvedValues() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(key: SettingKey.playbackSubtitleLanguage.rawValue, value: .string("es"),
+                  source: .scope(.profile), scope: .profile),
+            .init(key: SettingKey.playbackSubtitleMode.rawValue, value: .string("off"),
+                  source: .scope(.profile), scope: .profile),
+            .init(key: SettingKey.playbackShowForcedSubtitles.rawValue, value: .bool(false),
+                  source: .scope(.profile), scope: .profile),
+            .init(key: SettingKey.catalogMetadataLanguage.rawValue, value: .string("it"),
+                  source: .scope(.profile), scope: .profile),
+        ]
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.load()
+
+        XCTAssertEqual(editor.subtitleLanguage, "es")
+        XCTAssertEqual(editor.subtitleMode, "off")
+        XCTAssertEqual(editor.showForcedSubtitles, "off")
+        XCTAssertEqual(editor.preferredMetadataLanguage, "it")
+    }
+
+    /// A stored `false` must survive. The contract's default for
+    /// `show_forced_subtitles` is true, so a reader that treated a resolved
+    /// value as "absent" would flip the toggle back on every refresh.
+    func testAStoredFalseIsNotMistakenForAnAbsentValue() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(key: SettingKey.playbackShowForcedSubtitles.rawValue, value: .bool(false),
+                  source: .scope(.profile), scope: .profile),
+        ]
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.load()
+
+        XCTAssertEqual(editor.showForcedSubtitles, "off")
+    }
+
+    /// A null language is "no preference", which the editor shows as its
+    /// sentinel rather than as a literal.
+    func testANullLanguageBecomesTheNonePickerSentinel() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(key: SettingKey.playbackSubtitleLanguage.rawValue, value: .null,
+                  source: .contractDefault),
+            .init(key: SettingKey.catalogMetadataLanguage.rawValue, value: .null,
+                  source: .contractDefault),
+        ]
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.load()
+
+        XCTAssertEqual(editor.subtitleLanguage, PlaybackPrefSentinel.none)
+        XCTAssertEqual(editor.preferredMetadataLanguage, PlaybackPrefSentinel.none)
+    }
+
+    // MARK: - Server upgrade required
+
+    /// A server with no canonical settings routes is a distinct, actionable
+    /// state: the screens explain it instead of rendering a broken control.
+    func testAnOldServerSurfacesAsUpgradeRequiredOnRead() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failReadsWith = .serverUpgradeRequired
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.load()
+
+        XCTAssertTrue(editor.serverUpgradeRequired)
+    }
+
+    func testAnOldServerReadDisablesSubsequentProfileSaveAttempts() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failReadsWith = .serverUpgradeRequired
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.load()
+        await editor.setSubtitleLanguage("en")
+        await editor.setPreferredMetadataLanguage("fr")
+
+        XCTAssertTrue(transport.writes().isEmpty)
+        XCTAssertEqual(editor.saveState, .serverUpgradeRequired)
+    }
+
+    func testAnOldServerSurfacesAsUpgradeRequiredOnWrite() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failWritesWith = .serverUpgradeRequired
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.setSubtitleLanguage("en")
+
+        XCTAssertEqual(editor.saveState, .serverUpgradeRequired)
+        XCTAssertTrue(editor.serverUpgradeRequired)
+
+        let attempts = transport.writes().count
+        await editor.setSubtitleLanguage("fr")
+        XCTAssertEqual(
+            transport.writes().count,
+            attempts,
+            "once the old server is known, later edits must not issue broken requests"
+        )
+    }
+
+    func testOldServerDetectionStopsAnOverlappingSubtitleSaveDrain() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failWritesWith = .serverUpgradeRequired
+        await transport.writeGate.block(.string("en"))
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleLanguage("en") }
+        await transport.writeGate.waitUntilEntered(.string("en"))
+
+        await editor.setSubtitleLanguage("fr")
+        await transport.writeGate.release(.string("en"))
+        await firstSave.value
+
+        XCTAssertEqual(transport.writes().map(\.value), [.string("en")])
+        XCTAssertTrue(editor.serverUpgradeRequired)
+
+        transport.failWritesWith = nil
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("ja"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+        ]
+        await editor.load()
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+        XCTAssertEqual(
+            transport.writes().filter { $0.key == .playbackSubtitleLanguage }.map(\.value),
+            [.string("en")],
+            "a later successful load and sibling edit must not revive the obsolete queued edit"
+        )
+        XCTAssertEqual(editor.subtitleLanguage, "ja", "nothing is left queued, so the read repaints")
+    }
+
+    func testOldServerDetectionStopsAnOverlappingMetadataSaveDrain() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failWritesWith = .serverUpgradeRequired
+        await transport.writeGate.block(.string("en"))
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        let firstSave = Task { @MainActor in await editor.setPreferredMetadataLanguage("en") }
+        await transport.writeGate.waitUntilEntered(.string("en"))
+
+        await editor.setPreferredMetadataLanguage("fr")
+        await transport.writeGate.release(.string("en"))
+        await firstSave.value
+
+        XCTAssertEqual(transport.writes().map(\.value), [.string("en")])
+        XCTAssertTrue(editor.serverUpgradeRequired)
+
+        transport.failWritesWith = nil
+        transport.effective = [
+            .init(
+                key: SettingKey.catalogMetadataLanguage.rawValue,
+                value: .string("ja"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+        ]
+        await editor.load()
+        XCTAssertEqual(
+            transport.writes().map(\.value),
+            [.string("en")],
+            "a later successful load must not revive the obsolete queued edit"
+        )
+        XCTAssertEqual(editor.preferredMetadataLanguage, "ja", "nothing is left queued, so the read repaints")
+    }
+
+    /// A transient read failure must not blank the screen: snapping every
+    /// control to a contract default the profile never chose looks exactly like
+    /// the server having wiped their settings.
+    func testATransientReadFailureLeavesTheEditorAlone() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        await editor.setSubtitleLanguage("ko")
+        await editor.setShowForcedSubtitles(false)
+
+        transport.failReadsWith = .transport(description: "offline")
+        await editor.load()
+
+        XCTAssertEqual(editor.subtitleLanguage, "ko")
+        XCTAssertEqual(editor.showForcedSubtitles, "off")
+        XCTAssertFalse(editor.serverUpgradeRequired)
+    }
+
+    // MARK: - Bounded retry and held changes (owner decision D4)
+
+    /// A write that may have been lost is retried as the same desired value
+    /// within the bound, then held: not sent again until the user asks.
+    func testATransientFailureIsRetriedWithinTheBoundThenHeld() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+
+        transport.failWritesWith = .server(status: 503, code: nil, message: nil)
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+
+        var modeWrites = transport.writes().filter { $0.key == .playbackSubtitleMode }
+        XCTAssertEqual(modeWrites.map(\.value), Array(repeating: .string("always"), count: 4),
+                       "one attempt plus three bounded retries of the same value")
+        XCTAssertEqual(editor.saveState, .held)
+        XCTAssertTrue(editor.hasHeldChanges)
+
+        // An edit of another control must not send the held value with it.
+        transport.failWritesWith = nil
+        await editor.setSubtitleLanguage("ja")
+        XCTAssertEqual(transport.writesByKey()[.playbackSubtitleLanguage]?.value, .string("ja"))
+        XCTAssertEqual(transport.writes().filter { $0.key == .playbackSubtitleMode }.count, 4)
+
+        // "Try Again" sends it with a fresh budget.
+        await editor.retryHeldChanges()
+        modeWrites = transport.writes().filter { $0.key == .playbackSubtitleMode }
+        XCTAssertEqual(modeWrites.count, 5)
+        XCTAssertEqual(editor.saveState, .saved)
+        XCTAssertFalse(editor.hasHeldChanges)
+    }
+
+    func testDiscardingAHeldChangeRepaintsTheServerValueWithoutWriting() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("en"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+        ]
+
+        transport.failWritesWith = .transport(description: "offline")
+        await editor.setSubtitleLanguage("ja")
+        XCTAssertTrue(editor.hasHeldChanges)
+
+        // A reload while held keeps showing the user's unsaved choice.
+        await editor.load()
+        XCTAssertEqual(editor.subtitleLanguage, "ja")
+        let attempts = transport.writes().count
+
+        await editor.discardHeldChanges()
+        XCTAssertFalse(editor.hasHeldChanges)
+        XCTAssertEqual(editor.subtitleLanguage, "en", "discarding shows what the server holds")
+        XCTAssertNil(editor.saveState)
+        XCTAssertEqual(transport.writes().count, attempts, "discarding sends nothing")
+    }
+
+    /// Offline, the reload after a discard fails and leaves the fields alone.
+    /// The discarded value must not stay on screen, and the next change to
+    /// any other control must not send it along.
+    func testDiscardingAHeldChangeOfflineDoesNotSendItWithTheNextEdit() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("en"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+            .init(
+                key: SettingKey.catalogMetadataLanguage.rawValue,
+                value: .string("de"),
+                source: .scope(.profile),
+                scope: .profile
+            ),
+        ]
+        await editor.load()
+
+        transport.failWritesWith = .transport(description: "offline")
+        transport.failReadsWith = .transport(description: "offline")
+        await editor.setSubtitleLanguage("ja")
+        await editor.setPreferredMetadataLanguage("ko")
+        XCTAssertTrue(editor.hasHeldChanges)
+        let heldAttempts = transport.writes().count
+
+        await editor.discardHeldChanges()
+        XCTAssertFalse(editor.hasHeldChanges)
+        XCTAssertEqual(editor.subtitleLanguage, "en", "the discarded control shows the last server value")
+        XCTAssertEqual(editor.preferredMetadataLanguage, "de")
+
+        transport.failWritesWith = nil
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+
+        let sent = transport.writes().dropFirst(heldAttempts)
+        XCTAssertEqual(sent.map(\.key), [.playbackSubtitleMode], "only the new edit is sent")
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    func testANewEditReplacesAHeldValue() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+
+        transport.failWritesWith = .transport(description: "offline")
+        await editor.setPreferredMetadataLanguage("ja")
+        XCTAssertEqual(editor.saveState, .held)
+
+        transport.failWritesWith = nil
+        await editor.setPreferredMetadataLanguage("ko")
+
+        let values = transport.writes().filter { $0.key == .catalogMetadataLanguage }.map(\.value)
+        XCTAssertEqual(values.last, .string("ko"))
+        XCTAssertFalse(values.dropLast().contains(.string("ko")))
+        XCTAssertEqual(editor.saveState, .saved)
+        XCTAssertFalse(editor.hasHeldChanges)
+    }
+
+    func testANewEditReplacesAHeldSubtitleValue() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+
+        transport.failWritesWith = .server(status: 503, code: nil, message: nil)
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+        XCTAssertEqual(editor.saveState, .held)
+
+        transport.failWritesWith = nil
+        await editor.setSubtitleMode(SubtitleMode.off.rawValue)
+
+        let values = transport.writes().filter { $0.key == .playbackSubtitleMode }.map(\.value)
+        XCTAssertEqual(values.last, .string("off"))
+        XCTAssertFalse(values.dropLast().contains(.string("off")))
+        XCTAssertFalse(editor.hasHeldChanges)
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// The writer records a hold after the final failed attempt without
+    /// checking for a newer edit. An edit queued while that attempt was in
+    /// flight must still replace the hold, or "Try Again" would later send
+    /// the old value over it.
+    func testAnEditQueuedDuringTheFinalAttemptReplacesTheHeldValue() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: ProfileSettingsWriter(
+            transport: transport,
+            retryPolicy: .init(maximumAutomaticRetries: 0, base: .milliseconds(1), maximum: .milliseconds(1))
+        ))
+        editor.seed(from: nil)
+        await transport.writeGate.block(.string("always"))
+        transport.setWriteFailure(.server(status: 503, code: nil, message: nil), for: .playbackSubtitleMode)
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleMode(SubtitleMode.always.rawValue) }
+        await transport.writeGate.waitUntilEntered(.string("always"))
+        // The fake captured the failure when "always" entered, so it still fails.
+        transport.setWriteFailure(nil, for: .playbackSubtitleMode)
+        await editor.setSubtitleMode(SubtitleMode.off.rawValue)
+        await transport.writeGate.release(.string("always"))
+        await firstSave.value
+
+        XCTAssertEqual(
+            transport.writes().filter { $0.key == .playbackSubtitleMode }.map(\.value),
+            [.string("always"), .string("off")]
+        )
+        XCTAssertFalse(editor.hasHeldChanges)
+        XCTAssertEqual(editor.saveState, .saved)
+        XCTAssertEqual(editor.subtitleMode, "off")
+    }
+
+    /// The same race, seen by a reload: while a sibling write in the same
+    /// pass is in flight, the stale hold and the newer edit both exist. A
+    /// reload then must keep showing the newer edit, or it lands while the
+    /// control shows the held value.
+    func testAReloadBeforeAStaleHoldIsReplacedKeepsTheNewerEdit() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(key: SettingKey.playbackSubtitleLanguage.rawValue, value: .string("ja"),
+                  source: .scope(.profile), scope: .profile),
+        ]
+        let editor = ProfilePrefsEditor(writer: ProfileSettingsWriter(
+            transport: transport,
+            retryPolicy: .init(maximumAutomaticRetries: 0, base: .milliseconds(1), maximum: .milliseconds(1))
+        ))
+        editor.seed(from: nil)
+        await transport.writeGate.block(.string("ja"))
+        await transport.writeGate.block(.string("always"))
+        await transport.writeGate.block(.bool(false))
+
+        // Queue mode and forced behind a language write so one pass sends both.
+        let languageEdit = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+        await editor.setShowForcedSubtitles(false)
+        transport.setWriteFailure(.server(status: 503, code: nil, message: nil), for: .playbackSubtitleMode)
+        await transport.writeGate.release(.string("ja"))
+
+        // The mode's only attempt is in flight when the user moves the control.
+        await transport.writeGate.waitUntilEntered(.string("always"))
+        transport.setWriteFailure(nil, for: .playbackSubtitleMode)
+        await editor.setSubtitleMode(SubtitleMode.off.rawValue)
+        await transport.writeGate.release(.string("always"))
+
+        // "always" is held, "off" is queued, and the forced write is in flight.
+        await transport.writeGate.waitUntilEntered(.bool(false))
+        await editor.load()
+        XCTAssertEqual(editor.subtitleMode, "off", "a reload must not show a stale hold over a newer edit")
+        await transport.writeGate.release(.bool(false))
+        await languageEdit.value
+
+        XCTAssertEqual(
+            transport.writes().filter { $0.key == .playbackSubtitleMode }.map(\.value),
+            [.string("always"), .string("off")]
+        )
+        XCTAssertEqual(editor.subtitleMode, "off")
+        XCTAssertFalse(editor.hasHeldChanges)
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// A refusal retrying cannot change is reported, not retried.
+    func testARefusedWriteIsNotRetried() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failWritesWith = .invalidValue(message: "not a language tag")
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+
+        await editor.setSubtitleLanguage("not a tag")
+
+        XCTAssertEqual(transport.writes().count, 1)
+        XCTAssertEqual(editor.saveState, .failed("not a language tag"))
+        XCTAssertFalse(editor.hasHeldChanges)
+    }
+
+    /// A value the server refused is released: the control goes back to the
+    /// server value, and the next edit of a sibling control does not send the
+    /// refused value again.
+    func testARefusedSubtitleWriteIsNotSentAgainWithTheNextEdit() async throws {
+        let refusals: [SettingsAPIError] = [
+            .invalidValue(message: "not a language tag"),
+            .server(status: 403, code: "forbidden", message: nil),
+        ]
+        for refusal in refusals {
+            let transport = FakeProfileSettingsTransport()
+            transport.failWritesByKey[.playbackSubtitleLanguage] = refusal
+            let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+            editor.seed(from: nil)
+
+            await editor.setSubtitleLanguage("not a tag")
+            guard case .failed = editor.saveState else {
+                return XCTFail("the refusal must be reported: \(refusal)")
+            }
+            XCTAssertEqual(editor.subtitleLanguage, PlaybackPrefSentinel.none, "\(refusal)")
+
+            await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+
+            XCTAssertEqual(
+                transport.writes().filter { $0.key == .playbackSubtitleLanguage }.count,
+                1,
+                "a refused value is not re-sent: \(refusal)"
+            )
+            XCTAssertEqual(
+                transport.writes().filter { $0.key == .playbackSubtitleMode }.map(\.value),
+                [.string("always")]
+            )
+            XCTAssertEqual(editor.saveState, .saved)
+        }
+    }
+
+    func testEachEditProducesItsOwnWrite() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+        await editor.setSubtitleMode(SubtitleMode.off.rawValue)
+
+        let modeWrites = transport.writes().filter { $0.key == .playbackSubtitleMode }
+        XCTAssertEqual(modeWrites.map(\.value), [.string("always"), .string("off")])
+    }
+
+    func testQueuedSubtitleEditsKeepTheProfileThatOwnedEachEdit() async throws {
+        let transport = FakeProfileSettingsTransport()
+        await transport.writeGate.block(.string("ja"))
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.bindProfile(id: "profile-1")
+        editor.seed(from: nil)
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+
+        editor.bindProfile(id: "profile-2")
+        await editor.setSubtitleLanguage("ko")
+        await transport.writeGate.release(.string("ja"))
+        await firstSave.value
+
+        let writes = transport.writes().filter { $0.key == .playbackSubtitleLanguage }
+        XCTAssertEqual(writes.map(\.value), [.string("ja"), .string("ko")])
+        XCTAssertEqual(writes.map(\.profileId), ["profile-1", "profile-2"])
+    }
+
+    func testFailedWriteForPreviousProfileSurvivesAQueuedCurrentProfileEdit() async throws {
+        let transport = FakeProfileSettingsTransport()
+        await transport.writeGate.block(.string("ja"))
+        transport.setWriteFailure(
+            .transport(description: "response lost"),
+            for: .playbackSubtitleLanguage
+        )
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.bindProfile(id: "profile-1")
+        editor.seed(from: nil)
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+
+        editor.bindProfile(id: "profile-2")
+        await editor.setSubtitleLanguage("ko")
+        transport.setWriteFailure(nil, for: .playbackSubtitleLanguage)
+        await transport.writeGate.release(.string("ja"))
+        await firstSave.value
+
+        let writes = transport.writes().filter { $0.key == .playbackSubtitleLanguage }
+        XCTAssertEqual(writes.map(\.value), [.string("ja"), .string("ja"), .string("ko")])
+        XCTAssertEqual(
+            writes.map(\.profileId),
+            ["profile-1", "profile-1", "profile-2"],
+            "the previous profile's ambiguous write is retried for that profile before the new edit"
+        )
+    }
+
+    func testQueuedMetadataEditsKeepTheProfileThatOwnedEachEdit() async throws {
+        let transport = FakeProfileSettingsTransport()
+        await transport.writeGate.block(.string("ja"))
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.bindProfile(id: "profile-1")
+        editor.seed(from: nil)
+
+        let firstSave = Task { @MainActor in await editor.setPreferredMetadataLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+
+        editor.bindProfile(id: "profile-2")
+        await editor.setPreferredMetadataLanguage("ko")
+        await transport.writeGate.release(.string("ja"))
+        await firstSave.value
+
+        let writes = transport.writes().filter { $0.key == .catalogMetadataLanguage }
+        XCTAssertEqual(writes.map(\.value), [.string("ja"), .string("ko")])
+        XCTAssertEqual(writes.map(\.profileId), ["profile-1", "profile-2"])
+    }
+
+    func testProfileSwitchSettlesMetadataSaveStateWithoutAReplacementWrite() async throws {
+        let outcomes: [SettingsAPIError?] = [
+            nil,
+            .transport(description: "response lost"),
+        ]
+
+        for outcome in outcomes {
+            let transport = FakeProfileSettingsTransport()
+            await transport.writeGate.block(.string("ja"))
+            transport.failWritesWith = outcome
+            let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+            editor.bindProfile(id: "profile-1")
+            editor.seed(from: nil)
+
+            let save = Task { @MainActor in await editor.setPreferredMetadataLanguage("ja") }
+            await transport.writeGate.waitUntilEntered(.string("ja"))
+
+            editor.bindProfile(id: "profile-2")
+            await transport.writeGate.release(.string("ja"))
+            await save.value
+
+            XCTAssertNil(
+                editor.saveState,
+                "a stale completion must not leave the newly bound profile showing Saving"
+            )
+        }
+    }
+
+    // MARK: - Reads never send
+
+    /// A value the effective read resolved from a *narrower* scope must not be
+    /// written back at `profile` scope on screen open.
+    ///
+    /// All three subtitle keys list `profile_device` in `allowed_scopes`, and
+    /// the web admin's per-device settings pane writes them there. This editor
+    /// only ever writes at `profile`, so sending a value the read painted
+    /// would promote one device's override to the whole household, with the
+    /// user having touched nothing.
+    func testOpeningTheScreenDoesNotPromoteADeviceOverrideToTheProfile() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        // The profile's own language is "ja"; this device has a profile_device
+        // row of "en", which is what the effective endpoint resolves.
+        editor.seed(from: nil)
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("en"),
+                source: .scope(.profileDevice),
+                scope: .profileDevice
+            ),
+            .init(
+                key: SettingKey.playbackSubtitleMode.rawValue,
+                value: .string(SubtitleMode.always.rawValue),
+                source: .scope(.profileDevice),
+                scope: .profileDevice
+            ),
+            .init(
+                key: SettingKey.playbackShowForcedSubtitles.rawValue,
+                value: .bool(false),
+                source: .scope(.profileDevice),
+                scope: .profileDevice
+            ),
+        ]
+        await editor.load()
+        XCTAssertEqual(editor.subtitleLanguage, "en", "precondition: the resolved value is painted")
+        XCTAssertTrue(
+            transport.writes().isEmpty,
+            "a repaint is not a user edit: writing it back would promote the device row to the profile"
+        )
+
+        await editor.setSubtitleMode(SubtitleMode.off.rawValue)
+
+        XCTAssertEqual(
+            transport.writes().map(\.key),
+            [.playbackSubtitleMode],
+            "an edit sends only the control the user changed"
+        )
+    }
+
+    /// Reads never send, but a control the user actually touches still saves.
+    func testAnEditAfterALoadStillSaves() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("en"),
+                source: .scope(.profileDevice),
+                scope: .profileDevice
+            ),
+        ]
+        await editor.load()
+
+        await editor.setSubtitleLanguage("ja")
+
+        let byKey = transport.writesByKey()
+        XCTAssertEqual(byKey[.playbackSubtitleLanguage]?.value, .string("ja"))
+        // And only that key: the two the user did not touch stay where the
+        // server resolved them.
+        XCTAssertNil(byKey[.playbackSubtitleMode], "an untouched control must not be written")
+        XCTAssertNil(byKey[.playbackShowForcedSubtitles], "an untouched control must not be written")
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// A reload that lands while the user's write is in flight is a read,
+    /// not an edit. Sending it back would revert the user's choice on the
+    /// server, and here would also promote the device row to the profile.
+    func testAReloadDuringASubtitleWriteDoesNotSendTheReadValueBack() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+        transport.effective = [
+            .init(key: SettingKey.playbackSubtitleLanguage.rawValue, value: .string("en"),
+                  source: .scope(.profileDevice), scope: .profileDevice),
+        ]
+        await transport.writeGate.block(.string("ja"))
+
+        let edit = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+        await editor.load()
+        await transport.writeGate.release(.string("ja"))
+        await edit.value
+
+        XCTAssertEqual(
+            transport.writes().filter { $0.key == .playbackSubtitleLanguage }.map(\.value),
+            [.string("ja")],
+            "neither the stale read nor the device value may be sent to the profile"
+        )
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    func testAReloadDuringASubtitleWriteKeepsTheUserValueOnScreen() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+        transport.effective = [
+            .init(key: SettingKey.playbackSubtitleLanguage.rawValue, value: .string("en"),
+                  source: .scope(.profile), scope: .profile),
+        ]
+        await transport.writeGate.block(.string("ja"))
+
+        let edit = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+        await editor.load()
+        XCTAssertEqual(editor.subtitleLanguage, "ja", "a read must not replace an edit still in flight")
+        await transport.writeGate.release(.string("ja"))
+        await edit.value
+
+        XCTAssertEqual(editor.subtitleLanguage, "ja")
+        XCTAssertEqual(editor.saveState, .saved)
+        XCTAssertEqual(transport.writes().filter { $0.key == .playbackSubtitleLanguage }.count, 1)
+    }
+
+    func testAReloadDuringAMetadataWriteKeepsTheEditOnScreen() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+        await transport.writeGate.block(.string("ja"))
+
+        let edit = Task { @MainActor in await editor.setPreferredMetadataLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+        transport.effective = [
+            .init(key: SettingKey.catalogMetadataLanguage.rawValue, value: .string("de"),
+                  source: .scope(.profile), scope: .profile),
+        ]
+        await editor.load()
+        await transport.writeGate.release(.string("ja"))
+        await edit.value
+
+        XCTAssertEqual(
+            transport.writes().filter { $0.key == .catalogMetadataLanguage }.map(\.value),
+            [.string("ja")]
+        )
+        XCTAssertEqual(editor.preferredMetadataLanguage, "ja")
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// A write that was not sent because a precondition failed is still owed,
+    /// so the next edit must send it too rather than treat the field as
+    /// already persisted.
+    func testAnUnsentWriteIsSentWithTheNextEdit() async throws {
+        let transport = FakeProfileSettingsTransport()
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        editor.seed(from: nil)
+        transport.failWritesWith = .profileRequired
+        await editor.setSubtitleLanguage("ko")
+        XCTAssertEqual(transport.writes().filter { $0.key == .playbackSubtitleLanguage }.count, 1)
+
+        transport.failWritesWith = nil
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+
+        let languageWrites = transport.writes().filter { $0.key == .playbackSubtitleLanguage }
+        XCTAssertEqual(languageWrites.count, 2,
+                       "a failed write must stay owed rather than being marked persisted")
+        XCTAssertEqual(languageWrites.last?.value, .string("ko"))
+        XCTAssertEqual(transport.writesByKey()[.playbackSubtitleMode]?.value, .string("always"))
+    }
+
+    func testOverlappingEditsToOneProfileKeyLandNewestLast() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.writeDelays[.string("ja")] = .milliseconds(100)
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        try await waitUntil("the first language write to start") {
+            transport.writes().count == 1
+        }
+
+        await editor.setSubtitleLanguage("ko")
+        await firstSave.value
+
+        let completedLanguages = transport.completedWrites()
+            .filter { $0.key == .playbackSubtitleLanguage }
+            .map(\.value)
+        XCTAssertEqual(
+            completedLanguages,
+            [.string("ja"), .string("ko")],
+            "same-key saves must serialize so an older slow PUT cannot overwrite the newer choice"
+        )
+        XCTAssertEqual(editor.subtitleLanguage, "ko")
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    func testSubtitleRevertIsSentAfterTheSupersededWriteFailsAmbiguously() async throws {
+        let transport = FakeProfileSettingsTransport()
+        await transport.writeGate.block(.string("ja"))
+        transport.setWriteFailure(
+            .transport(description: "response lost"),
+            for: .playbackSubtitleLanguage
+        )
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        try await waitUntil("the first subtitle-language write to start") {
+            transport.writes().count == 1
+        }
+
+        // The first request may have reached the server even though its
+        // response was lost. Going back to the server value still owes an
+        // explicit compensating write.
+        transport.setWriteFailure(nil, for: .playbackSubtitleLanguage)
+        await editor.setSubtitleLanguage(PlaybackPrefSentinel.none)
+        await transport.writeGate.release(.string("ja"))
+        await firstSave.value
+
+        let values = transport.writes()
+            .filter { $0.key == .playbackSubtitleLanguage }
+            .map(\.value)
+        XCTAssertEqual(
+            values,
+            [.string("ja"), .null],
+            "an ambiguous failure must not suppress the queued revert"
+        )
+        XCTAssertEqual(editor.subtitleLanguage, PlaybackPrefSentinel.none)
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    func testSuccessfulLanguageWriteUpdatesThePreferenceStoreWhenASiblingFails() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.failWritesByKey[.playbackSubtitleMode] = .server(
+            status: 403,
+            code: "forbidden",
+            message: nil
+        )
+        await transport.writeGate.block(.string("ja"))
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        ProfilePrefsStore.shared.clear()
+        defer { ProfilePrefsStore.shared.clear() }
+
+        // Both edits go out in one drain: the mode edit queues behind the
+        // language write.
+        let languageEdit = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        await transport.writeGate.waitUntilEntered(.string("ja"))
+        await editor.setSubtitleMode(SubtitleMode.always.rawValue)
+        await transport.writeGate.release(.string("ja"))
+        await languageEdit.value
+
+        XCTAssertEqual(
+            ProfilePrefsStore.shared.preferredSubtitleLanguage,
+            "ja",
+            "a landed language row must update local ordering even when another row in the drain fails"
+        )
+        guard case .failed = editor.saveState else {
+            return XCTFail("the sibling failure must still be reported")
+        }
+    }
+
+    func testAProfileWriteReResolvesWhenADeviceOverrideStillWins() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("en"),
+                source: .scope(.profileDevice),
+                scope: .profileDevice
+            ),
+        ]
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        await editor.load()
+
+        await editor.setSubtitleLanguage("ja")
+
+        XCTAssertEqual(
+            transport.effectiveCalls().count,
+            2,
+            "a successful profile write must refresh an effective value known to be shadowed"
+        )
+        XCTAssertEqual(
+            editor.subtitleLanguage,
+            "en",
+            "the editor must show the still-winning device override, not the ineffective optimistic profile value"
+        )
+        XCTAssertTrue(
+            editor.subtitleProfileOverrideMessage?.contains("This device, for this profile") == true,
+            "the UI needs a visible explanation for why the saved profile value did not become effective"
+        )
+    }
+
+    func testEditDuringShadowRefreshStillSavesNewestValue() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.effective = [
+            .init(
+                key: SettingKey.playbackSubtitleLanguage.rawValue,
+                value: .string("en"),
+                source: .scope(.profileDevice),
+                scope: .profileDevice
+            ),
+        ]
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        await editor.load()
+        transport.effectiveDelay = .milliseconds(100)
+
+        let firstSave = Task { @MainActor in await editor.setSubtitleLanguage("ja") }
+        for _ in 0..<100 {
+            if transport.effectiveCalls().count >= 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(transport.effectiveCalls().count, 2, "the post-write resolution read must start")
+
+        await editor.setSubtitleLanguage("ko")
+        await firstSave.value
+
+        let languages = transport.writes()
+            .filter { $0.key == .playbackSubtitleLanguage }
+            .map(\.value)
+        XCTAssertEqual(
+            languages,
+            [.string("ja"), .string("ko")],
+            "an edit queued while the shadow-resolution read is suspended must get its own serialized write"
+        )
+        XCTAssertEqual(
+            editor.subtitleLanguage,
+            "en",
+            "the device override remains the displayed effective value after the profile write lands"
+        )
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    func testMetadataEditRevertedDuringWriteStillLandsNewestValue() async throws {
+        let transport = FakeProfileSettingsTransport()
+        transport.writeDelays[.string("ja")] = .milliseconds(100)
+        let editor = ProfilePrefsEditor(writer: Self.writer(transport))
+        editor.seed(from: nil)
+
+        let firstSave = Task { @MainActor in await editor.setPreferredMetadataLanguage("ja") }
+        try await waitUntil("the first metadata-language write to start") {
+            transport.writes().count == 1
+        }
+
+        await editor.setPreferredMetadataLanguage(PlaybackPrefSentinel.none)
+        await firstSave.value
+
+        let values = transport.writes()
+            .filter { $0.key == .catalogMetadataLanguage }
+            .map(\.value)
+        XCTAssertEqual(
+            values,
+            [.string("ja"), .null],
+            "going back to the server value while an older PUT is suspended must enqueue the revert"
+        )
+        XCTAssertEqual(editor.preferredMetadataLanguage, PlaybackPrefSentinel.none)
+        XCTAssertEqual(editor.saveState, .saved)
+    }
+
+    /// A writer whose bounded retries run without real delays.
+    private static func writer(_ transport: ProfileSettingsTransport) -> ProfileSettingsWriter {
+        ProfileSettingsWriter(
+            transport: transport,
+            retryPolicy: .init(maximumAutomaticRetries: 3, base: .milliseconds(1), maximum: .milliseconds(1))
+        )
+    }
+}
+
+// MARK: - Fakes
+
+/// A ``ProfileSettingsTransport`` that records what it was asked to do and can
+/// be told to fail the way the real API fails.
+final class FakeProfileSettingsTransport: ProfileSettingsTransport, @unchecked Sendable {
+    struct Write: Equatable {
+        let key: SettingKey
+        let value: SettingJSONValue
+        let profileId: String?
+    }
+
+    var effective: [EffectiveSettingValue] = []
+    var failReadsWith: SettingsAPIError?
+    var failWritesWith: SettingsAPIError?
+    var failWritesByKey: [SettingKey: SettingsAPIError] = [:]
+    var writeDelays: [SettingJSONValue: Duration] = [:]
+    var effectiveDelay: Duration?
+    let writeGate = ProfileSettingsWriteGate()
+
+    private let lock = NSLock()
+    private var recordedWrites: [Write] = []
+    private var recordedCompletions: [Write] = []
+    private var recordedEffectiveCalls: [[SettingKey]] = []
+
+    func writes() -> [Write] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedWrites
+    }
+
+    /// The last write per key, which is what a caller asserting "what did this
+    /// setter send" wants.
+    func writesByKey() -> [SettingKey: Write] {
+        var byKey: [SettingKey: Write] = [:]
+        for write in writes() {
+            byKey[write.key] = write
+        }
+        return byKey
+    }
+
+    func effectiveCalls() -> [[SettingKey]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedEffectiveCalls
+    }
+
+    func completedWrites() -> [Write] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCompletions
+    }
+
+    func setWriteFailure(_ error: SettingsAPIError?, for key: SettingKey) {
+        lock.lock()
+        failWritesByKey[key] = error
+        lock.unlock()
+    }
+
+    // MARK: ProfileSettingsTransport
+
+    func effectiveValues(keys: [SettingKey]) async throws -> EffectiveSettingValuesResponse {
+        lock.lock()
+        recordedEffectiveCalls.append(keys)
+        let settings = effective
+        let failure = failReadsWith
+        let delay = effectiveDelay
+        lock.unlock()
+        if let delay { try? await Task.sleep(for: delay) }
+        if let failure { throw failure }
+        return EffectiveSettingValuesResponse(settings: settings, revision: SettingKey.revision)
+    }
+
+    func putValue(key: SettingKey, value: SettingJSONValue, profileId: String?) async throws {
+        lock.lock()
+        let write = Write(key: key, value: value, profileId: profileId)
+        recordedWrites.append(write)
+        let failure = failWritesByKey[key] ?? failWritesWith
+        let delay = writeDelays[value]
+        lock.unlock()
+        await writeGate.waitIfBlocked(value)
+        if let delay { try? await Task.sleep(for: delay) }
+        if let failure { throw failure }
+        lock.lock()
+        recordedCompletions.append(write)
+        lock.unlock()
+    }
+}
+
+actor ProfileSettingsWriteGate {
+    private var blockedValues: Set<SettingJSONValue> = []
+    private var waiters: [SettingJSONValue: [CheckedContinuation<Void, Never>]] = [:]
+    private var enteredValues: Set<SettingJSONValue> = []
+    private var entryWaiters: [SettingJSONValue: [CheckedContinuation<Void, Never>]] = [:]
+
+    func block(_ value: SettingJSONValue) {
+        blockedValues.insert(value)
+    }
+
+    func waitIfBlocked(_ value: SettingJSONValue) async {
+        enteredValues.insert(value)
+        let observers = entryWaiters.removeValue(forKey: value) ?? []
+        for observer in observers {
+            observer.resume()
+        }
+        guard blockedValues.contains(value) else { return }
+        await withCheckedContinuation { continuation in
+            waiters[value, default: []].append(continuation)
+        }
+    }
+
+    func waitUntilEntered(_ value: SettingJSONValue) async {
+        guard !enteredValues.contains(value) else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters[value, default: []].append(continuation)
+        }
+    }
+
+    func release(_ value: SettingJSONValue) {
+        blockedValues.remove(value)
+        let resumptions = waiters.removeValue(forKey: value) ?? []
+        for continuation in resumptions {
+            continuation.resume()
+        }
+    }
+}

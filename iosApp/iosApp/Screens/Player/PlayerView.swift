@@ -1,0 +1,1782 @@
+import AetherEngine
+import SwiftUI
+
+/// Full-screen video player. Thin shell around `PlayerViewModel` that picks
+/// the platform-appropriate controls overlay. iOS gets touch-driven controls
+/// with bottom sheets; tvOS gets a focus-driven transport bar plus the
+/// floating HUD for route, track, chapter, and playback controls.
+struct PlayerView: View {
+    let contentId: String
+    /// Provider-owned playback bypasses Silo's content preparation while retaining this view's
+    /// Aether controller, PiP, orientation, transport and HUD.
+    let externalPlayback: ExternalPlaybackRequest?
+    let libraryId: Int?
+    let preferredFileId: Int?
+    /// The viewer picked `preferredFileId` in a version picker.
+    let pinsVersion: Bool
+    let preferredAudioTrackIndex: Int?
+    let preferredSubtitleTrackIndex: Int?
+    /// `true` when the caller explicitly asked to restart from zero rather
+    /// than honoring the server-side resume position. Forwarded to the
+    /// session bridge so both direct-play and transcode paths align.
+    let startFromBeginning: Bool
+    let resumePositionOverride: Double?
+    let prefersLastUsedVersion: Bool
+    /// Set when the caller wants offline playback of a completed download.
+    /// Routes the prepare through `OfflinePlaybackBuilder` (stored manifest
+    /// + local media file, no server session) so playback works with no
+    /// network and progress queues for the next `/sync/progress` flush.
+    let offlineDownloadId: String?
+    /// Optional poster/backdrop URLs the presenter already has on hand.
+    /// When set, the now-playing widget skips its own catalog-item fetch
+    /// for artwork. Nil falls back to the prior fetch-on-prepare path.
+    let posterURLHint: String?
+    let backdropURLHint: String?
+    let watchPartyContext: WatchPartyPlaybackContext?
+    let shuffle: APIv2Shuffle?
+    let onPlaybackStarted: (() -> Void)?
+    let onDismissRequested: (() -> Void)?
+
+    @StateObject private var viewModelBox: PlayerViewModelBox
+    private var viewModel: PlayerViewModel {
+        get { viewModelBox.model }
+        nonmutating set { viewModelBox.model = newValue }
+    }
+    @State private var didNotifyPlaybackStarted = false
+    @State private var showsPartyPanel = false
+    @Environment(\.dismiss) var dismiss
+    #if os(iOS)
+    @State private var orientationCoordinator = PlayerOrientationCoordinator.shared
+    @State private var pictureInPicture = PictureInPictureCoordinator.shared
+    /// Set while an iPhone Duo is half-folded with its fold across the screen.
+    @State private var tabletopLayout: PlayerTabletopLayout?
+    @Environment(\.scenePhase) private var scenePhase
+    #endif
+    #if os(tvOS)
+    @State private var remoteIdentityNotice: RemotePlaybackIdentityManager.ActiveIdentity?
+    @State private var isTimelinePreviewVisible = false
+    @State private var timelineTimeDisplayMode: TVPlayerTimeDisplayMode = .elapsedRemaining
+    @State private var timelineSelectionRequest: UUID?
+    @State private var timelinePreviewHideTask: Task<Void, Never>?
+    @State private var timelinePreviewContactCanToggle = false
+    /// The buffering pill's buttons. Owned here because the pill is drawn at
+    /// the notice position; `TVPlayerControls` applies its focus rules.
+    @FocusState private var focusedBufferingAction: TVBufferingQualityPill.Action?
+    /// The prompt's button that a press capture's Select answers while the
+    /// controls are hidden. Left and Right move it between Lower quality and
+    /// Keep quality; each new pill starts on its primary action.
+    @State private var bufferingSelectTarget: TVBufferingQualityPill.Action = .primary
+    /// `TVPlayerControls`' explicit timeline scrub, which takes the buffering
+    /// pill out of the focus graph.
+    @State private var isTimelineScrubbing = false
+    #endif
+
+    init(
+        contentId: String,
+        externalPlayback: ExternalPlaybackRequest? = nil,
+        libraryId: Int? = nil,
+        preferredFileId: Int? = nil,
+        pinsVersion: Bool = false,
+        preferredAudioTrackIndex: Int? = nil,
+        preferredSubtitleTrackIndex: Int? = nil,
+        startFromBeginning: Bool = false,
+        resumePositionOverride: Double? = nil,
+        prefersLastUsedVersion: Bool = false,
+        offlineDownloadId: String? = nil,
+        posterURLHint: String? = nil,
+        backdropURLHint: String? = nil,
+        watchPartyContext: WatchPartyPlaybackContext? = nil,
+        shuffle: APIv2Shuffle? = nil,
+        onPlaybackStarted: (() -> Void)? = nil,
+        onDismissRequested: (() -> Void)? = nil
+    ) {
+        self.contentId = contentId
+        self.externalPlayback = externalPlayback
+        self.libraryId = libraryId
+        _viewModelBox = StateObject(wrappedValue: PlayerViewModelBox(PlayerViewModel(libraryId: libraryId)))
+        self.preferredFileId = preferredFileId
+        self.pinsVersion = pinsVersion
+        self.preferredAudioTrackIndex = preferredAudioTrackIndex
+        self.preferredSubtitleTrackIndex = preferredSubtitleTrackIndex
+        self.startFromBeginning = startFromBeginning
+        self.resumePositionOverride = resumePositionOverride
+        self.prefersLastUsedVersion = prefersLastUsedVersion
+        self.offlineDownloadId = offlineDownloadId
+        self.posterURLHint = posterURLHint
+        self.backdropURLHint = backdropURLHint
+        self.watchPartyContext = watchPartyContext
+        self.shuffle = shuffle
+        self.onPlaybackStarted = onPlaybackStarted
+        self.onDismissRequested = onDismissRequested
+    }
+
+    var body: some View {
+        PlayerSurfaceLayout(isPreview: viewModel.showNextUpScreen) {
+            playerSurface()
+                .opacity(viewModel.error == nil ? 1 : 0)
+                .accessibilityHidden(viewModel.error != nil)
+        } content: {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                    #if os(iOS)
+                    .onTapGesture {
+                        // Loaded playback uses MobilePlayerGestureLayer.
+                        // Keep tap-to-reveal available before it mounts too.
+                        if viewModel.isLoading || viewModel.error != nil {
+                            viewModel.toggleControls()
+                        }
+                    }
+                    #endif
+                if viewModel.showNextUpScreen && viewModel.error == nil {
+                    PlayerNextUpScreen(
+                        viewModel: viewModel,
+                        onBack: {
+                            if !viewModel.keepWatchingCurrentEpisode() {
+                                dismissPlayer()
+                            }
+                        },
+                        onStopShuffling: {
+                            viewModel.stopShuffling()
+                            dismissPlayer()
+                        }
+                    )
+                }
+            }
+        }
+        .overlay(alignment: .top) {
+            ZStack(alignment: .top) {
+                if let error = viewModel.error {
+                    errorView(error)
+                        #if os(iOS)
+                        // Centred in the player rather than pinned to the top
+                        // edge, where it ran under the status bar in portrait
+                        // and against the screen edge in landscape.
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        #endif
+                    #if os(iOS)
+                    loadingCloseButton
+                    #endif
+                } else {
+                    if !viewModel.showNextUpScreen {
+
+                        #if os(tvOS)
+                        // Focus sink with UIKit-backed press capture. Mounted
+                        // whenever the transport overlay is hidden OR a seek
+                        // session is active — in both cases it's the sole target
+                        // for the Siri Remote.
+                        //
+                        // Two modes:
+                        //   • Not in seek mode: Tap Left/Right = quick skip,
+                        //     Tap Down = open the player menu, Tap Up = reveal the
+                        //     full transport HUD, Tap Select = pause and
+                        //     enter the focused timeline,
+                        //     Hold Left/Right = enter seek mode.
+                        //   • In seek mode: Tap Left/Right = adjust rate along
+                        //     the signed ladder, Tap Select = commit + exit,
+                        //     Menu = cancel + exit (handled in onExitCommand).
+                        //     Taps against Up/Down are ignored; holds are no-ops.
+                        // While a buffering or intro-skip pill is up the sink
+                        // stays mounted and Select acts on the pill (the spec's
+                        // root-level Select), so every other press keeps its
+                        // playback meaning and the pill's timer runs on regardless.
+                        // The buffering prompt is the exception: it has two
+                        // buttons, so Left and Right move between them instead
+                        // of skipping.
+                        // Never while the HUD is presented: the sink and the HUD's
+                        // focus graph would be two owners for the same presses
+                        // (docs/tvos-focus.md), and the sink's Down handler
+                        // force-switches the HUD tab underneath the user.
+                        if !viewModel.isLoading && !viewModel.isHUDPresented &&
+                            (!viewModel.showSegmentSkip || viewModel.isHoldSeeking) &&
+                            (!viewModel.showControls || viewModel.isHoldSeeking) {
+                            TVPressCaptureView(
+                                onArrowTap: { direction in
+                                    if viewModel.isHoldSeeking {
+                                        switch direction {
+                                        case .left:  viewModel.adjustHoldSeekRate(delta: -1)
+                                        case .right: viewModel.adjustHoldSeekRate(delta: +1)
+                                        case .up, .down: break
+                                        }
+                                    } else if !moveBufferingSelectTarget(direction) {
+                                        switch direction {
+                                        case .left:  viewModel.skipBackward()
+                                        case .right: viewModel.skipForward()
+                                        case .down:  viewModel.openSettingsHUD()
+                                        case .up:    viewModel.revealControls()
+                                        }
+                                    }
+                                },
+                                onArrowHoldBegin: { direction in
+                                    // Only Left / Right enter seek mode. Hold on
+                                    // Up / Down is ignored so it can't be
+                                    // accidentally triggered while skipping.
+                                    switch direction {
+                                    case .left:  viewModel.beginHoldSeek(forward: false)
+                                    case .right: viewModel.beginHoldSeek(forward: true)
+                                    case .up, .down: break
+                                    }
+                                },
+                                onDirectionalPressBegan: {
+                                    timelinePreviewContactCanToggle = false
+                                },
+                                onTouchSurfaceContactBegan: {
+                                    handleTimelinePreviewContactBegan()
+                                },
+                                onTouchSurfaceContactEnded: {
+                                    handleTimelinePreviewContactEnded()
+                                },
+                                onTouchSurfaceContactCancelled: {
+                                    handleTimelinePreviewContactCancelled()
+                                },
+                                onSelect: {
+                                    if viewModel.isHoldSeeking {
+                                        viewModel.commitHoldSeek()
+                                    } else if viewModel.showBufferingPill {
+                                        // Never up together with the intro
+                                        // pill: the controller holds one back.
+                                        selectBufferingTarget()
+                                    } else if viewModel.showIntroSkip {
+                                        viewModel.selectIntroSkipPrompt()
+                                    } else if viewModel.isPlaying {
+                                        timelinePreviewContactCanToggle = false
+                                        hideTimelinePreview(immediately: true)
+                                        viewModel.pauseForTimelineSelection()
+                                        timelineSelectionRequest = UUID()
+                                    } else {
+                                        viewModel.revealControls()
+                                    }
+                                }
+                            )
+                            .ignoresSafeArea()
+                        }
+
+                        // A buffering pill shows during a stall, often while a
+                        // load is in flight and nothing above is mounted. Give it
+                        // a sink of its own that answers Select, moves between
+                        // the prompt's buttons on Left and Right, and leaves
+                        // every other press inert, as during any load; Menu
+                        // reaches `onExitCommand` through it.
+                        if capturesSelectForBufferingPillWhileLoading {
+                            TVPressCaptureView(
+                                onArrowTap: { _ = moveBufferingSelectTarget($0) },
+                                onSelect: { selectBufferingTarget() }
+                            )
+                            .ignoresSafeArea()
+                        }
+
+                        // `isLoading` also covers Protocol V3 replans (track or
+                        // quality changes made *from inside the HUD*). Unmounting
+                        // here for those would destroy the HUD's @State/@FocusState
+                        // mid-press and reseed focus on a reset tab, so the HUD
+                        // keeps its host mounted through a replan. A replacement
+                        // load closes the HUD in `resetPublishedLoadState`, so
+                        // cold starts and item changes still unmount as before.
+                        if (!viewModel.isLoading || viewModel.isHUDPresented) && !viewModel.isHoldSeeking {
+                            TVPlayerControls(
+                                viewModel: viewModel,
+                                showsTimelinePreview: isTimelinePreviewVisible,
+                                timeDisplayMode: timelineTimeDisplayMode,
+                                timelineSelectionRequest: timelineSelectionRequest,
+                                bufferingPillFocus: $focusedBufferingAction,
+                                onToggleTimeDisplayMode: {
+                                    withAnimation(.easeOut(duration: SiloTheme.fastDuration)) {
+                                        timelineTimeDisplayMode.toggle()
+                                    }
+                                },
+                                onTimelineScrubbingChange: { isTimelineScrubbing = $0 },
+                                onDismiss: { dismissPlayer() }
+                            )
+                        }
+
+                        // Speed-indicator chip shown only while a seek session is
+                        // active. The overlay/scrubber is suppressed during the
+                        // session (so the capture view keeps focus), so this chip
+                        // is the sole source of visual feedback until Select
+                        // commits or Menu cancels.
+                        if viewModel.isHoldSeeking {
+                            HoldSeekIndicator(
+                                rate: viewModel.holdSeekRate,
+                                previewTime: viewModel.scrubPreviewTime,
+                                duration: viewModel.duration,
+                                previewImage: viewModel.scrubPreviewImage
+                            )
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                        }
+                        #else
+                        // The full controls overlay (and its close button) only
+                        // mounts once the decoder opens the file, so a standalone
+                        // close control must remain available through a tap
+                        // during the load/buffer phase. tvOS gets this via Menu in
+                        // `onExitCommand`.
+                        if viewModel.isLoading {
+                            loadingCloseButton
+                        }
+
+                        if !viewModel.isLoading {
+                            // Invisible gestures (tap-to-toggle, double-tap skip,
+                            // hold-2×, edge swipes, pinch) live in a dedicated
+                            // layer under the button overlay.
+                            MobilePlayerGestureLayer(viewModel: viewModel)
+                            MobilePlayerControls(
+                                viewModel: viewModel,
+                                onDismiss: { dismissPlayer() }
+                            )
+                        }
+                        #endif
+
+                        subtitleSyncIndicator
+                    }
+
+                    // Outside the playback-only branch, so an end that stopped
+                    // short explains itself on the end-of-playback screen too,
+                    // above that screen's video preview. The buffering pill
+                    // shares the notice stack, in its top-trailing corner and
+                    // below any notice.
+                    #if os(tvOS)
+                    // Below the player menu's panel while it is open, so the
+                    // pill never covers its tabs.
+                    PlayerNoticeStack(pillMinY: viewModel.isHUDPresented ? Self.playerMenuPanelBottom : SiloTheme.safePadding) {
+                        if let identity = remoteIdentityNotice {
+                            RemotePlaybackIdentityNotice(identity: identity)
+                                .transition(.opacity)
+                        } else if let notice = viewModel.presentedNotice {
+                            PlayerNoticeOverlay(notice: notice)
+                        }
+                        tvBufferingPill
+                    }
+                    // Slides in, and out when its timer runs out; an answer
+                    // takes it down at once (see `selectBufferingPrimary`).
+                    .animation(.easeOut(duration: 0.2), value: viewModel.showBufferingPill)
+                    .animation(.easeOut(duration: SiloTheme.fastDuration), value: viewModel.isHUDPresented)
+                    #else
+                    // Below the top bar while it shows (two rows in portrait,
+                    // one in landscape), so the pill never covers its buttons.
+                    GeometryReader { proxy in
+                        let portrait = proxy.size.width < proxy.size.height
+                        PlayerNoticeStack(
+                            pillMinY: viewModel.shouldShowMobilePlayerChrome
+                                ? Self.topBarBottom(portrait: portrait)
+                                : SiloTheme.safePadding
+                        ) {
+                            if let notice = viewModel.presentedNotice {
+                                PlayerNoticeOverlay(notice: notice)
+                            }
+                            mobileBufferingPill
+                        }
+                        // Slides in, and out when its timer runs out; a tap
+                        // takes it down at once (see `selectBufferingPrimary`).
+                        .animation(.easeOut(duration: 0.2), value: viewModel.showBufferingPill)
+                        .animation(.easeOut(duration: 0.2), value: viewModel.shouldShowMobilePlayerChrome)
+                    }
+                    #endif
+                    #if os(iOS)
+                    // Above the notice, which starts at the same corner.
+                    if viewModel.showNextUpScreen { loadingCloseButton }
+                    #endif
+
+                    // The pill, which already says playback is buffering, takes
+                    // this corner capsule's place while it shows.
+                    #if os(tvOS)
+                    if !showsBufferingPill {
+                        if let message = watchPartySyncMessage {
+                            PlayerBufferingCapsule(message: message, delay: .milliseconds(500))
+                        } else if viewModel.isLoading || viewModel.isBuffering || viewModel.isReconnecting {
+                            PlayerBufferingCapsule()
+                        }
+                    }
+                    #else
+                    if (viewModel.isLoading || viewModel.isBuffering || viewModel.isReconnecting) &&
+                        !showsBufferingPill {
+                        PlayerBufferingCapsule()
+                    }
+                    #endif
+                }
+            }
+        }
+        #if os(iOS)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in
+            orientationCoordinator.refreshInterfaceOrientation()
+        }
+        // Tabletop posture: video above the fold, controls below. Next Up
+        // keeps its own layout.
+        .onPlayerTabletopLayoutChange { layout in
+            tabletopLayout = layout
+        }
+        .environment(\.playerTabletopLayout, viewModel.showNextUpScreen ? nil : tabletopLayout)
+        .animation(.easeInOut(duration: 0.25), value: tabletopLayout)
+        // Hardware keyboards (iPad, or the iOS app running on a Mac) get no
+        // key events from the touch gesture layer. Space toggles playback,
+        // matching the macOS player.
+        .background {
+            Button("Play/Pause") { viewModel.togglePlayPause() }
+                .keyboardShortcut(.space, modifiers: [])
+                .opacity(0)
+                .accessibilityHidden(true)
+                .disabled(
+                    viewModel.isLoading || viewModel.error != nil || viewModel.showNextUpScreen
+                        || showsPartyPanel || !viewModel.canRequestPlayPause
+                )
+        }
+        #endif
+        #if os(tvOS)
+        // Physical Play/Pause on the Siri remote always toggles playback
+        // and brings the transport bar back.
+        .onPlayPauseCommand {
+            if viewModel.showNextUpScreen {
+                viewModel.playNextEpisodeNow()
+            } else {
+                viewModel.togglePlayPause()
+            }
+        }
+        // Menu button: step seek-session → HUD → buffering pill → (loading:
+        // dismiss) → intro pill → overlay → dismiss.
+        // Matches the Infuse / Apple TV pattern. Runs at the shell level
+        // so it fires even if focus has drifted — the HUD's own
+        // `onExitCommand` handles the common case where focus is inside
+        // it; this fallback keeps the user from getting stuck.
+        .onExitCommand {
+            if viewModel.showNextUpScreen {
+                if !viewModel.keepWatchingCurrentEpisode() {
+                    dismissPlayer()
+                }
+            } else if viewModel.isHoldSeeking {
+                viewModel.cancelHoldSeek()
+            } else if viewModel.isHUDPresented {
+                // Before the `isLoading` escape: a replan issued from the HUD
+                // keeps the HUD mounted while `isLoading` is true, and Menu
+                // during that window must close the HUD, not exit the player.
+                // A genuinely stalled load is still escapable — the first
+                // Menu closes the HUD, the next one lands below.
+                viewModel.closeHUD()
+            } else if viewModel.dismissBufferingPill() {
+                // Before the `isLoading` escape too: the pill shows during a
+                // stall, often while a load is in flight, and Menu answers it
+                // instead of exiting. The press ends there; the next Menu
+                // behaves normally.
+            } else if viewModel.isLoading {
+                dismissPlayer()
+            } else if viewModel.dismissIntroSkipPrompt() {
+                // The intro pill is the most transient thing on screen: Menu
+                // takes it down and the press ends there, so it can neither
+                // hide the controls nor exit. The next Menu behaves normally.
+                // Below the loading escape because the controls, pill
+                // included, are not drawn while a load is in flight.
+            } else if !viewModel.isPlaying {
+                // While paused, Menu exits the player instead of hiding the
+                // controls over a frozen frame.
+                dismissPlayer()
+            } else if viewModel.showControls {
+                viewModel.dismissControls()
+            } else {
+                dismissPlayer()
+            }
+        }
+        #endif
+        .onChange(of: viewModel.isPlaying) { _, isPlaying in
+            guard isPlaying, !didNotifyPlaybackStarted else { return }
+            didNotifyPlaybackStarted = true
+            onPlaybackStarted?()
+        }
+        #if os(tvOS)
+        .onChange(of: viewModel.showControls) { _, visible in
+            if visible {
+                hideTimelinePreview()
+            } else {
+                timelineTimeDisplayMode = .elapsedRemaining
+            }
+        }
+        .onChange(of: viewModel.bufferingPill?.kind) { _, _ in
+            bufferingSelectTarget = .primary
+        }
+        #endif
+        #if os(iOS)
+        // Like AVKit's stock player, a PiP start from the player's own control
+        // returns the user to the app while the video continues in the window.
+        // Only the cover closes: `playerPresentationDidDisappear` defers the
+        // engaged session's cleanup, and AVKit's restore re-presents it.
+        .onChange(of: pictureInPicture.controlStartToken) { _, _ in
+            guard pictureInPicture.ownsEngagedSession(viewModel) else { return }
+            closePresentation()
+        }
+        // Hand the user's brightness back while the app is away, and take the
+        // player's level again on return unless the user changed it. Automatic
+        // PiP on backgrounding keeps this cover, so coming back to the app
+        // lands on the player itself; end PiP into it.
+        .onChange(of: scenePhase) { _, phase in
+            KyroPiPDiagnostics.record("scene_phase", state: String(describing: phase))
+            if phase == .active {
+                PlayerScreenBrightness.shared.resume()
+                pictureInPicture.stopForReturnToPresentedPlayer(owner: viewModel)
+            } else {
+                PlayerScreenBrightness.shared.suspend()
+            }
+        }
+        #endif
+        .onChange(of: viewModel.remoteDismissToken) { _, newValue in
+            guard newValue != nil else { return }
+            dismissPlayer()
+        }
+        #if os(tvOS)
+        // A tvOS sheet is a narrow centered card; the lobby needs the screen.
+        .fullScreenCover(isPresented: $showsPartyPanel) {
+            WatchPartyRoomPanel(session: .shared, playbackEnded: viewModel.hasReachedEndOfFile)
+        }
+        #else
+        .sheet(isPresented: $showsPartyPanel) {
+            WatchPartyRoomPanel(session: .shared, playbackEnded: viewModel.hasReachedEndOfFile)
+        }
+        .onChange(of: showsPartyPanel) { _, isPresented in
+            orientationCoordinator.setPlayerCovered(isPresented)
+        }
+        #endif
+        .onAppear {
+            if let externalPlayback {
+                #if os(iOS)
+                orientationCoordinator.activatePlayer()
+                viewModel.playerPresentationDidAppear()
+                bindPictureInPicture(to: viewModel)
+                #endif
+                viewModel.loadExternalPlayback(externalPlayback)
+                return
+            }
+            if let context = watchPartyContext {
+                #if os(iOS)
+                orientationCoordinator.activatePlayer()
+                viewModel.playerPresentationDidAppear()
+                #endif
+                let adapter = WatchPartyPlaybackAdapter(player: viewModel)
+                WatchPartySession.shared.bind(adapter, context: context)
+                #if os(tvOS)
+                TVControlReceiver.shared.registerPlayer(viewModel, contentId: contentId)
+                #endif
+                return
+            }
+            #if os(iOS)
+            // A Picture in Picture restore re-presents this cover for a session
+            // that is still playing. Adopt that view model instead of minting a
+            // new one, and skip the load — the session never stopped.
+            if let restored = PlayerPresentationRestoration.consumeAdoption(matching: contentId) {
+                viewModel = restored
+                orientationCoordinator.activatePlayer()
+                restored.playerPresentationDidAppear()
+                bindPictureInPicture(to: restored)
+                return
+            }
+            #endif
+            let activeViewModel: PlayerViewModel
+            if viewModel.needsReplacementForPresentation {
+                let replacement = PlayerViewModel(libraryId: libraryId)
+                viewModel = replacement
+                activeViewModel = replacement
+            } else {
+                activeViewModel = viewModel
+            }
+            #if os(iOS)
+            orientationCoordinator.activatePlayer()
+            activeViewModel.playerPresentationDidAppear()
+            bindPictureInPicture(to: activeViewModel)
+            #endif
+            activeViewModel.applyArtworkURLHints(posterURL: posterURLHint, backdropURL: backdropURLHint)
+            activeViewModel.loadAndPlay(
+                contentId: contentId,
+                preferredFileId: preferredFileId,
+                pinsVersion: pinsVersion,
+                preferredAudioTrackIndex: preferredAudioTrackIndex,
+                preferredSubtitleTrackIndex: preferredSubtitleTrackIndex,
+                startFromBeginning: startFromBeginning,
+                resumePositionOverride: resumePositionOverride,
+                prefersLastUsedVersion: prefersLastUsedVersion,
+                offlineDownloadId: offlineDownloadId,
+                shuffle: shuffle
+            )
+            #if os(tvOS)
+            TVControlReceiver.shared.registerPlayer(activeViewModel, contentId: contentId)
+            withAnimation(.easeInOut(duration: 0.2)) {
+                remoteIdentityNotice = RemotePlaybackIdentityManager.shared.activeIdentity
+            }
+            #endif
+        }
+        #if os(tvOS)
+        .task(id: remoteIdentityNotice?.generationID) {
+            guard remoteIdentityNotice != nil else { return }
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                remoteIdentityNotice = nil
+            }
+        }
+        #endif
+        .onDisappear {
+            #if os(tvOS)
+            timelinePreviewHideTask?.cancel()
+            timelinePreviewHideTask = nil
+            #endif
+            #if os(iOS)
+            viewModel.playerPresentationDidDisappear()
+            #else
+            viewModel.cleanup()
+            #endif
+            #if os(tvOS)
+            TVControlReceiver.shared.unregisterPlayer(viewModel)
+            #endif
+            #if os(iOS)
+            orientationCoordinator.deactivatePlayer()
+            PlayerScreenBrightness.shared.restore()
+            #endif
+            #if os(tvOS)
+            // A detail/Home read launched synchronously from this disappear
+            // can beat cleanup's final progress POST and cache the old watched
+            // state. Capture the mutation set now, then invalidate and reload
+            // only after the session bridge has finished its final write.
+            let touchedContentIds = viewModel.contentIdsNeedingDetailRefresh.isEmpty
+                ? Set([contentId])
+                : viewModel.contentIdsNeedingDetailRefresh
+            Task { @MainActor in
+                await viewModel.waitForCleanupCompletion()
+
+                // A Home request may have started as the cover disappeared.
+                // Retire that generation before asking for the authoritative
+                // Continue Watching row produced by the completed write.
+                PersonalStateSync.invalidateDerivedLists()
+
+                await ItemDetailCache.shared.refreshAfterPlayback(contentIds: touchedContentIds)
+            }
+            #endif
+        }
+        .siloStatusBarHidden()
+        #if !os(tvOS)
+        .navigationBarHidden(true)
+        #endif
+        .preferredColorScheme(.dark)
+    }
+
+    private func dismissPlayer() {
+        if watchPartyContext != nil, WatchPartySession.shared.isEngaged, viewModel.remoteDismissToken == nil {
+            showsPartyPanel = true
+            return
+        }
+        viewModel.cleanup()
+        closePresentation()
+    }
+
+    private func closePresentation() {
+        if let onDismissRequested {
+            onDismissRequested()
+        } else {
+            dismiss()
+        }
+    }
+
+    #if os(iOS)
+    /// One binding site so the restore and start-failure hooks can never be
+    /// installed on one path and forgotten on the other.
+    private func bindPictureInPicture(to model: PlayerViewModel) {
+        PictureInPictureCoordinator.shared.bind(
+            engine: model.aetherEngine,
+            owner: model,
+            onEngagementEnded: { [weak model] in
+                model?.pictureInPictureEngagementDidEnd()
+            },
+            onRestoreUserInterface: { [weak model] completion in
+                guard let model else {
+                    // The engaged player is gone; AVKit must not be told the
+                    // interface came back.
+                    completion(false)
+                    return
+                }
+                model.restorePictureInPictureUserInterface(completion)
+            },
+            onStartFailure: { [weak model] failure in
+                model?.reportPictureInPictureStartFailure(failure)
+            }
+        )
+    }
+    #endif
+
+    #if os(tvOS)
+    private func handleTimelinePreviewContactBegan() {
+        guard viewModel.isPlaying,
+              !viewModel.showControls,
+              !viewModel.isHUDPresented,
+              !viewModel.isHoldSeeking else { return }
+
+        timelinePreviewHideTask?.cancel()
+        timelinePreviewHideTask = nil
+        timelinePreviewContactCanToggle = isTimelinePreviewVisible
+        withAnimation(.easeOut(duration: SiloTheme.fastDuration)) {
+            if !isTimelinePreviewVisible {
+                isTimelinePreviewVisible = true
+            }
+        }
+    }
+
+    private func handleTimelinePreviewContactEnded() {
+        guard isTimelinePreviewVisible else { return }
+        if timelinePreviewContactCanToggle {
+            withAnimation(.easeOut(duration: SiloTheme.fastDuration)) {
+                timelineTimeDisplayMode.toggle()
+            }
+        }
+        timelinePreviewContactCanToggle = false
+        scheduleTimelinePreviewHide()
+    }
+
+    private func handleTimelinePreviewContactCancelled() {
+        timelinePreviewContactCanToggle = false
+        scheduleTimelinePreviewHide()
+    }
+
+    private func scheduleTimelinePreviewHide() {
+        guard isTimelinePreviewVisible else { return }
+        timelinePreviewHideTask?.cancel()
+        timelinePreviewHideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            hideTimelinePreview()
+        }
+    }
+
+    private func hideTimelinePreview(immediately: Bool = false) {
+        timelinePreviewHideTask?.cancel()
+        timelinePreviewHideTask = nil
+        timelinePreviewContactCanToggle = false
+        guard isTimelinePreviewVisible else { return }
+        if immediately {
+            isTimelinePreviewVisible = false
+        } else {
+            withAnimation(.easeOut(duration: SiloTheme.fastDuration)) {
+                isTimelinePreviewVisible = false
+            }
+            // A dismissed quick preview always starts fresh in duration mode
+            // on the next light touch. The immediate Select-to-HUD handoff
+            // intentionally preserves the current display mode instead.
+            timelineTimeDisplayMode = .elapsedRemaining
+        }
+    }
+    #endif
+
+    /// Video surface. tvOS uses focus-driven transport; on iOS the touch
+    /// gestures (tap-to-toggle, pinch, double-tap skip, …) live in
+    /// `MobilePlayerGestureLayer`, mounted above this surface.
+    ///
+    /// Aether owns native/software route selection behind this one surface.
+    private func playerSurface() -> some View {
+        AetherPlayerSurface(engine: viewModel.aetherEngine)
+            .background(Color.black)
+            .overlay {
+                PlayerSubtitleLayer(viewModel: viewModel)
+            }
+    }
+
+    #if os(tvOS)
+    private var watchPartySyncMessage: LocalizedStringKey? {
+        guard let context = watchPartyContext, viewModel.error == nil,
+              let room = WatchPartySession.shared.room,
+              room.roomId == context.roomId, room.selectionRevision == context.selectionRevision,
+              room.phase == .playing else { return nil }
+        if WatchPartySession.shared.connection == .reconnecting {
+            return "Reconnecting to the party…"
+        }
+        let playback = viewModel.watchPartyPlaybackSnapshot
+        if room.playbackState == .waiting || playback.isBuffering || playback.isSeeking
+            || room.members.contains(where: { $0.isSelf && $0.isSyncing }) {
+            return "Syncing with the party…"
+        }
+        return nil
+    }
+    #endif
+
+    // MARK: - Buffering pill
+
+    /// The buffering prompt or undo pill is drawn. Over playback only: the Next
+    /// Up screen's own controls own the input there.
+    private var showsBufferingPill: Bool {
+        viewModel.showBufferingPill && !viewModel.showNextUpScreen
+    }
+
+    #if os(tvOS)
+    /// A load in flight mounts neither the press capture nor the controls, so
+    /// a buffering pill gets a Select-only sink of its own then.
+    private var capturesSelectForBufferingPillWhileLoading: Bool {
+        viewModel.isLoading && showsBufferingPill && !viewModel.isHUDPresented
+    }
+
+    /// Root Select acts on the pill: a press capture is mounted and no seek
+    /// session claims Select first.
+    private var bufferingPillIsSelectTarget: Bool {
+        if capturesSelectForBufferingPillWhileLoading { return true }
+        return !viewModel.isLoading && !viewModel.isHUDPresented && !viewModel.showControls &&
+            !viewModel.showSegmentSkip && !viewModel.isHoldSeeking
+    }
+
+    /// One focus owner at a time (docs/tvos-focus.md), as for the intro pill.
+    /// With the controls hidden, or a load in flight, a press capture owns the
+    /// remote and routes Select to the pill, so the pill is not focusable. With
+    /// the transport up it is ordinary buttons in the native focus graph, and
+    /// Down moves on to the scrubber while its timer runs. It also leaves the
+    /// graph during a timeline scrub, so a drag that drifts upward cannot land
+    /// here and cancel the scrub, and while the player menu, whose focus graph
+    /// owns the top of the screen, is open.
+    private var bufferingPillTakesFocus: Bool {
+        viewModel.showControls && !viewModel.isLoading && !viewModel.isHUDPresented &&
+            !viewModel.isHoldSeeking && !isTimelineScrubbing
+    }
+
+    /// Left or Right while the buffering prompt is the Select target: picks
+    /// Lower quality or Keep quality. True when the press was the prompt's.
+    private func moveBufferingSelectTarget(_ direction: TVPressCaptureView.ArrowDirection) -> Bool {
+        guard bufferingPillIsSelectTarget, showsBufferingPill, viewModel.bufferingPill?.kind == .prompt else {
+            return false
+        }
+        switch direction {
+        case .left: bufferingSelectTarget = .primary
+        case .right: bufferingSelectTarget = .secondary
+        case .up, .down: return false
+        }
+        return true
+    }
+
+    /// Select at the player root: the prompt's chosen button, or the pill's
+    /// primary action.
+    private func selectBufferingTarget() {
+        if bufferingSelectTarget == .secondary, viewModel.bufferingPill?.kind == .prompt {
+            viewModel.selectBufferingKeep()
+        } else {
+            viewModel.selectBufferingPrimary()
+        }
+    }
+
+    @ViewBuilder
+    private var tvBufferingPill: some View {
+        if showsBufferingPill, let pill = viewModel.bufferingPill {
+            TVBufferingQualityPill(
+                pill: pill,
+                selectTarget: bufferingPillIsSelectTarget ? bufferingSelectTarget : nil,
+                focus: $focusedBufferingAction,
+                onPrimary: { viewModel.selectBufferingPrimary() },
+                onSecondary: { viewModel.selectBufferingKeep() }
+            )
+            .disabled(!bufferingPillTakesFocus)
+            // Its own focus region, sized to the card: Left and Right move
+            // between its buttons, and Down leaves it for the transport.
+            .focusSection()
+            // The "Loading…" capsule's corner, which the pill takes over.
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, SiloTheme.safePadding)
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .playerNoticeStackPill()
+        }
+    }
+    #else
+    @ViewBuilder
+    private var mobileBufferingPill: some View {
+        if showsBufferingPill, let pill = viewModel.bufferingPill {
+            MobileBufferingQualityPill(
+                pill: pill,
+                onPrimary: { viewModel.selectBufferingPrimary() },
+                onSecondary: { viewModel.selectBufferingKeep() }
+            )
+            // The "Loading…" capsule's corner, which the pill takes over.
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, SiloTheme.safePadding)
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .playerNoticeStackPill()
+        }
+    }
+    #endif
+
+    #if os(tvOS)
+    /// Where the open player menu's panel ends. The buffering pill and the
+    /// subtitle-sync card sit below it so they never cover its tabs.
+    private static let playerMenuPanelBottom: CGFloat = 560
+    #else
+    /// Where the top bar ends while it shows: two rows in portrait, one in
+    /// landscape. The buffering pill and the subtitle-sync card sit below it.
+    private static func topBarBottom(portrait: Bool) -> CGFloat {
+        portrait ? 112 : 64
+    }
+    #endif
+
+    /// The sync card for a subtitle sync this viewer started, in the
+    /// top-trailing corner. On iOS it moves below the top bar while the
+    /// controls show (two rows tall in portrait, one in landscape); on tvOS
+    /// it stays clear of the overscan margin.
+    @ViewBuilder
+    private var subtitleSyncIndicator: some View {
+        if let notice = viewModel.subtitleSync.notice {
+            #if os(tvOS)
+            // Below the player menu's panel while it is open, so the card
+            // never covers its Options column.
+            SubtitleSyncIndicator(notice: notice)
+                .padding(.top, viewModel.isHUDPresented ? Self.playerMenuPanelBottom : 60)
+                .padding(.trailing, 80)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .transition(.opacity)
+            #else
+            GeometryReader { proxy in
+                let portrait = proxy.size.width < proxy.size.height
+                SubtitleSyncIndicator(notice: notice) {
+                    viewModel.subtitleSync.dismissNotice()
+                }
+                .padding(.top, viewModel.shouldShowMobilePlayerChrome ? Self.topBarBottom(portrait: portrait) : 12)
+                .padding(.trailing, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .animation(.easeOut(duration: 0.2), value: viewModel.shouldShowMobilePlayerChrome)
+            }
+            .transition(.opacity)
+            #endif
+        }
+    }
+
+    #if !os(tvOS)
+    /// Tap-to-reveal close control while loading and on Next Up, in
+    /// the same spot, size and glass style as the close button in
+    /// `MobilePlayerControls`' top strip so the two read as one control.
+    private var loadingCloseButton: some View {
+        HStack {
+            Button(action: { dismissPlayer() }) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: SiloTheme.topBarIconHitSize, height: SiloTheme.topBarIconHitSize)
+            }
+            .buttonStyle(MobilePlayerGlassButtonStyle())
+            .accessibilityLabel("Close Player")
+            .accessibilityIdentifier("player.close")
+
+            Spacer()
+        }
+        .padding(.horizontal)
+        .padding(.top)
+        .transition(.opacity)
+        // Nothing is playing behind an error, so its close button stays up
+        // instead of waiting for a tap that reveals the transport chrome.
+        .modifier(MobilePlayerChromeVisibility(
+            isVisible: viewModel.shouldShowMobilePlayerChrome || viewModel.error != nil
+        ))
+    }
+    #endif
+
+    @ViewBuilder
+    private func errorView(_ error: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 40))
+                .foregroundStyle(Color.siloError)
+
+            Text(error)
+                .font(.siloBody)
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            if let code = viewModel.externalPlaybackDiagnosticCode {
+                // Credential-free; lets a device report name the cause without logs.
+                Text(code)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
+            HStack(spacing: 16) {
+                if viewModel.errorIsRetryable {
+                    Button(viewModel.retryButtonTitle) {
+                        viewModel.retry()
+                    }
+                    .siloPrimaryButton()
+                    .frame(minWidth: 140)
+                }
+
+                Button("Go Back") { dismissPlayer() }
+                    .siloPrimaryButton()
+                    .frame(minWidth: 140)
+            }
+        }
+    }
+}
+
+/// Holds the player's view model for the life of the presentation.
+/// `StateObject` evaluates its initial value once; a `State` initial value
+/// would build a `PlayerViewModel` (an AetherEngine plus an audio-session
+/// claim) on every `PlayerView` init.
+private final class PlayerViewModelBox: ObservableObject {
+    @Published var model: PlayerViewModel
+
+    init(_ model: PlayerViewModel) {
+        self.model = model
+    }
+}
+
+/// Subtitle overlay. It reads the playback clock, so clock ticks re-render
+/// this layer rather than the player shell.
+private struct PlayerSubtitleLayer: View {
+    let viewModel: PlayerViewModel
+
+    var body: some View {
+        AetherSubtitleOverlay(
+            engine: viewModel.aetherEngine,
+            assSubtitles: viewModel.assSubtitles,
+            cueHold: viewModel.subtitleCueHold,
+            sourceTime: viewModel.currentTime,
+            primaryUsesMovieTimeline: viewModel.subtitleUsesMovieTimeline(viewModel.selectedSubtitleId),
+            secondaryUsesMovieTimeline: viewModel.subtitleUsesMovieTimeline(viewModel.selectedSecondarySubtitleId, slot: .secondary),
+            livePrimaryCues: viewModel.selectedSubtitleId.map(SubtitleTrackIdSpace.isAILive) == true
+                ? viewModel.livePrimarySubtitleCues
+                : [],
+            liveSecondaryCues: viewModel.selectedSecondarySubtitleId.map(SubtitleTrackIdSpace.isAILive) == true
+                ? viewModel.liveSecondarySubtitleCues
+                : [],
+            appearance: viewModel.settings.effectiveSubtitleAppearance,
+            subtitleSyncMs: viewModel.settings.subtitleSyncMs
+        )
+    }
+}
+
+private let playerNextUpMainScrollTarget = "player-next-up-main"
+private let playerNextUpOnDeckScrollTarget = "player-next-up-on-deck"
+
+private enum PlayerNextUpFocusTarget: Hashable {
+    case playNow
+    case pickAnother
+    case keepWatching
+    case back
+    case autoPlay
+    case stopShuffling
+}
+
+struct PlayerNextUpScreen: View {
+    let viewModel: PlayerViewModel
+    let onBack: () -> Void
+    var onStopShuffling: () -> Void = {}
+    @FocusState private var focusedTarget: PlayerNextUpFocusTarget?
+    @State private var didRequestInitialActionFocus = false
+    @State private var uiCustomization = UICustomizationPreferences.shared
+
+    #if os(tvOS)
+    @Namespace private var defaultFocusNamespace
+    #endif
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.ignoresSafeArea()
+                    #if os(iOS)
+                    // A background tap reveals/dismisses the close button
+                    // without intercepting Play Now, Back, or Auto Play.
+                    .onTapGesture { viewModel.toggleControls() }
+                    #endif
+                #if !os(iOS)
+                backgroundImage
+                #endif
+
+                #if os(tvOS)
+                ScrollView(.vertical, showsIndicators: false) {
+                    screenContent(columnWidth: contentColumnWidth(for: proxy))
+                    .padding(.horizontal, horizontalPadding)
+                    .padding(.top, verticalTopPadding)
+                    .padding(.bottom, verticalBottomPadding)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .defaultScrollAnchor(.top)
+                .scrollClipDisabled()
+                .transformAnchorPreference(key: PlayerPreviewBoundsKey.self, value: .bounds) {
+                    $0.viewport = $1
+                }
+                #else
+                PlayerNextUpMobileLayout {
+                    miniPlayerPane
+                } panel: { compact in
+                    mobileNextUpPanel(compact: compact)
+                        .anchorPreference(key: PlayerPreviewBoundsKey.self, value: .bounds) { .init(actions: $0) }
+                }
+                .padding(.top, MobilePlayerChromeVisibility.topClearance)
+                #endif
+            }
+            #if os(iOS)
+            // Artwork is decoration, not a sibling allowed to enlarge this
+            // ZStack's ideal size. Pin the entire screen to the real viewport.
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .background { backgroundImage }
+            .clipped()
+            #endif
+        }
+        #if os(tvOS)
+        .ignoresSafeArea()
+        #endif
+        .animation(.easeInOut(duration: 0.2), value: viewModel.nextUpCountdownSeconds)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.nextUpEpisode)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.nextUpCarouselItems)
+        #if os(tvOS)
+        .onAppear(perform: requestInitialActionFocusIfNeeded)
+        .onChange(of: viewModel.nextUpEpisode?.contentId) { _, _ in
+            requestInitialActionFocusIfNeeded()
+        }
+        #endif
+    }
+
+    #if os(tvOS)
+    private func screenContent(columnWidth: CGFloat) -> some View {
+        VStack(spacing: sectionSpacing) {
+            mainContent(columnWidth: columnWidth)
+                .id(playerNextUpMainScrollTarget)
+
+            if !viewModel.nextUpCarouselItems.isEmpty {
+                // MediaRow insets its header and cards by the safe padding,
+                // so widen its frame by that inset to share the hero's edges.
+                onDeckSection
+                    .frame(width: columnWidth + SiloTheme.safePadding * 2)
+                    .id(playerNextUpOnDeckScrollTarget)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .focusScope(defaultFocusNamespace)
+    }
+    #endif
+
+    @ViewBuilder
+    private var backgroundImage: some View {
+        if let artwork = backgroundArtwork {
+            AsyncImageView(url: artwork.url, thumbhash: artwork.thumbhash)
+                .scaledToFill()
+                .blur(radius: 44)
+                .scaleEffect(1.12)
+                .opacity(0.18)
+                .overlay(Color.black.opacity(0.78))
+                .ignoresSafeArea()
+        }
+    }
+
+    #if os(tvOS)
+    private func mainContent(columnWidth: CGFloat) -> some View {
+        // Split the column on the On Deck card grid: the preview spans the
+        // first two cards and the panel starts at the third.
+        let previewWidth = onDeckCardWidth * 2 + tvCardSpacing
+        return HStack(alignment: .center, spacing: tvCardSpacing) {
+            miniPlayerPane
+                .frame(width: previewWidth)
+            nextUpPanel
+                .frame(width: columnWidth - previewWidth - tvCardSpacing, alignment: .leading)
+        }
+        .frame(width: columnWidth)
+    }
+    #endif
+
+    #if !os(tvOS)
+    func mobileNextUpPanel(compact: Bool = false) -> some View {
+        VStack(spacing: compact ? 6 : 10) {
+            // Keep every action reachable below the rotation bar's reserved area
+            // on short landscape screens. Only the redundant eyebrow is omitted.
+            if let scopeLabel = viewModel.shuffleState?.scopeLabel {
+                shuffleBadge(scopeLabel)
+            }
+            if !compact { eyebrow }
+            if let episode = viewModel.nextUpEpisode {
+                metadata(for: episode, compact: true)
+            } else if viewModel.isLoadingNextUpEpisode {
+                Text(loadingLabel)
+                    .font(.callout)
+                    .foregroundStyle(.white)
+            } else {
+                Text(viewModel.nextUpScreenVideoEnded ? "End of playback" : "Almost finished")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+            }
+            actionRow(hasNextEpisode: viewModel.nextUpEpisode != nil, compact: compact)
+            shuffleActionErrorText
+            if viewModel.nextUpEpisode != nil {
+                if !compact { autoPlayFooter }
+            } else if !viewModel.isLoadingNextUpEpisode {
+                Text(finishedMessage)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.62))
+                    .lineLimit(2)
+            }
+        }
+        .multilineTextAlignment(.center)
+    }
+    #endif
+
+    private var miniPlayerPane: some View {
+        Color.clear
+        .aspectRatio(16 / 9, contentMode: .fit)
+        .anchorPreference(key: PlayerPreviewBoundsKey.self, value: .bounds) { .init(bounds: $0) }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var nextUpPanel: some View {
+        VStack(alignment: isTV ? .leading : .center, spacing: panelSpacing) {
+            if let scopeLabel = viewModel.shuffleState?.scopeLabel {
+                shuffleBadge(scopeLabel)
+            }
+            eyebrow
+
+            if let episode = viewModel.nextUpEpisode {
+                nextEpisodeContent(episode)
+            } else if viewModel.isLoadingNextUpEpisode {
+                loadingContent
+            } else {
+                finishedContent
+            }
+        }
+        .multilineTextAlignment(isTV ? .leading : .center)
+    }
+
+    private var eyebrow: some View {
+        Text(statusLabel)
+            .font(.system(size: eyebrowSize, weight: .semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(.white.opacity(0.52))
+    }
+
+    private func nextEpisodeContent(_ episode: PlayerNextUpEpisode) -> some View {
+        VStack(alignment: isTV ? .leading : .center, spacing: panelSpacing) {
+            metadata(for: episode)
+            actionRow(hasNextEpisode: true)
+            shuffleActionErrorText
+            autoPlayFooter
+        }
+    }
+
+    /// "Shuffling Movies", "Shuffling Breaking Bad · Season 2".
+    private func shuffleBadge(_ scopeLabel: String) -> some View {
+        Label("Shuffling \(scopeLabel)", systemImage: "shuffle")
+            .font(.system(size: captionSize, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.78))
+            .lineLimit(1)
+            .padding(.horizontal, isTV ? 18 : 12)
+            .padding(.vertical, isTV ? 8 : 5)
+            .background(.white.opacity(0.1), in: Capsule())
+    }
+
+    @ViewBuilder
+    private var shuffleActionErrorText: some View {
+        if let message = viewModel.shuffleActionError {
+            Text(message)
+                .font(.system(size: captionSize, weight: .medium))
+                .foregroundStyle(.white.opacity(0.7))
+        }
+    }
+
+    /// The auto-play toggle, with Stop shuffling beside it during a shuffle.
+    private var autoPlayFooter: some View {
+        HStack(spacing: isTV ? 12 : 4) {
+            autoPlayToggle
+            if viewModel.shuffleState != nil {
+                stopShufflingButton
+            }
+        }
+    }
+
+    private var stopShufflingButton: some View {
+        Button(action: onStopShuffling) {
+            Text("Stop shuffling")
+                .font(.system(size: captionSize, weight: .semibold))
+        }
+        .buttonStyle(AutoPlayToggleButtonStyle())
+        .accessibilityIdentifier("next-up-stop-shuffling")
+        #if os(tvOS)
+        .focused($focusedTarget, equals: .stopShuffling)
+        // Down is left to the focus engine, which enters On Deck at its
+        // first card, as it does from the actions row.
+        .onMoveCommand { direction in
+            if direction == .up {
+                focusPreferredAction()
+            }
+        }
+        #endif
+    }
+
+    private var loadingContent: some View {
+        VStack(alignment: isTV ? .leading : .center, spacing: panelSpacing) {
+            HStack(spacing: 14) {
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(isTV ? 1.35 : 1.0)
+                Text(loadingLabel)
+                    .font(.system(size: titleSize, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            actionRow(hasNextEpisode: false)
+        }
+    }
+
+    private var finishedContent: some View {
+        VStack(alignment: isTV ? .leading : .center, spacing: panelSpacing) {
+            Text(viewModel.nextUpScreenVideoEnded ? "End of playback" : "Almost finished")
+                .font(.system(size: titleSize, weight: .bold))
+                .foregroundStyle(.white)
+            Text(finishedMessage)
+                .font(.system(size: bodySize, weight: .medium))
+                .foregroundStyle(.white.opacity(0.62))
+                .frame(maxWidth: 560, alignment: isTV ? .leading : .center)
+            actionRow(hasNextEpisode: false)
+        }
+    }
+
+    private func metadata(for episode: PlayerNextUpEpisode, compact: Bool = false) -> some View {
+        VStack(alignment: isTV ? .leading : .center, spacing: isTV ? 12 : 7) {
+            if let episodeLabel = episode.episodeLabel {
+                if let seriesTitle = episode.seriesTitle, !seriesTitle.isEmpty {
+                    Text(seriesTitle)
+                        .font(.system(size: seriesTitleSize, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 10) {
+                    Text(episodeLabel)
+                        .foregroundStyle(.white.opacity(0.62))
+                    Text(episode.title)
+                        .foregroundStyle(.white)
+                }
+                .font(.system(size: subtitleSize, weight: .semibold))
+                .lineLimit(compact ? 1 : 2)
+                .multilineTextAlignment(isTV ? .leading : .center)
+            } else {
+                // A shuffled movie has no series or episode line; its own
+                // title heads the card.
+                Text(episode.title)
+                    .font(.system(size: seriesTitleSize, weight: .bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(compact ? 1 : 2)
+            }
+
+            let metadataLine = episodeMetadataLine(for: episode)
+            if !compact && !metadataLine.isEmpty {
+                Text(metadataLine)
+                    .font(.system(size: captionSize, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.46))
+            }
+
+            if !compact,
+               !(episode.isEpisode && EpisodeSpoilerPreferences.shared.settings.hidesOverview(for: episode.watchState)),
+               let overview = episode.overview, !overview.isEmpty {
+                Text(overview)
+                    .font(.system(size: bodySize))
+                    .lineLimit(isTV ? 3 : 2)
+                    .multilineTextAlignment(isTV ? .leading : .center)
+                    .foregroundStyle(.white.opacity(0.58))
+                    .frame(maxWidth: 620, alignment: isTV ? .leading : .center)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionRow(hasNextEpisode: Bool, compact: Bool = false) -> some View {
+        #if os(tvOS)
+        VStack(alignment: .leading, spacing: 18) {
+            // Reserve enough room for the primary pill's focused scale and
+            // outer focus outline so the countdown never overlaps it.
+            HStack(spacing: 56) {
+                if hasNextEpisode {
+                    Button(action: { viewModel.playNextEpisodeNow() }) {
+                        HStack(spacing: 18) {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 32, weight: .bold))
+                            Text("Play Now")
+                                .font(.system(size: 30, weight: .semibold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .frame(width: 220)
+                    }
+                    .buttonStyle(TVPillButtonStyle(kind: .primary))
+                    .disabled(viewModel.isStartingNextUp)
+                    .focused($focusedTarget, equals: .playNow)
+                    .prefersDefaultFocus(true, in: defaultFocusNamespace)
+                }
+
+                if hasNextEpisode && viewModel.shuffleState != nil {
+                    Button(action: { viewModel.pickAnotherShufflePick() }) {
+                        HStack(spacing: 16) {
+                            Image(systemName: "shuffle")
+                                .font(.system(size: 26, weight: .semibold))
+                            Text("Pick Another")
+                                .font(.system(size: 26, weight: .semibold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .frame(width: 250)
+                    }
+                    .buttonStyle(TVPillButtonStyle(kind: .secondary))
+                    // Not disabled while a pick is replaced: a disabled button
+                    // loses tvOS focus, and repeat presses are ignored.
+                    .disabled(!viewModel.canPickAnotherShufflePick)
+                    .focused($focusedTarget, equals: .pickAnother)
+                }
+
+                if let seconds = viewModel.nextUpCountdownSeconds {
+                    CountdownRing(seconds: seconds, totalSeconds: viewModel.nextUpCountdownTotalSeconds)
+                }
+            }
+
+            HStack(spacing: 20) {
+                if !viewModel.nextUpScreenVideoEnded {
+                    Button(action: { viewModel.keepWatchingCurrentEpisode() }) {
+                        HStack(spacing: 16) {
+                            Image(systemName: "rectangle.inset.filled")
+                                .font(.system(size: 25, weight: .semibold))
+                            Text("Keep Watching")
+                                .font(.system(size: 26, weight: .semibold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .frame(width: 250)
+                    }
+                    .buttonStyle(TVPillButtonStyle(kind: .secondary))
+                    .disabled(viewModel.isStartingNextUp)
+                    .focused($focusedTarget, equals: .keepWatching)
+                    .prefersDefaultFocus(!hasNextEpisode, in: defaultFocusNamespace)
+                }
+
+                Button(action: onBack) {
+                    HStack(spacing: 16) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 26, weight: .semibold))
+                        Text("Back")
+                            .font(.system(size: 26, weight: .semibold))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .frame(width: 120)
+                }
+                .buttonStyle(TVPillButtonStyle(kind: .secondary))
+                .focused($focusedTarget, equals: .back)
+                .prefersDefaultFocus(!hasNextEpisode && viewModel.nextUpScreenVideoEnded, in: defaultFocusNamespace)
+            }
+            .onMoveCommand { direction in
+                if direction == .down {
+                    focusBelowActions()
+                }
+            }
+        }
+        #else
+        VStack(spacing: compact ? 6 : 10) {
+            HStack(spacing: 12) {
+                if hasNextEpisode {
+                    Button(action: { viewModel.playNextEpisodeNow() }) {
+                        Label("Play Now", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity, minHeight: compact ? 24 : 44)
+                    }
+                    .siloPrimaryButton(isLoading: viewModel.isStartingNextUp)
+                    .frame(minHeight: 44)
+                    .accessibilityIdentifier("next-up-play-now")
+                }
+                if hasNextEpisode && viewModel.shuffleState != nil {
+                    Button(action: { viewModel.pickAnotherShufflePick() }) {
+                        Label("Pick Another", systemImage: "shuffle")
+                            .frame(minHeight: compact ? 24 : 44)
+                    }
+                    .siloSecondaryButton()
+                    .frame(minHeight: 44)
+                    .disabled(!viewModel.canPickAnotherShufflePick)
+                    .accessibilityIdentifier("next-up-pick-another")
+                }
+                if let seconds = viewModel.nextUpCountdownSeconds {
+                    CountdownRing(seconds: seconds, totalSeconds: viewModel.nextUpCountdownTotalSeconds)
+                }
+            }
+
+            HStack(spacing: 10) {
+                if !viewModel.nextUpScreenVideoEnded {
+                    Button(action: { viewModel.keepWatchingCurrentEpisode() }) {
+                        Text("Keep Watching")
+                            .frame(maxWidth: .infinity, minHeight: compact ? 24 : 44)
+                    }
+                    .siloSecondaryButton()
+                    .frame(minHeight: 44)
+                    .disabled(viewModel.isStartingNextUp)
+                }
+                Button(action: onBack) {
+                    Label("Back", systemImage: "chevron.left")
+                        .frame(minHeight: compact ? 24 : 44)
+                }
+                .siloSecondaryButton()
+                .frame(minHeight: 44)
+                if compact && hasNextEpisode && viewModel.shuffleState == nil { autoPlayToggle }
+            }
+            // With Stop shuffling beside it, the footer needs its own line.
+            if compact && hasNextEpisode && viewModel.shuffleState != nil { autoPlayFooter }
+        }
+        .font(.callout)
+        .lineLimit(1)
+        .frame(maxWidth: compact ? 560 : 380)
+        #endif
+    }
+
+    private var autoPlayToggle: some View {
+        Button {
+            viewModel.setNextUpAutoPlayEnabled(!viewModel.settings.autoPlayNextEpisode)
+        } label: {
+            Text("Auto-play is \(viewModel.settings.autoPlayNextEpisode ? "On" : "Off")")
+                .font(.system(size: captionSize, weight: .semibold))
+        }
+        .buttonStyle(AutoPlayToggleButtonStyle())
+        #if os(tvOS)
+        .focused($focusedTarget, equals: .autoPlay)
+        .onMoveCommand { direction in
+            if direction == .up {
+                focusPreferredAction()
+            }
+        }
+        #endif
+    }
+
+    private var onDeckSection: some View {
+        MediaRow(
+            title: "On Deck",
+            items: viewModel.nextUpCarouselItems.map(\.sectionItem),
+            onItemTap: playOnDeckItem(contentId:),
+            showProgress: true,
+            icon: "play.circle.fill",
+            layout: .thumbnail,
+            usesProvidedThumbnailTapAction: onDeckUsesProvidedThumbnailTapAction,
+            // The panel sits above the third card, so a geometric Down entry
+            // would skip the first. Let the focus engine enter the row and
+            // land on its first card instead of redirecting the move, and
+            // scroll the strip home on exit so that card is loaded next time.
+            prefersDefaultFocusOnFirstItem: true,
+            scrollsToFirstItemWhenFocusLeaves: true,
+            onMoveUp: focusAboveOnDeck
+        )
+    }
+
+    private var onDeckUsesProvidedThumbnailTapAction: Bool {
+        #if os(iOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    private var statusLabel: String {
+        if viewModel.nextUpEpisode == nil && !viewModel.isLoadingNextUpEpisode {
+            return viewModel.nextUpScreenVideoEnded ? "Finished" : "More To Watch"
+        }
+        if viewModel.shuffleState != nil { return "Up Next at Random" }
+        return viewModel.nextUpScreenVideoEnded ? "Playing Next" : "Up Next"
+    }
+
+    private var loadingLabel: String {
+        viewModel.shuffleState != nil ? "Picking at random" : "Finding the next episode"
+    }
+
+    private var finishedMessage: String {
+        if viewModel.shuffleState != nil {
+            if viewModel.nextUpStartError != nil {
+                return "Couldn't start the next pick. Try again or go back."
+            }
+            return "Nothing else in this shuffle can play."
+        }
+        return episodeFinishedMessage
+    }
+
+    private var episodeFinishedMessage: String {
+        #if os(iOS)
+        if viewModel.nextUpStartError != nil {
+            return "Couldn't start the next episode. Try again or go back."
+        }
+        if viewModel.nextUpLookupError != nil {
+            return "Couldn't load the next episode. Go back to choose something else."
+        }
+        return "No next episode is available."
+        #else
+        if let startError = viewModel.nextUpStartError {
+            let suffix = viewModel.nextUpCarouselItems.isEmpty
+                ? "Try again or go back."
+                : "Try again, pick something from On Deck, or go back."
+            return "Couldn't start the next episode: \(startError) \(suffix)"
+        }
+        if viewModel.nextUpLookupError != nil {
+            return "Couldn't load the next episode. Pick something from On Deck, or go back."
+        }
+        if viewModel.nextUpCarouselItems.isEmpty {
+            return "No next episode is available."
+        }
+        return "No next episode is available. Pick something from On Deck instead."
+        #endif
+    }
+
+    private func focusPreferredAction() {
+        focusedTarget = preferredActionFocusTarget
+    }
+
+    private func focusBelowActions() {
+        // Without the Auto-play toggle, Down enters On Deck natively.
+        guard viewModel.nextUpEpisode != nil else { return }
+        focusedTarget = .autoPlay
+    }
+
+    private func focusAboveOnDeck() {
+        if viewModel.nextUpEpisode != nil {
+            focusedTarget = .autoPlay
+            return
+        }
+        focusPreferredAction()
+    }
+
+    private func requestInitialActionFocusIfNeeded() {
+        guard !didRequestInitialActionFocus else { return }
+        guard viewModel.nextUpEpisode != nil || !viewModel.isLoadingNextUpEpisode else { return }
+        didRequestInitialActionFocus = true
+
+        Task { @MainActor in
+            await Task.yield()
+            focusedTarget = preferredActionFocusTarget
+        }
+    }
+
+    private var preferredActionFocusTarget: PlayerNextUpFocusTarget {
+        if viewModel.nextUpEpisode != nil {
+            return .playNow
+        }
+        if !viewModel.nextUpScreenVideoEnded {
+            return .keepWatching
+        }
+        return .back
+    }
+
+    private func playOnDeckItem(contentId: String) {
+        guard let item = viewModel.nextUpCarouselItems.first(where: { $0.contentId == contentId }) else {
+            return
+        }
+        viewModel.playOnDeckItemNow(item)
+    }
+
+    private var backgroundArtwork: (url: String, thumbhash: String?)? {
+        if let url = viewModel.nextUpEpisode?.stillUrl {
+            return (url, viewModel.nextUpEpisode?.stillThumbhash)
+        }
+        if let item = viewModel.nextUpCarouselItems.first,
+           let url = item.artworkUrl {
+            return (url, item.artworkThumbhash)
+        }
+        return nil
+    }
+
+    private func episodeMetadataLine(for episode: PlayerNextUpEpisode) -> String {
+        var parts: [String] = []
+        if let airDate = episode.airDate, !airDate.isEmpty {
+            parts.append(formatAirDate(airDate))
+        }
+        if let runtime = MediaTextFormatting.runtime(minutes: episode.runtime) {
+            parts.append(runtime)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func formatAirDate(_ airDate: String) -> String {
+        guard let date = try? Date(airDate, strategy: .iso8601) else { return airDate }
+        return date.formatted(date: .abbreviated, time: .omitted)
+    }
+
+    /// One centered column shared by the hero and On Deck, as wide as four
+    /// On Deck cards so a full row fills it edge to edge. The cap leaves room
+    /// for MediaRow's inset; Large cards are too wide for four to fit, so the
+    /// fourth card runs past the column like any other rail.
+    private func contentColumnWidth(for proxy: GeometryProxy) -> CGFloat {
+        let fourCards = onDeckCardWidth * 4 + tvCardSpacing * 3
+        let available = proxy.size.width - (horizontalPadding + SiloTheme.safePadding) * 2
+        return min(available, fourCards)
+    }
+
+    /// Matches EpisodeThumbCard, which scales with the Poster Size setting.
+    private var onDeckCardWidth: CGFloat {
+        SiloTheme.thumbnailCardWidth * uiCustomization.cardPresentation.posterSize.scale
+    }
+
+    private var isTV: Bool {
+        #if os(tvOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    /// Matches MediaRow's tvOS card spacing.
+    private let tvCardSpacing: CGFloat = 40
+    private var horizontalPadding: CGFloat { isTV ? 80 : 24 }
+    private var verticalTopPadding: CGFloat { isTV ? 112 : 24 }
+    private var verticalBottomPadding: CGFloat { isTV ? 260 : 24 }
+    private var sectionSpacing: CGFloat { isTV ? 34 : 22 }
+    private var panelSpacing: CGFloat { isTV ? 22 : 14 }
+    private var eyebrowSize: CGFloat { isTV ? 18 : 12 }
+    private var titleSize: CGFloat { isTV ? 42 : 26 }
+    private var seriesTitleSize: CGFloat { isTV ? 34 : 22 }
+    private var subtitleSize: CGFloat { isTV ? 25 : 17 }
+    private var bodySize: CGFloat { isTV ? 22 : 15 }
+    private var captionSize: CGFloat { isTV ? 19 : 13 }
+}
+
+private struct AutoPlayToggleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        AutoPlayToggleButtonBody(configuration: configuration)
+    }
+}
+
+private struct AutoPlayToggleButtonBody: View {
+    let configuration: ButtonStyle.Configuration
+    @Environment(\.isFocused) private var isFocused
+
+    var body: some View {
+        configuration.label
+            .foregroundStyle(.white.opacity(isFocused ? 0.92 : 0.54))
+            .padding(.horizontal, 22)
+            .padding(.vertical, 10)
+            .overlay(
+                Capsule()
+                    .stroke(.white.opacity(isFocused ? 0.55 : 0), lineWidth: 1.5)
+            )
+            .scaleEffect(configuration.isPressed ? 0.98 : (isFocused ? 1.04 : 1.0))
+            #if os(tvOS)
+            .focusEffectDisabled()
+            #endif
+            .animation(SiloTheme.springAnimation, value: isFocused)
+            .animation(.easeOut(duration: SiloTheme.fastDuration), value: configuration.isPressed)
+    }
+}
+
+private struct CountdownRing: View {
+    let seconds: Int
+    let totalSeconds: Int
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(.white.opacity(0.12), lineWidth: 3)
+            Circle()
+                .trim(from: 0, to: progress)
+                .stroke(.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            Text("\(seconds)")
+                .font(.system(size: textSize, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+        }
+        .frame(width: ringSize, height: ringSize)
+        .accessibilityLabel("Playing next in \(seconds) seconds")
+    }
+
+    private var progress: Double {
+        guard totalSeconds > 0 else { return 0 }
+        return max(0, min(1, Double(seconds) / Double(totalSeconds)))
+    }
+
+    private var ringSize: CGFloat {
+        #if os(tvOS)
+        58
+        #else
+        44
+        #endif
+    }
+
+    private var textSize: CGFloat {
+        #if os(tvOS)
+        24
+        #else
+        17
+        #endif
+    }
+}

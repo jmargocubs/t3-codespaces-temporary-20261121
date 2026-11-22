@@ -1,0 +1,869 @@
+//
+//  SubtitleSearchMenu.swift
+//  Silo (iOS + tvOS)
+//
+//  In-player external subtitle search (OpenSubtitles / SubDL / Subsource via
+//  silo-server). Android/web parity: pick a language (the profile's preferred
+//  subtitle language floats to the top and is pre-selected), Search — no
+//  free-text query, the server keys the search on the media file — then tap a
+//  result to download it. The downloaded track registers on the live backend
+//  and auto-selects with no session restart (the same sidecar handoff the AI
+//  flow uses; see `PlayerViewModel.downloadSearchedSubtitle`).
+//
+//  Presented next to the "AI Subtitles…" entry — from the Audio & Subtitles
+//  menu in ``MobilePlayerControls`` (iOS) and the Subtitles pane's options
+//  column in ``TVPlayerInfoHUD`` (tvOS).
+//  The entry row is shown only per ``PlayerViewModel/subtitleSearchEnabled``:
+//  an active server session (none for offline/local playback) and a server
+//  with external providers configured. Without providers the row is hidden
+//  rather than running a search that can only come back empty.
+//
+//  Two-platform split mirrors ``SubtitleTranslateMenu``: iOS renders a
+//  sectioned `List` in a sheet; tvOS renders a centered floating panel with a
+//  single panel-level `@FocusState` (scroll-follow + nil-recovery), backdrop
+//  tap + `onExitCommand` dismissal. Not compiled for macOS, which has no entry
+//  point to it.
+//
+
+import SwiftUI
+
+#if !os(macOS)
+struct SubtitleSearchMenu: View {
+    let viewModel: PlayerViewModel
+    let onDismiss: () -> Void
+
+    /// Called when a download succeeded and the track is registered +
+    /// selected: dismisses the WHOLE subtitle UI (this menu plus the enclosing
+    /// panel/sheet) down to the player, like the AI menu's `onJobStarted`.
+    /// It must remove this menu: after a success Done, swipe-down and the
+    /// rows stay disabled. Not called if this menu goes away before the
+    /// download settles.
+    let onDownloaded: () -> Void
+
+    /// The profile's preferred subtitle language, used to pre-select and
+    /// float its row. Observed so a late hydration refreshes the default.
+    @ObservedObject private var profilePrefs = ProfilePrefsStore.shared
+
+    private enum Phase: Equatable {
+        /// Language list shown, no search yet (or user backed out of results).
+        case picking
+        /// `POST /subtitles/search` in flight — can take ~30s.
+        case searching
+        /// Results (possibly empty) for `searchedLanguage`.
+        case results
+        /// Search or download failed; message shown verbatim.
+        case failed(String)
+    }
+
+    @State private var phase: Phase = .picking
+    /// Selected language code; seeded from the preferred subtitle language.
+    @State private var selectedLanguage: String?
+    /// The language the current `results` belong to (for the empty-state copy).
+    @State private var searchedLanguage: String?
+    @State private var results: [SubtitleSearchResult] = []
+    @State private var warnings: [String] = []
+    /// The result currently downloading; non-nil disables every row.
+    @State private var downloadingId: String?
+    /// Results whose download stored, or may have stored, the subtitle,
+    /// keyed by ``SubtitleSearchResult/uniqueKey`` with the copy to show.
+    /// The download is `non_retryable`: picking one again shows the copy
+    /// instead of sending it twice.
+    @State private var settledDownloads: [String: String] = [:]
+    @State private var searchTask: Task<Void, Never>?
+    /// The menu's reaction to the in-flight download (not the download
+    /// itself); cancelled on disappear so a late result can't act on UI
+    /// that's gone.
+    @State private var downloadTask: Task<Void, Never>?
+
+    #if os(tvOS)
+    /// Panel-level focus for language rows and result rows (keys never
+    /// collide: language codes vs composite `provider:id` result keys).
+    /// Centralized so the list can scroll-follow and recover a dropped
+    /// focus — mirrors ``SubtitleTranslateMenu``.
+    @FocusState private var focusedRowID: String?
+    #endif
+
+    var body: some View {
+        platformBody
+            // The provider probe is async and fails open, so this menu can
+            // already be on screen when the server's "no providers configured"
+            // answer lands — the entry row's `.disabled(...)` only gates
+            // *opening* it. Catch the flip here so an idle language list stops
+            // inviting a search that can't work; `search(language:)` guards the
+            // action itself for the narrower race where the pick beats this.
+            //
+            // Keyed on the reason rather than `subtitleSearchEnabled` because
+            // the reason is non-nil for exactly the unconfigured-provider case:
+            // the *visibility* half of that predicate also drops when the
+            // playback session momentarily has no id, and hijacking the menu
+            // for that would be a false positive.
+            .onChange(of: viewModel.subtitleSearchUnavailableReason) { _, _ in
+                reflectUnavailabilityIfIdle()
+            }
+            // Covers the sliver where the probe lands between the row's tap
+            // and this view appearing, which `onChange` would never see.
+            .onAppear { reflectUnavailabilityIfIdle() }
+            .onDisappear {
+                searchTask?.cancel()
+                downloadTask?.cancel()
+            }
+    }
+
+    @ViewBuilder
+    private var platformBody: some View {
+        #if os(tvOS)
+        tvOSPanel
+        #else
+        phoneList
+        #endif
+    }
+
+    // MARK: - Shared copy
+
+    private var title: String { "Search Subtitles" }
+
+    private var explainer: String {
+        "Pick a language and Silo searches its subtitle providers for this video."
+    }
+
+    // MARK: - Languages
+
+    /// Languages offered, with the preferred language floated to the top.
+    private var languageChoices: SubtitleLanguageChoices {
+        SubtitleLanguageChoices(preferred: profilePrefs.preferredSubtitleLanguage)
+    }
+
+    private func displayName(_ code: String) -> String {
+        SubtitleLanguageChoices.displayName(code)
+    }
+
+    /// Seed the selection from the preferred language once hydrated.
+    private func seedSelectedLanguage() {
+        guard selectedLanguage == nil else { return }
+        selectedLanguage = profilePrefs.preferredSubtitleLanguage ?? SubtitleLanguageChoices.firstCatalogCode
+    }
+
+    // MARK: - Actions
+
+    /// Terminal copy for a search the server can't service. Reuses the entry
+    /// row's own string so the two surfaces can't drift. The fallback covers
+    /// only the case where the *visibility* half of the gate dropped too (the
+    /// playback session went away under an open sheet), which nils the reason
+    /// while leaving search just as unrunnable.
+    private var unavailableMessage: String {
+        viewModel.subtitleSearchUnavailableReason ?? "Subtitle search isn't available right now."
+    }
+
+    /// Show the unavailable state if the server has since told us it has no
+    /// providers. Only rewrites an *idle* language list: an in-flight search
+    /// or a result list the user is reading is left alone, since yanking
+    /// either away mid-read is more disruptive than the stale state — and
+    /// `search(language:)` guards the action, so nothing new can be launched
+    /// from them either.
+    private func reflectUnavailabilityIfIdle() {
+        guard phase == .picking,
+              let reason = viewModel.subtitleSearchUnavailableReason else { return }
+        searchedLanguage = nil
+        phase = .failed(reason)
+    }
+
+    /// Selecting a language IS the search trigger (one-tap, like the AI
+    /// menu routes on language pick) — no separate Search button.
+    private func search(language: String) {
+        guard downloadingId == nil, phase != .searching else { return }
+        // The entry row's `.disabled(...)` gates opening this menu, not acting
+        // inside it: `SubtitleProvidersStore` fails open, so the sheet can be
+        // presented before the probe returns `{"enabled": false}`. Without
+        // this the pick would still start the provider fan-out and deliver the
+        // 20–30s empty search this feature exists to avoid. Route it to the
+        // menu's existing terminal failure state instead of silently ignoring
+        // the press, which on both platforms would read as a dead row.
+        //
+        // `searchedLanguage` stays nil deliberately: it is what makes the
+        // failure panel offer "Try Again", and retrying is pointless here —
+        // only "Back" applies.
+        guard viewModel.subtitleSearchEnabled else {
+            selectedLanguage = language
+            searchedLanguage = nil
+            phase = .failed(unavailableMessage)
+            return
+        }
+        selectedLanguage = language
+        searchedLanguage = language
+        phase = .searching
+        searchTask?.cancel()
+        searchTask = Task {
+            do {
+                let response = try await viewModel.searchSubtitles(languages: [language])
+                guard !Task.isCancelled else { return }
+                results = response.results
+                warnings = response.warnings
+                phase = .results
+            } catch {
+                guard !Task.isCancelled else { return }
+                // Verbatim server error.
+                phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func download(_ result: SubtitleSearchResult) {
+        guard downloadingId == nil else { return }
+        let key = result.uniqueKey
+        if let message = settledDownloads[key] {
+            phase = .failed(message)
+            return
+        }
+        downloadingId = key
+        // The download belongs to the player, not this menu: it is
+        // non-retryable and a stored subtitle should still be added if the
+        // menu goes away. Only the menu's reaction is tied to the menu, and
+        // cancelling it doesn't reach `work` (awaiting `value` doesn't
+        // propagate cancellation).
+        let work = Task { await viewModel.downloadSearchedSubtitle(result) }
+        downloadTask = Task {
+            let outcome = await work.value
+            // The menu went away mid-download: the track may still register,
+            // but nothing in (or above) this menu should react.
+            guard !Task.isCancelled else { return }
+            guard let message = outcome.message else {
+                // Track registered + auto-selected on the live player;
+                // collapse the whole subtitle UI down to the video.
+                onDownloaded()
+                return
+            }
+            if outcome.holdsResult { settledDownloads[key] = message }
+            downloadingId = nil
+            phase = .failed(message)
+        }
+    }
+
+    /// Back out of results/failure to the language list (keeps the menu up).
+    private func backToLanguages() {
+        searchTask?.cancel()
+        results = []
+        warnings = []
+        phase = .picking
+    }
+
+    // MARK: - Result presentation
+
+    private func scoreColor(_ score: Double) -> Color {
+        switch SubtitleSearchScoreTier(score: score) {
+        case .good: return .siloSuccess
+        case .fair: return .siloWarning
+        case .poor: return .siloError
+        }
+    }
+
+    /// Short provider tag for the row badge (parity with Android/web).
+    private func providerBadge(_ provider: String) -> String {
+        switch provider.lowercased() {
+        case "opensubtitles": return "OS"
+        case "subdl": return "SDL"
+        case "subsource": return "SS"
+        default: return provider.uppercased()
+        }
+    }
+
+    /// Second row of a result: language • downloads • HI.
+    private func resultDetail(_ result: SubtitleSearchResult) -> String {
+        var parts: [String] = []
+        // Canonical-key check filters junk codes; display goes through the
+        // same `displayName` as the picker so the strings stay consistent.
+        if SubtitleDisplayOrder.canonicalLanguageKey(result.language) != nil {
+            parts.append(displayName(result.language))
+        }
+        if result.downloads > 0 {
+            parts.append("\(result.downloads) downloads")
+        }
+        if result.hearingImpaired {
+            parts.append("HI")
+        }
+        return parts.joined(separator: " • ")
+    }
+
+    private var emptyResultsText: String {
+        let language = searchedLanguage.map(displayName) ?? "that language"
+        return "No subtitles found for \(language)."
+    }
+
+    // MARK: - tvOS
+
+    #if os(tvOS)
+    private func focusFirstRow() {
+        switch phase {
+        case .picking:
+            focusedRowID = selectedLanguage ?? languageChoices.all.first?.code
+        case .results:
+            // Empty result set: land focus on the fallback row so the remote
+            // isn't left with nothing focused.
+            focusedRowID = results.first?.uniqueKey ?? "back-to-languages"
+        case .searching:
+            focusedRowID = "cancel-search"
+        case .failed:
+            focusedRowID = searchedLanguage == nil ? "search-back" : "retry-search"
+        }
+    }
+
+    private func scrollToFocusedRow(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        guard let target = focusedRowID else { return }
+        SubtitleLanguageChoices.scroll(proxy, to: target, animated: animated)
+    }
+
+    private var tvOSPanel: some View {
+        TVSubtitleDialog(
+            title: title,
+            subtitle: tvSubtitle,
+            backHint: tvBackHint,
+            statusHint: downloadingId != nil ? "Adding subtitle…"
+                : phase == .results && !results.isEmpty ? "Select a subtitle to download and use it" : "",
+            onDismiss: { if downloadingId == nil { onDismiss() } }
+        ) {
+            switch phase {
+            case .searching:
+                searchingPanel
+            case .failed(let message):
+                failurePanel(message)
+            case .picking, .results:
+                ScrollViewReader { proxy in
+                    ScrollView(showsIndicators: false) {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            if phase == .picking {
+                                tvLanguageRows
+                            } else {
+                                tvResultRows
+                            }
+                        }
+                        .padding(8)
+                    }
+                    .focusSection()
+                    .onAppear {
+                        focusFirstRow()
+                        scrollToFocusedRow(proxy, animated: false)
+                    }
+                    .onChange(of: focusedRowID) { _, value in
+                        // Focus fell off the list — pull it back rather
+                        // than letting it vanish; else keep it visible.
+                        if value == nil { focusFirstRow() }
+                        else { scrollToFocusedRow(proxy) }
+                    }
+                    .onChange(of: phase) { _, _ in focusFirstRow() }
+                }
+            }
+        }
+        .onExitCommand {
+            // First back-press from results returns to the language list;
+            // from the language list it dismisses the menu. Back is inert
+            // while a download is in flight (mirrors iOS's disabled
+            // "Language" button) so the resolving download can't later yank
+            // the user off the language list or force-dismiss the menu.
+            switch phase {
+            case .results, .failed, .searching:
+                if downloadingId == nil { backToLanguages() }
+            case .picking:
+                onDismiss()
+            }
+        }
+        .task { await profilePrefs.hydrateIfNeeded() }
+        .onAppear { seedSelectedLanguage() }
+        .onChange(of: profilePrefs.preferredSubtitleLanguage) { _, _ in seedSelectedLanguage() }
+    }
+
+    private var tvSubtitle: String {
+        switch phase {
+        case .picking:
+            return "Choose a language to find subtitles for this video."
+        case .searching:
+            return "Finding subtitles in \(searchedLanguage.map(displayName) ?? "your language")"
+        case .results:
+            let language = searchedLanguage.map(displayName) ?? "Subtitles"
+            return "\(language) · \(results.count) \(results.count == 1 ? "result" : "results")"
+        case .failed:
+            return "Subtitle search could not finish"
+        }
+    }
+
+    private var tvBackHint: String {
+        if downloadingId != nil { return "Please wait for the download to finish" }
+        return phase == .picking ? "Back to Subtitles" : "Back to languages"
+    }
+
+    @ViewBuilder
+    private var tvLanguageRows: some View {
+        let choices = languageChoices
+        if !choices.suggested.isEmpty {
+            sectionHeader("Preferred language")
+            ForEach(choices.suggested) { tvLanguageRow($0) }
+        }
+        sectionHeader(choices.suggested.isEmpty ? "Language" : "All Languages")
+        ForEach(choices.other) { tvLanguageRow($0) }
+    }
+
+    @ViewBuilder
+    private func tvLanguageRow(_ choice: SubtitleLanguageChoices.Choice) -> some View {
+        TVSubtitleMenuRow(
+            rowID: choice.code,
+            focusedID: $focusedRowID,
+            action: { search(language: choice.code) }
+        ) {
+            Image(systemName: choice.hint == "Preferred" ? "star.fill" : "globe")
+                .font(.system(size: 22, weight: .regular))
+                .opacity(0.8)
+                .frame(width: 34)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(choice.label)
+                    .font(.system(size: 24, weight: .medium))
+                    .lineLimit(1)
+                if let hint = choice.hint {
+                    Text(hint)
+                        .font(.system(size: 18))
+                        .opacity(0.65)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 18, weight: .semibold))
+                .opacity(0.55)
+        }
+        .id(choice.code)
+    }
+
+    /// Per-provider soft failures, shown above the results in amber.
+    @ViewBuilder
+    private var warningRows: some View {
+        ForEach(warnings, id: \.self) { warning in
+            Label(warning, systemImage: "exclamationmark.triangle")
+                .font(.system(size: 20))
+                .foregroundStyle(Color.siloWarning)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 4)
+        }
+    }
+
+    @ViewBuilder
+    private var tvResultRows: some View {
+        warningRows
+        if results.isEmpty {
+            Text(emptyResultsText)
+                .font(.system(size: 20))
+                .foregroundStyle(.white.opacity(0.55))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+            TVSubtitleMenuRow(
+                rowID: "back-to-languages",
+                focusedID: $focusedRowID,
+                action: { backToLanguages() }
+            ) {
+                Image(systemName: "chevron.backward")
+                    .font(.system(size: 20, weight: .semibold))
+                    .opacity(0.8)
+                    .frame(width: 34)
+                Text("Choose another language")
+                    .font(.system(size: 22, weight: .medium))
+                Spacer(minLength: 8)
+            }
+            .id("back-to-languages")
+        } else {
+            ForEach(results, id: \.uniqueKey) { result in
+                tvResultRow(result)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tvResultRow(_ result: SubtitleSearchResult) -> some View {
+        let isDownloadingThis = downloadingId == result.uniqueKey
+        TVSubtitleMenuRow(
+            rowID: result.uniqueKey,
+            isDisabled: downloadingId != nil && !isDownloadingThis,
+            focusedID: $focusedRowID,
+            action: { download(result) }
+        ) {
+            VStack(spacing: 6) {
+                scoreBadge(result.score, fontSize: 18)
+                Text("Match")
+                    .font(.system(size: 14))
+                    .opacity(0.65)
+            }
+            .frame(width: 64)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(result.releaseName.isEmpty ? "Untitled release" : result.releaseName)
+                    .font(.system(size: 24, weight: .medium))
+                    .lineLimit(2)
+                Text(resultDetail(result))
+                    .font(.system(size: 20))
+                    .opacity(0.65)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if isDownloadingThis {
+                ProgressView()
+                    .scaleEffect(0.7)
+            } else {
+                VStack(alignment: .trailing, spacing: 8) {
+                    Text(tvProviderName(result.provider))
+                        .font(.system(size: 18, weight: .medium))
+                    Label(result.format.uppercased(), systemImage: "arrow.down.circle")
+                        .font(.system(size: 17))
+                        .opacity(0.6)
+                }
+                .frame(width: 150, alignment: .trailing)
+            }
+        }
+        .id(result.uniqueKey)
+    }
+
+    private func tvProviderName(_ provider: String) -> String {
+        switch provider.lowercased() {
+        case "opensubtitles": return "OpenSubtitles"
+        case "subdl": return "SubDL"
+        case "subsource": return "Subsource"
+        default: return provider
+        }
+    }
+
+    @ViewBuilder
+    private var searchingPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 14) {
+                ProgressView()
+                Text("Searching providers…")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+            Text("This can take up to half a minute.")
+                .font(.system(size: 17))
+                .foregroundStyle(.white.opacity(0.5))
+            Button("Cancel") { backToLanguages() }
+                .buttonStyle(.bordered)
+                .focused($focusedRowID, equals: "cancel-search")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .onAppear { focusFirstRow() }
+    }
+
+    @ViewBuilder
+    private func failurePanel(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label(message, systemImage: "exclamationmark.triangle")
+                .font(.system(size: 20))
+                .foregroundStyle(.white.opacity(0.7))
+            HStack(spacing: 12) {
+                if let language = searchedLanguage {
+                    Button("Try Again") { search(language: language) }
+                        .buttonStyle(.bordered)
+                        .focused($focusedRowID, equals: "retry-search")
+                }
+                Button("Back") { backToLanguages() }
+                    .buttonStyle(.bordered)
+                    .focused($focusedRowID, equals: "search-back")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .onAppear { focusFirstRow() }
+    }
+
+    @ViewBuilder
+    private func sectionHeader(_ text: String) -> some View {
+        Text(text.uppercased())
+            .font(.system(size: 14, weight: .semibold))
+            .tracking(1.2)
+            .foregroundStyle(.white.opacity(0.45))
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+    }
+    #endif
+
+    // MARK: - iOS
+
+    #if !os(tvOS)
+    private var phoneList: some View {
+        NavigationStack {
+            Group {
+                switch phase {
+                case .searching:
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Searching providers…")
+                            .font(.headline)
+                        Text("This can take up to half a minute.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Button("Cancel") { backToLanguages() }
+                            .buttonStyle(.bordered)
+                            .padding(.top, 4)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .failed(let message):
+                    VStack(alignment: .leading, spacing: 16) {
+                        Label(message, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            if let language = searchedLanguage {
+                                Button("Try Again") { search(language: language) }
+                                    .buttonStyle(.bordered)
+                            }
+                            Button("Back") { backToLanguages() }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                case .picking:
+                    languagePickingList
+                case .results:
+                    resultsList
+                }
+            }
+            .navigationTitle(phase == .results ? "Results" : title)
+            .siloNavigationTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    // Leaving is blocked while a download is in flight, as on
+                    // tvOS (backdrop and Menu are inert then).
+                    Button("Done") { onDismiss() }
+                        .disabled(downloadingId != nil)
+                }
+                if phase == .results {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Language") { backToLanguages() }
+                            .disabled(downloadingId != nil)
+                    }
+                }
+            }
+            .task { await profilePrefs.hydrateIfNeeded() }
+            .onAppear { seedSelectedLanguage() }
+            .onChange(of: profilePrefs.preferredSubtitleLanguage) { _, _ in seedSelectedLanguage() }
+        }
+        .interactiveDismissDisabled(downloadingId != nil)
+    }
+
+    private var languagePickingList: some View {
+        let choices = languageChoices
+        return List {
+            if !choices.suggested.isEmpty {
+                Section("Suggested") {
+                    ForEach(choices.suggested) { languageRow($0) }
+                }
+            }
+            Section {
+                ForEach(choices.other) { languageRow($0) }
+            } header: {
+                Text(choices.suggested.isEmpty ? "Language" : "All Languages")
+            } footer: {
+                Text(explainer)
+            }
+        }
+        .siloGroupedListStyle()
+    }
+
+    @ViewBuilder
+    private func languageRow(_ choice: SubtitleLanguageChoices.Choice) -> some View {
+        Button {
+            search(language: choice.code)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: choice.hint == "Preferred" ? "star.fill" : "globe")
+                    .foregroundStyle(.tint)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(choice.label)
+                        .foregroundStyle(.primary)
+                    if let hint = choice.hint {
+                        Text(hint)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var resultsList: some View {
+        List {
+            if !warnings.isEmpty {
+                Section {
+                    ForEach(warnings, id: \.self) { warning in
+                        Label(warning, systemImage: "exclamationmark.triangle")
+                            .font(.footnote)
+                            .foregroundStyle(Color.siloWarning)
+                    }
+                }
+            }
+            if results.isEmpty {
+                Section {
+                    Text(emptyResultsText)
+                        .foregroundStyle(.secondary)
+                    Button("Choose another language") { backToLanguages() }
+                }
+            } else {
+                Section(searchedLanguage.map { displayName($0) } ?? "Results") {
+                    ForEach(results, id: \.uniqueKey) { result in
+                        resultRow(result)
+                    }
+                }
+            }
+        }
+        .siloGroupedListStyle()
+    }
+
+    @ViewBuilder
+    private func resultRow(_ result: SubtitleSearchResult) -> some View {
+        let isDownloadingThis = downloadingId == result.uniqueKey
+        Button {
+            download(result)
+        } label: {
+            HStack(spacing: 12) {
+                scoreBadge(result.score, fontSize: 13)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(result.releaseName.isEmpty ? "Untitled release" : result.releaseName)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Text(resultDetail(result))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if isDownloadingThis {
+                    ProgressView()
+                } else {
+                    providerTag(result.provider, fontSize: 11)
+                }
+            }
+        }
+        .disabled(downloadingId != nil && !isDownloadingThis)
+    }
+    #endif
+
+    // MARK: - Shared badges
+
+    /// Rounded score chip, tier-colored (≥70 green / ≥40 amber / else red).
+    @ViewBuilder
+    private func scoreBadge(_ score: Double, fontSize: CGFloat) -> some View {
+        Text("\(Int(score.rounded()))")
+            .font(.system(size: fontSize, weight: .bold, design: .rounded))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(scoreColor(score).opacity(0.85))
+            )
+    }
+
+    /// Small capsule with the provider abbreviation.
+    @ViewBuilder
+    private func providerTag(_ provider: String, fontSize: CGFloat) -> some View {
+        if !provider.isEmpty {
+            Text(providerBadge(provider))
+                .font(.system(size: fontSize, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Capsule().strokeBorder(.secondary.opacity(0.45), lineWidth: 1))
+        }
+    }
+}
+
+// MARK: - Shared language list
+
+/// Language rows for ``SubtitleSearchMenu`` and ``SubtitleTranslateMenu``:
+/// hinted suggestions first, in priority order, then every catalog language
+/// sorted by name.
+struct SubtitleLanguageChoices {
+    struct Choice: Identifiable {
+        let code: String
+        let label: String
+        /// Provenance tag ("Preferred" / "Original language") on suggested
+        /// rows; nil on the full list.
+        let hint: String?
+        var id: String { code }
+    }
+
+    let suggested: [Choice]
+    let other: [Choice]
+
+    /// Suggested rows, then the rest, in display order.
+    var all: [Choice] { suggested + other }
+
+    /// Blank codes and codes naming an already-listed language are skipped,
+    /// and the full list leaves out any suggested language.
+    init(preferred: String?, original: String? = nil) {
+        var seen = Set<String>()
+        var suggested: [Choice] = []
+        for (rawCode, hint) in [(preferred, "Preferred"), (original, "Original language")] {
+            guard let code = rawCode?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !code.isEmpty,
+                  seen.insert(PlaybackLanguageOption.languageIdentity(code)).inserted else { continue }
+            suggested.append(Choice(code: code, label: Self.displayName(code), hint: hint))
+        }
+        self.suggested = suggested
+        self.other = Self.sortedCatalog
+            .filter { !seen.contains($0.identity) }
+            .map { $0.choice }
+    }
+
+    /// Display name for a language code, preferring the catalog label.
+    static func displayName(_ code: String) -> String {
+        catalogLabels[code.lowercased()]
+            ?? englishLocale.localizedString(forLanguageCode: code)?.capitalized
+            ?? code.uppercased()
+    }
+
+    /// The first catalog language in catalog (not display) order.
+    static var firstCatalogCode: String? { catalog.first?.choice.code }
+
+    #if os(tvOS)
+    /// Centers `target` in the list, animated unless the list is appearing.
+    @MainActor
+    static func scroll(_ proxy: ScrollViewProxy, to target: String, animated: Bool) {
+        if animated {
+            withAnimation(.easeOut(duration: SiloTheme.fastDuration)) {
+                proxy.scrollTo(target, anchor: .center)
+            }
+        } else {
+            proxy.scrollTo(target, anchor: .center)
+        }
+    }
+    #endif
+
+    private typealias Entry = (identity: String, choice: Choice)
+
+    private static let englishLocale = Locale(identifier: "en")
+
+    private static let catalogLabels: [String: String] = Dictionary(
+        PlaybackLanguageOption.all.map { ($0.code.lowercased(), $0.label) },
+        uniquingKeysWith: { first, _ in first }
+    )
+
+    /// The catalog, deduped by language identity. Built once because
+    /// `PlaybackLanguageOption.all` is fixed for the process.
+    private static let catalog: [Entry] = {
+        var seen = Set<String>()
+        var entries: [Entry] = []
+        for option in PlaybackLanguageOption.all {
+            let code = option.code.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !code.isEmpty else { continue }
+            let identity = PlaybackLanguageOption.languageIdentity(code)
+            guard seen.insert(identity).inserted else { continue }
+            entries.append((
+                identity: identity,
+                choice: Choice(code: code, label: SubtitleLanguageChoices.displayName(code), hint: nil)
+            ))
+        }
+        return entries
+    }()
+
+    private static let sortedCatalog: [Entry] = catalog.sorted {
+        $0.choice.label.localizedCaseInsensitiveCompare($1.choice.label) == .orderedAscending
+    }
+}
+#endif

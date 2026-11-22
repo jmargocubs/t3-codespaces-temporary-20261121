@@ -1,0 +1,1513 @@
+import Foundation
+
+// MARK: - Browse / Catalog
+
+struct BrowseItem: Codable, Identifiable, Hashable {
+    let contentId: String
+    let type: String
+    let title: String
+    /// Episode context; the server sends it on episode rows (text search
+    /// with the `video_with_episodes` or `episode` scope) and on
+    /// section-sourced catalog pages (e.g. a Continue Watching shelf paged
+    /// through `source=section`), with progress on the latter, and omits it
+    /// elsewhere. Defaulted so the memberwise init and synthesized decoder
+    /// stay intact.
+    var seriesId: String? = nil
+    var seriesTitle: String? = nil
+    var seasonNumber: Int? = nil
+    var episodeNumber: Int? = nil
+    var itemSource: String? = nil
+    var positionSeconds: Double? = nil
+    var durationSeconds: Double? = nil
+    var progressUpdatedAt: String? = nil
+    let year: Int?
+    let genres: [String]?
+    let contentRating: String?
+    let advisoryAge: Int?
+    let advisorySource: String?
+    let status: String?
+    let ratingImdb: Double?
+    let ratingTmdb: Double?
+    let ratingRtCritic: Int?
+    let ratingRtAudience: Int?
+    let runtime: Int?
+    let originalLanguage: String?
+    let studios: [String]?
+    let networks: [String]?
+    let showStatus: String?
+    let overview: String?
+    var posterIsEpisodeStill: Bool? = nil
+    var backdropIsEpisodeStill: Bool? = nil
+    @ArtworkURL var posterUrl: String? = nil
+    let posterThumbhash: String?
+    @ArtworkURL var backdropUrl: String? = nil
+    let backdropThumbhash: String?
+    let addedAt: String?
+    let releaseDate: String?
+    let lastAirDate: String?
+    let userState: MediaItemUserState?
+    let overlaySummary: OverlaySummary?
+    var id: String { contentId }
+}
+
+/// Tech-level overlay data derived server-side from the best-ranked file's
+/// media metadata. Mirrors `internal/overlays/summary.go` →
+/// `OverlaySummary` on the Go side. Ratings, metadata, and ribbon overlays
+/// pull their values from item-level fields (ratingImdb, year, …), not this
+/// struct.
+struct OverlaySummary: Codable, Hashable {
+    let resolution: String?
+    let hdr: String?
+    let audio: String?
+    let audioChannels: String?
+    let videoCodec: String?
+    let container: String?
+    let aspectRatio: String?
+    let releaseType: String?
+    let edition: String?
+    let multiAudio: Bool?
+    let multiSub: Bool?
+}
+
+struct MediaItemUserState: Codable, Hashable {
+    let played: Bool
+    let isFavorite: Bool
+    let inWatchlist: Bool
+
+    init(played: Bool = false, isFavorite: Bool = false, inWatchlist: Bool = false) {
+        self.played = played
+        self.isFavorite = isFavorite
+        self.inWatchlist = inWatchlist
+    }
+}
+
+struct CatalogResponse: Codable {
+    let total: Int?
+    let totalExact: Bool?
+    let hasMore: Bool?
+    let items: [BrowseItem]
+
+    init(items: [BrowseItem], total: Int?, totalExact: Bool?, hasMore: Bool?) {
+        self.items = items
+        self.total = total
+        self.totalExact = totalExact
+        self.hasMore = hasMore
+    }
+
+    /// One v2 catalog page as the card grids show it.
+    init(catalogPage page: APIv2CatalogPage) {
+        self.init(items: page.items, total: page.total, totalExact: page.totalExact, hasMore: page.page.hasMore)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        total = try c.decodeIfPresent(Int.self, forKey: .total)
+        totalExact = try c.decodeIfPresent(Bool.self, forKey: .totalExact)
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore)
+        items = try c.decodeIfPresent([BrowseItem].self, forKey: .items) ?? []
+    }
+}
+
+// MARK: - Home Sections
+
+struct SectionItem: Codable, Identifiable, Hashable {
+    let contentId: String
+    let type: String
+    let title: String
+    let seriesId: String?
+    let seriesTitle: String?
+    let seasonNumber: Int?
+    let episodeNumber: Int?
+    let year: Int?
+    let genres: [String]?
+    let status: String?
+    let ratingImdb: Double?
+    let ratingTmdb: Double?
+    let ratingRtCritic: Int?
+    let ratingRtAudience: Int?
+    let contentRating: String?
+    let advisoryAge: Int?
+    let advisorySource: String?
+    let runtime: Int?
+    let originalLanguage: String?
+    let studios: [String]?
+    let networks: [String]?
+    let showStatus: String?
+    let overview: String?
+    let itemSource: String?
+    let positionSeconds: Double?
+    let durationSeconds: Double?
+    let progressUpdatedAt: String?
+    var posterIsEpisodeStill: Bool? = nil
+    var backdropIsEpisodeStill: Bool? = nil
+    @ArtworkURL var posterUrl: String? = nil
+    let posterThumbhash: String?
+    @ArtworkURL var backdropUrl: String? = nil
+    let backdropThumbhash: String?
+    @ArtworkURL var logoUrl: String? = nil
+    let userState: MediaItemUserState?
+    let overlaySummary: OverlaySummary?
+    /// This profile's metadata language when the card's description is not
+    /// in it yet. Drives the hero's on-view translation.
+    var pendingTranslationLanguage: String? = nil
+    /// Localized fields ("overview", "tagline") machine-translated by AI.
+    var machineTranslatedFields: [String]? = nil
+    var id: String { contentId }
+
+    /// Lift a catalog row into a section row so client-composed shelves
+    /// (Watch Party's picker) render through the same `SectionRow` as Home.
+    init(browseItem item: BrowseItem, positionSeconds: Double? = nil, durationSeconds: Double? = nil) {
+        contentId = item.contentId
+        type = item.type
+        title = item.title
+        seriesId = item.seriesId
+        seriesTitle = item.seriesTitle
+        seasonNumber = item.seasonNumber
+        episodeNumber = item.episodeNumber
+        year = item.year
+        genres = item.genres
+        status = item.status
+        ratingImdb = item.ratingImdb
+        ratingTmdb = item.ratingTmdb
+        ratingRtCritic = item.ratingRtCritic
+        ratingRtAudience = item.ratingRtAudience
+        contentRating = item.contentRating
+        advisoryAge = item.advisoryAge
+        advisorySource = item.advisorySource
+        runtime = item.runtime
+        originalLanguage = item.originalLanguage
+        studios = item.studios
+        networks = item.networks
+        showStatus = item.showStatus
+        overview = item.overview
+        itemSource = item.itemSource
+        self.positionSeconds = positionSeconds ?? item.positionSeconds
+        self.durationSeconds = durationSeconds ?? item.durationSeconds
+        progressUpdatedAt = item.progressUpdatedAt
+        posterIsEpisodeStill = item.posterIsEpisodeStill
+        backdropIsEpisodeStill = item.backdropIsEpisodeStill
+        posterUrl = item.posterUrl
+        posterThumbhash = item.posterThumbhash
+        backdropUrl = item.backdropUrl
+        backdropThumbhash = item.backdropThumbhash
+        logoUrl = nil
+        userState = item.userState
+        overlaySummary = item.overlaySummary
+    }
+}
+
+enum SiloMediaType {
+    private static func normalized(_ type: String) -> String {
+        type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    static func isAudiobook(_ type: String) -> Bool {
+        switch normalized(type) {
+        case "audiobook", "audiobooks", "book", "books":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isSeries(_ type: String) -> Bool {
+        switch normalized(type) {
+        case "series", "show", "shows", "tv", "tvshows":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isMovieLibrary(_ type: String) -> Bool {
+        switch normalized(type) {
+        case "movie", "movies":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isEpisode(_ type: String) -> Bool {
+        switch normalized(type) {
+        case "episode", "episodes":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isSeason(_ type: String) -> Bool {
+        switch normalized(type) {
+        case "season", "seasons":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Leaf media that can be handed directly to the player. Container
+    /// types such as series and seasons still open their detail screen.
+    static func isDirectlyPlayable(_ type: String) -> Bool {
+        isMovieLibrary(type)
+            || isAudiobook(type)
+            || isEpisode(type)
+    }
+
+    static func isAudiobookLibrary(_ type: String) -> Bool {
+        switch normalized(type) {
+        case "audiobook", "audiobooks":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// A "mixed" library holds movies and series in one folder; each item
+    /// still carries its own concrete `type`, so it browses as one library.
+    static func isMixedLibrary(_ type: String) -> Bool {
+        normalized(type) == "mixed"
+    }
+
+    static func isSupportedLibrary(_ type: String) -> Bool {
+        isMovieLibrary(type) || isSeries(type) || isAudiobookLibrary(type) || isMixedLibrary(type)
+    }
+
+    /// Section items are kept only when their type maps to a library type
+    /// the Apple clients support (see ``isSupportedLibrary``). The server
+    /// builds Home sections for every library type, so items from hidden
+    /// libraries (ebook, manga, comics, music, …) must be stripped
+    /// client-side or those libraries leak rows into Home.
+    static func isSupportedSectionItem(_ type: String) -> Bool {
+        if isMovieLibrary(type) || isSeries(type) || isAudiobook(type) {
+            return true
+        }
+        switch normalized(type) {
+        case "episode", "episodes":
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+extension BrowseItem {
+    var isAudiobook: Bool { SiloMediaType.isAudiobook(type) }
+
+    /// Lift a Home row into the catalog shape for Watch Party's picker, which
+    /// opens a confirmation page from a `BrowseItem`. Every field the two
+    /// types share is copied; artwork on a decoded section row is already
+    /// resolved. `addedAt`, `releaseDate` and `lastAirDate` are not on
+    /// section rows and stay nil.
+    init(sectionItem item: SectionItem) {
+        self.init(
+            contentId: item.contentId,
+            type: item.type,
+            title: item.title,
+            seriesId: item.seriesId,
+            seriesTitle: item.seriesTitle,
+            seasonNumber: item.seasonNumber,
+            episodeNumber: item.episodeNumber,
+            itemSource: item.itemSource,
+            positionSeconds: item.positionSeconds,
+            durationSeconds: item.durationSeconds,
+            progressUpdatedAt: item.progressUpdatedAt,
+            year: item.year,
+            genres: item.genres,
+            contentRating: item.contentRating,
+            advisoryAge: item.advisoryAge,
+            advisorySource: item.advisorySource,
+            status: item.status,
+            ratingImdb: item.ratingImdb,
+            ratingTmdb: item.ratingTmdb,
+            ratingRtCritic: item.ratingRtCritic,
+            ratingRtAudience: item.ratingRtAudience,
+            runtime: item.runtime,
+            originalLanguage: item.originalLanguage,
+            studios: item.studios,
+            networks: item.networks,
+            showStatus: item.showStatus,
+            overview: item.overview,
+            posterIsEpisodeStill: item.posterIsEpisodeStill,
+            backdropIsEpisodeStill: item.backdropIsEpisodeStill,
+            posterUrl: item.posterUrl,
+            posterThumbhash: item.posterThumbhash,
+            backdropUrl: item.backdropUrl,
+            backdropThumbhash: item.backdropThumbhash,
+            addedAt: nil,
+            releaseDate: nil,
+            lastAirDate: nil,
+            userState: item.userState,
+            overlaySummary: item.overlaySummary
+        )
+    }
+}
+
+extension SectionItem {
+    var isAudiobook: Bool { SiloMediaType.isAudiobook(type) }
+}
+
+struct ResolvedSection: Codable, Identifiable {
+    let id: String
+    let sectionType: String
+    let title: String
+    let featured: Bool?
+    let itemLimit: Int?
+    let totalCount: Int?
+    let isCustom: Bool?
+    let customized: Bool?
+    let items: [SectionItem]
+
+    /// Whether this section is featured (defaults to false if nil).
+    var isFeatured: Bool { featured ?? false }
+
+    init(
+        id: String,
+        sectionType: String,
+        title: String,
+        featured: Bool?,
+        itemLimit: Int?,
+        totalCount: Int?,
+        isCustom: Bool?,
+        customized: Bool?,
+        items: [SectionItem]
+    ) {
+        self.id = id
+        self.sectionType = sectionType
+        self.title = title
+        self.featured = featured
+        self.itemLimit = itemLimit
+        self.totalCount = totalCount
+        self.isCustom = isCustom
+        self.customized = customized
+        self.items = items
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        sectionType = try c.decode(String.self, forKey: .sectionType)
+        title = try c.decode(String.self, forKey: .title)
+        featured = try c.decodeIfPresent(Bool.self, forKey: .featured)
+        itemLimit = try c.decodeIfPresent(Int.self, forKey: .itemLimit)
+        totalCount = try c.decodeIfPresent(Int.self, forKey: .totalCount)
+        isCustom = try c.decodeIfPresent(Bool.self, forKey: .isCustom)
+        customized = try c.decodeIfPresent(Bool.self, forKey: .customized)
+        items = try c.decodeIfPresent([SectionItem].self, forKey: .items) ?? []
+    }
+}
+
+struct SectionsResponse: Codable {
+    let sections: [ResolvedSection]
+
+    init(sections: [ResolvedSection]) {
+        self.sections = Self.strippingUnsupportedItems(sections)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let decoded = try c.decodeIfPresent([ResolvedSection].self, forKey: .sections) ?? []
+        sections = Self.strippingUnsupportedItems(decoded)
+    }
+
+    /// Mirror of `LibrariesResponse` gating: unsupported library types are
+    /// hidden from the library list, so their items must not surface through
+    /// server-built sections either. Sections emptied by the strip are kept —
+    /// every consumer already drops empty sections before rendering.
+    private static func strippingUnsupportedItems(
+        _ sections: [ResolvedSection]
+    ) -> [ResolvedSection] {
+        sections.map { section in
+            let kept = section.items.filter {
+                SiloMediaType.isSupportedSectionItem($0.type)
+            }
+            guard kept.count != section.items.count else { return section }
+            return ResolvedSection(
+                id: section.id,
+                sectionType: section.sectionType,
+                title: section.title,
+                featured: section.featured,
+                itemLimit: section.itemLimit,
+                totalCount: section.totalCount,
+                isCustom: section.isCustom,
+                customized: section.customized,
+                items: kept
+            )
+        }
+    }
+}
+
+// MARK: - Item Detail
+
+struct ItemDetail: Codable {
+    let contentId: String
+    let type: String
+    let status: String?
+    let title: String
+    let sortTitle: String?
+    let originalTitle: String?
+    let originalLanguage: String?
+    let showStatus: String?
+    let year: Int?
+    let overview: String?
+    let tagline: String?
+    let runtime: Int?
+    let contentRating: String?
+    let advisoryAge: Int?
+    let advisorySource: String?
+    let genres: [String]?
+    let ratingImdb: Double?
+    let ratingTmdb: Double?
+    let ratingRtCritic: Int?
+    let ratingRtAudience: Int?
+    /// The ratings row the server chose for this title, in display order.
+    /// Nil from a server that predates it; read `displayRatings`, which
+    /// falls back to IMDb and TMDB, rather than this directly.
+    var ratings: [DisplayRating]? = nil
+    let imdbId: String?
+    let tmdbId: String?
+    let tvdbId: String?
+    let cast: [CastMember]?
+    let crew: [CrewMember]?
+    let studios: [String]?
+    let networks: [String]?
+    let countries: [String]?
+    let releaseDate: String?
+    let firstAirDate: String?
+    let lastAirDate: String?
+    var posterIsEpisodeStill: Bool? = nil
+    var backdropIsEpisodeStill: Bool? = nil
+    @ArtworkURL var posterUrl: String? = nil
+    let posterThumbhash: String?
+    @ArtworkURL var backdropUrl: String? = nil
+    let backdropThumbhash: String?
+    @ArtworkURL var logoUrl: String? = nil
+    let seasonCount: Int?
+    let seriesId: String?
+    let seriesTitle: String?
+    let seasonNumber: Int?
+    let episodeNumber: Int?
+    let episodeCount: Int?
+    let airDate: String?
+    let isSpecials: Bool?
+    let userData: LeafItemUserData?
+    let versions: [FileVersion]?
+    var playbackVariants: [PlaybackVariant]? = nil
+    let subtitles: [SubtitleInfoBasic]?
+    let intro: TimeRange?
+    let credits: TimeRange?
+    /// Server-resolved subtitle policy, folded in from the watch detail
+    /// during playback enrichment (absent on the raw catalog payload).
+    /// The signature is only present when an explicit per-series /
+    /// per-movie subtitle override is stored, so it doubles as the
+    /// "user picked a track" marker for selector seeding. The language comes
+    /// only from the watch detail, which also sets the flag.
+    var effectiveSubtitleLanguage: String? = nil
+    /// Optional so payloads cached or written without it still decode.
+    var hasWatchDetailSubtitlePolicy: Bool? = nil
+    let effectiveSubtitleMode: String?
+    let effectiveShowForcedSubtitles: Bool?
+    let effectiveSubtitleTrackSignature: SubtitleTrackSignature?
+    let overlaySummary: OverlaySummary?
+    let audiobook: AudiobookDetail?
+    /// Set by the server (omitted when empty) when a description exists
+    /// but is not yet available in the viewer's resolved metadata
+    /// language. Drives the on-view "translate this description"
+    /// affordance; clears once the localized overview lands.
+    let pendingTranslationLanguage: String?
+    /// Remote provider videos (YouTube trailers, teasers, …) for movies and
+    /// series, pre-ordered by the server (trailers first, official first).
+    /// Never populated for episodes.
+    ///
+    /// `var` with a default (rather than `let`) purely so the synthesized
+    /// memberwise initializer keeps a default for this parameter: the
+    /// detail views rebuild an `ItemDetail` field-by-field when folding in
+    /// watch metadata, and those call sites must keep compiling. Optional
+    /// `var`s are still decoded normally (unlike `let`s with an initial
+    /// value, which Codable skips).
+    var videos: [ItemVideo]? = nil
+    /// Local extras discovered by the scanner. Each carries its own
+    /// `contentId`, playable through the normal `/watch` flow.
+    var extras: [ItemExtra]? = nil
+    /// The viewer's favorite, watchlist and played flags from the v2 detail
+    /// read (`user_state`); absent without a profile. `var` with a default
+    /// for the same memberwise-initializer reason as `videos`.
+    var userState: MediaItemUserState? = nil
+    /// Localized fields ("overview", "tagline") whose text was machine
+    /// translated by AI. `var` with a default for the same memberwise-
+    /// initializer reason as `videos`.
+    var machineTranslatedFields: [String]? = nil
+    /// Local theme audio for this page, resolved by the server: a season
+    /// without themes carries its series' set, an episode its season's, then
+    /// its series'. `var` with a default for the same memberwise-initializer
+    /// reason as `videos`.
+    var themes: ThemeSongSet? = nil
+}
+
+extension ItemDetail {
+    var isAudiobook: Bool {
+        audiobook != nil || SiloMediaType.isAudiobook(type)
+    }
+
+    /// See `WatchDetail.showsForcedSubtitles`: a missing value is the
+    /// contract default, which is on.
+    var showsForcedSubtitles: Bool { effectiveShowForcedSubtitles ?? true }
+}
+
+/// A remote provider video reference (server `ItemVideoInfo`). The site
+/// reference (`site` + `siteKey`) is all a client needs to build thumbnail,
+/// watch, and embed URLs — see ``TrailerRail``.
+struct ItemVideo: Codable, Hashable {
+    let kind: String
+    let site: String
+    let siteKey: String
+    let name: String?
+    let language: String?
+    let isOfficial: Bool
+
+    init(
+        kind: String,
+        site: String,
+        siteKey: String,
+        name: String? = nil,
+        language: String? = nil,
+        isOfficial: Bool = false
+    ) {
+        self.kind = kind
+        self.site = site
+        self.siteKey = siteKey
+        self.name = name
+        self.language = language
+        self.isOfficial = isOfficial
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decode(String.self, forKey: .kind)
+        site = try c.decode(String.self, forKey: .site)
+        siteKey = try c.decode(String.self, forKey: .siteKey)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        language = try c.decodeIfPresent(String.self, forKey: .language)
+        // Defensive: a missing `is_official` must not fail the whole item
+        // detail decode.
+        isOfficial = try c.decodeIfPresent(Bool.self, forKey: .isOfficial) ?? false
+    }
+}
+
+/// A local extras file (server `ItemExtraInfo`). `contentId` is a playable
+/// watch target like any other item; `fileId` backs direct-stream affordances.
+struct ItemExtra: Codable, Hashable, Identifiable {
+    let contentId: String
+    let kind: String
+    let title: String?
+    /// `durationSeconds` and `fileId` are `omitempty` server-side: absent at zero.
+    let durationSeconds: Int?
+    let fileId: Int?
+    /// 16:9 card image: a sidecar beside the extra's file or a frame of the
+    /// video. Absent when the server has none yet.
+    @ArtworkURL var stillUrl: String? = nil
+    var stillThumbhash: String? = nil
+    var id: String { contentId }
+
+    init(
+        contentId: String,
+        kind: String,
+        title: String? = nil,
+        durationSeconds: Int? = nil,
+        fileId: Int? = nil,
+        stillUrl: String? = nil,
+        stillThumbhash: String? = nil
+    ) {
+        self.contentId = contentId
+        self.kind = kind
+        self.title = title
+        self.durationSeconds = durationSeconds
+        self.fileId = fileId
+        self.stillUrl = stillUrl
+        self.stillThumbhash = stillThumbhash
+    }
+}
+
+struct AudiobookDetail: Codable, Hashable {
+    let authors: [AudiobookPerson]
+    let narrators: [AudiobookPerson]
+    let publisher: String?
+    let totalDurationSeconds: Int?
+    let series: AudiobookSeriesGroup?
+    let otherNarrations: [AudiobookNarration]
+    let related: AudiobookRelatedContent?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        authors = try c.decodeIfPresent([AudiobookPerson].self, forKey: .authors) ?? []
+        narrators = try c.decodeIfPresent([AudiobookPerson].self, forKey: .narrators) ?? []
+        publisher = try c.decodeIfPresent(String.self, forKey: .publisher)
+        totalDurationSeconds = try c.decodeIfPresent(Int.self, forKey: .totalDurationSeconds)
+        series = try c.decodeIfPresent(AudiobookSeriesGroup.self, forKey: .series)
+        otherNarrations = try c.decodeIfPresent([AudiobookNarration].self, forKey: .otherNarrations) ?? []
+        related = try c.decodeIfPresent(AudiobookRelatedContent.self, forKey: .related)
+    }
+}
+
+struct AudiobookPerson: Codable, Identifiable, Hashable {
+    let personId: String?
+    let name: String
+    @ArtworkURL var photoUrl: String? = nil
+    let photoThumbhash: String?
+    var id: String { personId ?? name }
+}
+
+struct AudiobookSeriesGroup: Codable, Hashable {
+    let name: String?
+    let entries: [AudiobookRelatedItem]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        entries = try c.decodeIfPresent([AudiobookRelatedItem].self, forKey: .entries) ?? []
+    }
+}
+
+struct AudiobookRelatedContent: Codable, Hashable {
+    let alsoByAuthor: [AudiobookRelatedItem]
+    let similar: [AudiobookRelatedItem]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        alsoByAuthor = try c.decodeIfPresent([AudiobookRelatedItem].self, forKey: .alsoByAuthor) ?? []
+        similar = try c.decodeIfPresent([AudiobookRelatedItem].self, forKey: .similar) ?? []
+    }
+}
+
+struct AudiobookRelatedItem: Codable, Identifiable, Hashable {
+    let contentId: String
+    let title: String
+    let year: Int?
+    @ArtworkURL var posterUrl: String? = nil
+    let seriesIndex: Int?
+    var id: String { contentId }
+}
+
+struct AudiobookNarration: Codable, Identifiable, Hashable {
+    let contentId: String
+    let title: String
+    let year: Int?
+    let narrators: [String]
+    var id: String { contentId }
+}
+
+struct CastMember: Codable, Identifiable, Hashable {
+    let name: String
+    let character: String?
+    let order: Int?
+    let personId: String?
+    let tmdbId: String?
+    let tvdbId: String?
+    let imdbId: String?
+    @ArtworkURL var photoUrl: String? = nil
+    let photoThumbhash: String?
+    var id: String { personId ?? "\(name)-\(character ?? "")" }
+}
+
+struct CrewMember: Codable, Identifiable, Hashable {
+    let name: String
+    let job: String?
+    let personId: String?
+    let tmdbId: String?
+    let tvdbId: String?
+    let imdbId: String?
+    @ArtworkURL var photoUrl: String? = nil
+    let photoThumbhash: String?
+    var id: String { "\(personId ?? name)-\(job ?? "")" }
+}
+
+struct Person: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let bio: String?
+    let birthDate: String?
+    let deathDate: String?
+    let birthplace: String?
+    @ArtworkURL var photoUrl: String? = nil
+    let photoThumbhash: String?
+    let tmdbId: String?
+    let imdbId: String?
+    let tvdbId: String?
+}
+
+struct Season: Codable, Identifiable, Hashable {
+    let contentId: String
+    let seasonNumber: Int
+    let isSpecials: Bool?
+    let title: String?
+    let overview: String?
+    let airDate: String?
+    let episodeCount: Int
+    @ArtworkURL var posterUrl: String? = nil
+    let posterThumbhash: String?
+    let userData: SeasonUserData?
+    /// Localized fields ("overview") machine-translated by AI.
+    var machineTranslatedFields: [String]? = nil
+    var id: String { contentId }
+
+    /// Consistent label for season pickers and episode-section headings.
+    var downloadDisplayName: String {
+        if isSpecials == true || seasonNumber == 0 {
+            return title ?? "Specials"
+        }
+        return "Season \(seasonNumber)"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        contentId = try c.decode(String.self, forKey: .contentId)
+        seasonNumber = try c.decode(Int.self, forKey: .seasonNumber)
+        isSpecials = try c.decodeIfPresent(Bool.self, forKey: .isSpecials)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        overview = try c.decodeIfPresent(String.self, forKey: .overview)
+        airDate = try c.decodeIfPresent(String.self, forKey: .airDate)
+        episodeCount = try c.decodeIfPresent(Int.self, forKey: .episodeCount) ?? 0
+        posterUrl = try c.decode(ArtworkURL.self, forKey: .posterUrl).wrappedValue
+        posterThumbhash = try c.decodeIfPresent(String.self, forKey: .posterThumbhash)
+        userData = try c.decodeIfPresent(SeasonUserData.self, forKey: .userData)
+        machineTranslatedFields = try c.decodeIfPresent([String].self, forKey: .machineTranslatedFields)
+    }
+}
+
+extension Array where Element == Season {
+    /// Seasons the library holds, not counting Specials. The series' own
+    /// `seasonCount` is the metadata provider's total, which can name
+    /// seasons the library does not have.
+    var librarySeasonCount: Int {
+        filter { $0.isSpecials != true && $0.seasonNumber != 0 }.count
+    }
+
+    /// Specials lead, then numbered seasons ascending.
+    func sortedForDisplay() -> [Season] {
+        sorted { lhs, rhs in
+            let lhsSpecials = lhs.isSpecials == true || lhs.seasonNumber == 0
+            let rhsSpecials = rhs.isSpecials == true || rhs.seasonNumber == 0
+            if lhsSpecials != rhsSpecials { return lhsSpecials }
+            if lhs.seasonNumber != rhs.seasonNumber { return lhs.seasonNumber < rhs.seasonNumber }
+            if (lhs.title ?? "") != (rhs.title ?? "") { return (lhs.title ?? "") < (rhs.title ?? "") }
+            return lhs.contentId < rhs.contentId
+        }
+    }
+
+    /// The season a viewer resumes in: one with an episode in progress, then
+    /// the first partially watched season, then the first unplayed numbered
+    /// season (Specials only once every numbered season is played), then the
+    /// first season.
+    func preferredResumeSeason() -> Season? {
+        if let inProgress = first(where: { ($0.userData?.inProgressCount ?? 0) > 0 }) {
+            return inProgress
+        }
+        if let partial = first(where: {
+            guard let ud = $0.userData else { return false }
+            let watched = ud.watchedCount ?? 0
+            return watched > 0 && watched < $0.episodeCount
+        }) {
+            return partial
+        }
+        // Specials sort first for display, but a fresh series should open on
+        // its first numbered season rather than the specials bucket. Once
+        // every numbered season is played, an unplayed Specials still wins
+        // over a fully watched one.
+        let regular = filter { !($0.isSpecials == true || $0.seasonNumber == 0) }
+        let isUnplayed: (Season) -> Bool = { !($0.userData?.played ?? false) }
+        if let firstUnplayed = regular.first(where: isUnplayed) ?? first(where: isUnplayed) {
+            return firstUnplayed
+        }
+        return regular.first ?? first
+    }
+}
+
+extension Array where Element == EpisodeListItem {
+    /// The episode a viewer resumes with: the one in progress, then the first
+    /// unwatched, then the first.
+    func preferredResumeEpisode() -> EpisodeListItem? {
+        first { $0.userData?.isInProgress == true }
+            ?? first { !($0.userData?.played ?? false) }
+            ?? first
+    }
+}
+
+struct SeasonUserData: Codable, Hashable {
+    let played: Bool
+    let watchedCount: Int?
+    let unplayedCount: Int?
+    let inProgressCount: Int?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        played = try c.decodeIfPresent(Bool.self, forKey: .played) ?? false
+        watchedCount = try c.decodeIfPresent(Int.self, forKey: .watchedCount)
+        unplayedCount = try c.decodeIfPresent(Int.self, forKey: .unplayedCount)
+        inProgressCount = try c.decodeIfPresent(Int.self, forKey: .inProgressCount)
+    }
+}
+
+struct EpisodeListItem: Codable, Identifiable, Hashable {
+    let contentId: String
+    let seasonNumber: Int
+    let episodeNumber: Int
+    let title: String?
+    let overview: String?
+    let airDate: String?
+    let runtime: Int?
+    let imdbId: String?
+    let tmdbId: String?
+    let tvdbId: String?
+    var stillIsEpisodeStill: Bool? = nil
+    @ArtworkURL var stillUrl: String? = nil
+    let stillThumbhash: String?
+    let userData: LeafItemUserData?
+    let files: [EpisodeFile]?
+    /// Localized fields ("overview") machine-translated by AI.
+    var machineTranslatedFields: [String]? = nil
+    /// This profile's metadata language when the episode's description is
+    /// not in it yet. The season's translation job covers it.
+    var pendingTranslationLanguage: String? = nil
+    var id: String { contentId }
+}
+
+struct EpisodeFile: Codable, Hashable {
+    let fileId: Int
+    let resolution: String?
+    let codecVideo: String?
+    let hdr: Bool?
+    let audioChannels: Int?
+    let container: String?
+    let fileSize: Int64?
+}
+
+struct FileVersion: Codable, Identifiable, Hashable {
+    let fileId: Int
+    let fileName: String?
+    let resolution: String?
+    let codecVideo: String?
+    let codecAudio: String?
+    let hdr: Bool?
+    let container: String?
+    let fileSize: Int64?
+    let duration: Double?
+    let bitrate: Int?
+    let videoTracks: [VideoTrack]?
+    let audioTracks: [AudioTrack]?
+    let subtitleTracks: [SubtitleTrack]?
+    let chapters: [VersionChapter]?
+    let intro: TimeRange?
+    let credits: TimeRange?
+    let recap: TimeRange?
+    let presentationKind: String?
+    let presentationGroupKey: String?
+    let presentationPartIndex: Int?
+    let presentationPartTotal: Int?
+    /// Server-current edition fields. `editionRaw` is the display label,
+    /// while `editionKey` is the stable grouping key.
+    let editionRaw: String?
+    let editionKey: String?
+    /// Server-resolved default audio track ordinal for this version.
+    /// `var` so a read can fold in an audio pick the server has not stored
+    /// yet (`TrackSelectionPersistence.Settlement`).
+    var effectiveAudioTrackIndex: Int?
+    var effectiveAudioLanguage: String?
+    /// Whether the server publishes seek-bar previews for this file.
+    let trickplayAvailable: Bool?
+    var id: Int { fileId }
+    var editionDisplayLabel: String {
+        let trimmed = editionRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "Standard" : trimmed
+    }
+
+    init(
+        fileId: Int,
+        fileName: String?,
+        resolution: String?,
+        codecVideo: String?,
+        codecAudio: String?,
+        hdr: Bool?,
+        container: String?,
+        fileSize: Int64?,
+        duration: Double?,
+        bitrate: Int?,
+        videoTracks: [VideoTrack]?,
+        audioTracks: [AudioTrack]?,
+        subtitleTracks: [SubtitleTrack]?,
+        chapters: [VersionChapter]?,
+        intro: TimeRange? = nil,
+        credits: TimeRange? = nil,
+        recap: TimeRange? = nil,
+        presentationKind: String? = nil,
+        presentationGroupKey: String? = nil,
+        presentationPartIndex: Int? = nil,
+        presentationPartTotal: Int? = nil,
+        editionRaw: String? = nil,
+        editionKey: String? = nil,
+        effectiveAudioTrackIndex: Int? = nil,
+        effectiveAudioLanguage: String? = nil,
+        trickplayAvailable: Bool? = nil
+    ) {
+        self.fileId = fileId
+        self.fileName = fileName
+        self.resolution = resolution
+        self.codecVideo = codecVideo
+        self.codecAudio = codecAudio
+        self.hdr = hdr
+        self.container = container
+        self.fileSize = fileSize
+        self.duration = duration
+        self.bitrate = bitrate
+        self.videoTracks = videoTracks
+        self.audioTracks = audioTracks
+        self.subtitleTracks = subtitleTracks
+        self.chapters = chapters
+        self.intro = intro
+        self.credits = credits
+        self.recap = recap
+        self.presentationKind = presentationKind
+        self.presentationGroupKey = presentationGroupKey
+        self.presentationPartIndex = presentationPartIndex
+        self.presentationPartTotal = presentationPartTotal
+        self.editionRaw = editionRaw
+        self.editionKey = editionKey
+        self.effectiveAudioTrackIndex = effectiveAudioTrackIndex
+        self.effectiveAudioLanguage = effectiveAudioLanguage
+        self.trickplayAvailable = trickplayAvailable
+    }
+}
+
+struct PlaybackVariant: Codable, Hashable {
+    let variantId: String
+    let editionRaw: String?
+    let editionKey: String?
+    let presentationKind: String?
+    let presentationGroupKey: String?
+    let partCount: Int
+    let totalDuration: Double?
+    let defaultFileId: Int?
+    let parts: [PlaybackVariantPart]
+}
+
+struct PlaybackVariantPart: Codable, Hashable {
+    let partIndex: Int
+    let defaultFileId: Int?
+    let totalDuration: Double?
+    let versions: [FileVersion]
+}
+
+struct VersionChapter: Codable, Hashable {
+    let index: Int
+    let title: String?
+    let startSeconds: Double
+    let endSeconds: Double?
+    let source: String?
+    let thumbnailUrl: String?
+    let thumbnailThumbhash: String?
+}
+
+struct VideoTrack: Codable, Identifiable, Hashable {
+    let index: Int?
+    let codec: String?
+    let width: Int?
+    let height: Int?
+    /// Server emits this as a string (e.g. "23.976"), not a number.
+    let frameRate: String?
+    let bitrate: Int?
+    let profile: String?
+    let level: Int?
+    let bitDepth: Int?
+    let colorRange: String?
+    let colorSpace: String?
+    let colorPrimaries: String?
+    let colorTransfer: String?
+    let videoRange: String?
+    let dolbyVision: String?
+    let title: String?
+    let language: String?
+    var id: Int { index ?? 0 }
+}
+
+struct AudioTrack: Codable, Identifiable, Hashable {
+    let index: Int?
+    let codec: String?
+    let channels: Int?
+    /// Server field is `layout`, not `channel_layout`.
+    let channelLayout: String?
+    let bitrate: Int?
+    let sampleRate: Int?
+    let language: String?
+    let title: String?
+    /// Raw stream title as probed, distinct from the cleaned `title`.
+    /// The server's audio-pref signature match compares both fields
+    /// separately, so persisted track choices must echo each back.
+    let embeddedTitle: String?
+    /// Server field is the reserved word `default`.
+    let isDefault: Bool?
+    var id: Int { index ?? 0 }
+
+    enum CodingKeys: String, CodingKey {
+        case index
+        case codec
+        case channels
+        case channelLayout = "layout"
+        case bitrate
+        case sampleRate
+        case language
+        case title
+        case embeddedTitle
+        case isDefault = "default"
+    }
+}
+
+struct SubtitleTrack: Codable, Identifiable, Hashable {
+    /// Optional because the server emits `"index,omitempty"` — a subtitle with
+    /// stream index 0, or an external sub that has no ffmpeg stream index,
+    /// arrives without the field.
+    let index: Int?
+    let codec: String?
+    let language: String?
+    let title: String?
+    /// Raw stream title as probed, distinct from the cleaned `title`.
+    let embeddedTitle: String?
+    let forced: Bool?
+    /// SDH flag — carried into persisted subtitle-pref signatures.
+    let hearingImpaired: Bool?
+    /// Server field is the reserved word `default`.
+    let isDefault: Bool?
+    let external: Bool?
+    let externalPath: String?
+    var id: String { "\(index ?? -1)|\(externalPath ?? "")" }
+
+    /// The FFmpeg stream index the detail selector and player use to select
+    /// this track. The server emits `index,omitempty`, so an embedded track at
+    /// stream 0 arrives with no `index`; embedded is the only case where nil
+    /// means 0. External sidecars have no stream index and stay nil.
+    var selectionIndex: Int? {
+        if let index { return index }
+        return external == true ? nil : 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case index
+        case codec
+        case language
+        case title
+        case embeddedTitle
+        case forced
+        case hearingImpaired
+        case isDefault = "default"
+        case external
+        // `.convertFromSnakeCase` rewrites `file_name` to `fileName` before
+        // key matching.
+        case externalPath = "fileName"
+    }
+}
+
+struct SubtitleInfoBasic: Codable, Hashable {
+    let source: String?
+    let language: String?
+    let codec: String?
+    let forced: Bool?
+    let title: String?
+}
+
+struct TimeRange: Codable, Hashable {
+    let start: Double
+    let end: Double
+}
+
+struct LeafItemUserData: Codable, Hashable {
+    let played: Bool
+    let isInProgress: Bool?
+    let positionSeconds: Double?
+    let durationSeconds: Double?
+    let lastFileId: Int?
+    let lastResolution: String?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        played = try c.decodeIfPresent(Bool.self, forKey: .played) ?? false
+        isInProgress = try c.decodeIfPresent(Bool.self, forKey: .isInProgress)
+        positionSeconds = try c.decodeIfPresent(Double.self, forKey: .positionSeconds)
+        durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds)
+        lastFileId = try c.decodeIfPresent(Int.self, forKey: .lastFileId)
+        lastResolution = try c.decodeIfPresent(String.self, forKey: .lastResolution)
+    }
+}
+
+// MARK: - Playback
+
+struct PlaybackSessionResponse {
+    let sessionId: String
+    let userId: Int?
+    let profileId: String?
+    let mediaFileId: Int?
+    let playMethod: String
+    /// Mutable so the session bridge can overwrite the server-returned
+    /// resume point when the caller forces "Start Over" without
+    /// reconstructing the whole struct.
+    var position: Double
+    let isPaused: Bool?
+    let streamUrl: String
+    let audioTrackIndex: Int?
+    let durationSeconds: Double?
+    var timelineOffsetSeconds: Double
+    let subtitleUrls: [SubtitleUrl]?
+    let playbackInfo: PlaybackInfo?
+
+    init(
+        sessionId: String,
+        userId: Int?,
+        profileId: String?,
+        mediaFileId: Int?,
+        playMethod: String,
+        position: Double,
+        isPaused: Bool?,
+        streamUrl: String,
+        audioTrackIndex: Int?,
+        durationSeconds: Double?,
+        timelineOffsetSeconds: Double = 0,
+        subtitleUrls: [SubtitleUrl]?,
+        playbackInfo: PlaybackInfo?
+    ) {
+        self.sessionId = sessionId
+        self.userId = userId
+        self.profileId = profileId
+        self.mediaFileId = mediaFileId
+        self.playMethod = playMethod
+        self.position = position
+        self.isPaused = isPaused
+        self.streamUrl = streamUrl
+        self.audioTrackIndex = audioTrackIndex
+        self.durationSeconds = durationSeconds
+        self.timelineOffsetSeconds = timelineOffsetSeconds
+        self.subtitleUrls = subtitleUrls
+        self.playbackInfo = playbackInfo
+    }
+}
+
+struct PlaybackInfo: Codable, Hashable {
+    let streamType: String?
+    let transcodeAudio: Bool?
+    let videoCodec: String?
+    let audioCodec: String?
+}
+
+struct SubtitleUrl: Codable, Identifiable, Hashable {
+    let index: Int
+    let language: String?
+    let codec: String?
+    let label: String?
+    let source: String?
+    let forced: Bool?
+    let `default`: Bool?
+    let hearingImpaired: Bool?
+    let fontBundleUrl: String?
+    let url: String
+    var id: Int { index }
+
+    init(
+        index: Int,
+        language: String?,
+        codec: String?,
+        label: String?,
+        source: String?,
+        forced: Bool?,
+        `default`: Bool? = nil,
+        hearingImpaired: Bool? = nil,
+        fontBundleUrl: String? = nil,
+        url: String
+    ) {
+        self.index = index
+        self.language = language
+        self.codec = codec
+        self.label = label
+        self.source = source
+        self.forced = forced
+        self.default = `default`
+        self.hearingImpaired = hearingImpaired
+        self.fontBundleUrl = fontBundleUrl
+        self.url = url
+    }
+}
+
+// MARK: - Watch Detail
+
+struct WatchDetail {
+    let contentId: String
+    let type: String
+    let title: String
+    let year: Int?
+    let overview: String?
+    var versions: [FileVersion]
+    let subtitles: [SubtitleInfoBasic]?
+    let intro: TimeRange?
+    let credits: TimeRange?
+    var recap: TimeRange? = nil
+    let userData: LeafItemUserData?
+    let seriesId: String?
+    let seriesTitle: String?
+    let seasonNumber: Int?
+    let episodeNumber: Int?
+    /// Server-resolved subtitle policy for this content. Computed from
+    /// per-series → library → profile prefs cascade. Absent when the
+    /// user hasn't configured anything that applies. Consumed by the
+    /// player at track-discovery time to auto-pick the right track.
+    /// The pick-derived fields (and `versions`) are `var` so a read can fold
+    /// in a pick the server has not stored yet
+    /// (`TrackSelectionPersistence.Settlement`).
+    var effectiveSubtitleLanguage: String?
+    var effectiveSubtitleMode: String?
+    let effectiveShowForcedSubtitles: Bool?
+    var effectiveSubtitleTrackSignature: SubtitleTrackSignature?
+
+    /// "Show forced subtitles" for this content. The server omits
+    /// `effective_show_forced_subtitles` when no stored setting applies, and
+    /// the contract default is on, as web and the Jellyfin layer read it.
+    var showsForcedSubtitles: Bool { effectiveShowForcedSubtitles ?? true }
+}
+
+// MARK: - Collections
+
+struct UserCollection: Codable, Identifiable {
+    let id: String
+    let name: String
+    let collectionType: String?
+    let createdAt: String?
+    let description: String?
+    let groupId: String?
+    let sortOrder: Int?
+    let itemCount: Int?
+    @ArtworkURL var posterUrl: String? = nil
+    let posterThumbhash: String?
+    let includeInServerCollections: Bool?
+}
+
+/// A user-defined grouping bucket for personal collections: the v2
+/// `CollectionGroup` shape (`/api/v2/collections` `groups[*]`).
+struct CollectionGroup: Codable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let slug: String?
+    let defaultSortMode: String?
+    let sortOrder: Int?
+}
+
+// MARK: - Libraries
+
+struct Library: Codable, Identifiable, Hashable {
+    let id: Int
+    let name: String
+    let type: String
+    let sortOrder: Int?
+    @ArtworkURL var posterUrl: String? = nil
+
+    var isMovieLibrary: Bool { SiloMediaType.isMovieLibrary(type) }
+    var isAudiobookLibrary: Bool { SiloMediaType.isAudiobookLibrary(type) }
+    var isSeriesLibrary: Bool { SiloMediaType.isSeries(type) }
+    var isMixedLibrary: Bool { SiloMediaType.isMixedLibrary(type) }
+    var isSupportedLibrary: Bool { SiloMediaType.isSupportedLibrary(type) }
+
+    var navigationIcon: String {
+        isMixedLibrary ? "square.stack.3d.up" : "rectangle.stack"
+    }
+
+    var selectedNavigationIcon: String {
+        isMixedLibrary ? "square.stack.3d.up.fill" : "rectangle.stack.fill"
+    }
+}
+
+/// The viewer's supported libraries, built from `GET /api/v2/user/libraries`
+/// by `SiloAPI.libraries()`. Not a wire model; the v2 rows are
+/// `APIv2UserLibrary`.
+struct LibrariesResponse: Codable {
+    let libraries: [Library]
+
+    init(libraries: [Library]) {
+        self.libraries = libraries.filter(\.isSupportedLibrary)
+    }
+}
+
+/// Type of a library collection. Wire values are the plural forms
+/// (`regular`, `user_collections`); the catalog endpoint's `source`
+/// query parameter uses the singular forms — see [catalogSource].
+enum LibraryCollectionKind: String, Codable, Hashable {
+    case regular
+    case userCollections = "user_collections"
+
+    /// Value to pass as the `source` query parameter when resolving
+    /// collection items through the unified `/api/v2/catalog` endpoint.
+    var catalogSource: String {
+        switch self {
+        case .regular: return "library_collection"
+        case .userCollections: return "user_collection"
+        }
+    }
+}
+
+struct LibraryCollection: Codable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let collectionType: String?
+    let itemCount: Int?
+    @ArtworkURL var posterUrl: String? = nil
+    let posterThumbhash: String?
+    /// Set from the Collections tab group that holds the card. Nil means
+    /// regular.
+    let kind: LibraryCollectionKind?
+    /// Creator profile id, populated only for [LibraryCollectionKind.userCollections].
+    let creatorProfileId: String?
+
+    /// Server emits `title`, not `name`. All other fields go through the
+    /// shared `.convertFromSnakeCase` strategy — camelCase raw values
+    /// match the strategy-converted wire keys.
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name = "title"
+        case collectionType
+        case itemCount
+        case posterUrl
+        case posterThumbhash
+        case kind
+        case creatorProfileId
+    }
+
+    /// Convenience initializer for code that constructs from a wire
+    /// payload (e.g. flat fallback path) without round-tripping JSON.
+    init(
+        id: String,
+        name: String,
+        collectionType: String? = nil,
+        itemCount: Int? = nil,
+        posterUrl: String? = nil,
+        posterThumbhash: String? = nil,
+        kind: LibraryCollectionKind? = nil,
+        creatorProfileId: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.collectionType = collectionType
+        self.itemCount = itemCount
+        self.posterUrl = posterUrl
+        self.posterThumbhash = posterThumbhash
+        self.kind = kind
+        self.creatorProfileId = creatorProfileId
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        collectionType = try c.decodeIfPresent(String.self, forKey: .collectionType)
+        itemCount = try c.decodeIfPresent(Int.self, forKey: .itemCount)
+        posterUrl = try c.decode(ArtworkURL.self, forKey: .posterUrl).wrappedValue
+        posterThumbhash = try c.decodeIfPresent(String.self, forKey: .posterThumbhash)
+        // Tolerate unknown raw values by decoding through String first —
+        // unrecognized kinds become nil rather than aborting the whole
+        // collection decode.
+        if let raw = try c.decodeIfPresent(String.self, forKey: .kind) {
+            kind = LibraryCollectionKind(rawValue: raw)
+        } else {
+            kind = nil
+        }
+        creatorProfileId = try c.decodeIfPresent(String.self, forKey: .creatorProfileId)
+    }
+}
+
+/// Runtime-synthesized response from `SiloAPI.libraryCollections`, mapped
+/// from the v2 `APIv2LibraryCollectionTab` at the API boundary.
+struct LibraryCollectionsResponse {
+    let collections: [LibraryCollection]
+    /// Ordered render sections. Empty when the server has no groups
+    /// configured — use [resolvedSections] to get a render-ready list that
+    /// transparently wraps the flat case.
+    let sections: [LibraryCollectionSection]
+
+    /// Render-ready sections: server-provided groups when present,
+    /// otherwise a single anonymous section wrapping the flat list.
+    var resolvedSections: [LibraryCollectionSection] {
+        if !sections.isEmpty { return sections }
+        if collections.isEmpty { return [] }
+        return [LibraryCollectionSection(
+            id: "__flat__",
+            name: "",
+            kind: .regular,
+            collections: collections
+        )]
+    }
+}
+
+// MARK: - Seasons / Episodes
+
+struct SeasonsResponse {
+    let seasons: [Season]
+
+    init(seasons: [Season]) { self.seasons = seasons }
+}
+
+struct EpisodesResponse {
+    let episodes: [EpisodeListItem]
+
+    init(episodes: [EpisodeListItem]) { self.episodes = episodes }
+}
+
+// MARK: - Collection Create
+
+/// `POST /api/v2/collections` body.
+struct CreateCollectionRequest: Encodable {
+    let name: String
+    let collectionType: String
+}
+
+// MARK: - User Info
+
+struct UserInfo: Sendable {
+    let id: String?
+    let username: String
+    let isAdmin: Bool?
+}
+
+// MARK: - Collections Response (array wrapper)
+
+/// The personal-collections page as the screen caches it
+/// (`CacheKey.collections`), built from ``APIv2PersonalCollections``.
+struct CollectionsResponse {
+    let collections: [UserCollection]?
+    let groups: [CollectionGroup]?
+
+    init(collections: [UserCollection]?, groups: [CollectionGroup]?) {
+        self.collections = collections
+        self.groups = groups
+    }
+}
+
+// MARK: - Collection group requests
+
+/// `POST /api/v2/collections/groups` and `PATCH /api/v2/collections/groups/{id}`
+/// body. On create the server derives the slug.
+struct CollectionGroupNameBody: Encodable {
+    let name: String
+}
+
+/// Move-to-group payload. Always serializes `group_id`, including the
+/// JSON `null` literal when [groupId] is nil — the server needs to
+/// distinguish "clear group" from "don't change group", and the default
+/// synthesized `encode(to:)` would otherwise drop the nil via
+/// `encodeIfPresent`.
+struct UpdateUserCollectionGroupBody: Encodable {
+    let groupId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case groupId
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        if let groupId {
+            try c.encode(groupId, forKey: .groupId)
+        } else {
+            try c.encodeNil(forKey: .groupId)
+        }
+    }
+}

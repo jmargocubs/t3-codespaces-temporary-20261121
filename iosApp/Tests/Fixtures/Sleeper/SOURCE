@@ -1,0 +1,17 @@
+Source: live responses from api.sleeper.app, fetched 2026-11-06.
+
+Endpoints (all undocumented except /v1/state/**):
+  /schedule/nfl/regular/2026
+  /scores/nfl/regular/2026/9
+  /teams/nfl
+  /v1/state/nfl
+
+These are trimmed copies of real payloads, not synthetic data. Fields the
+client does not read were removed to keep the fixtures reviewable; no value
+was edited. `scores_nfl_live.json` is the exception: it is the real completed
+game from week 9 with its metadata flipped to an in-progress Q3 state, because
+no NFL game was in progress at capture time. It exists to prove the live
+decoder path, not to claim that a live update was observed.
+
+Do not hand-edit these files. Recapture against the live endpoints and re-run
+`xcodegen generate` if the shapes change.

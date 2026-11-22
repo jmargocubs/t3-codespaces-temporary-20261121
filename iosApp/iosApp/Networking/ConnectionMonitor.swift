@@ -1,0 +1,361 @@
+import Foundation
+import Network
+import OSLog
+import Synchronization
+
+/// App-wide connection state: device connectivity (via `NWPathMonitor`) plus
+/// server reachability learned passively from every `HTTPClient` request
+/// outcome. Screens read this to distinguish "showing cached data because the
+/// server is down" from a healthy session, and playback entry points consult
+/// it before opening a streaming player that cannot succeed.
+///
+/// Server status is optimistic: `.unknown` counts as reachable so the app
+/// never blocks a request it hasn't seen fail. Any completed HTTP response —
+/// including a 4xx/5xx — proves the server is up; only transport-level
+/// failures (connection refused, timeout, DNS) mark it unreachable. While
+/// unreachable, a background loop probes the server's health endpoint so the
+/// state self-heals as soon as the server comes back.
+@MainActor
+@Observable
+final class ConnectionMonitor {
+    static let shared = ConnectionMonitor()
+
+    enum ServerStatus {
+        case unknown
+        case reachable
+        case unreachable
+    }
+
+    /// What the v2 contract probe (`APIv2Probe`) learned about the active
+    /// server. Orthogonal to reachability: an `.updateRequired` server is
+    /// reachable and still serves v1, but every v2 operation is refused.
+    enum ServerContractStatus: Equatable {
+        case unknown
+        /// The server serves API v2.
+        case v2
+        /// A v1-only alpha server; the user must update it.
+        case updateRequired
+    }
+
+    /// Device has a usable network path (Wi-Fi/cellular/wired).
+    private(set) var isDeviceOnline = true
+    /// The path runs over Wi-Fi or wired Ethernet, which a Wi-Fi-only
+    /// download may use. Kept in memory only: like every property of the
+    /// path it can describe where the user is, so it's never logged.
+    private(set) var isOnWiFiOrWired = true
+    private(set) var serverStatus: ServerStatus = .unknown
+    private(set) var contractStatus: ServerContractStatus = .unknown {
+        didSet {
+            let updateRequired = contractStatus == .updateRequired
+            Self.requestPathSnapshot.withLock { $0.hasUpdateRequiredVerdict = updateRequired }
+        }
+    }
+    /// Registry id of the server `contractStatus` describes. A verdict is
+    /// only meaningful while that server is the active one: a candidate
+    /// probed during setup, or a server the user has since switched away
+    /// from, must never gate the active session.
+    private(set) var contractServerId: String?
+
+    /// Latest probe generation issued per server id (see `beginContractProbe`).
+    /// Process-scoped and monotonic; never reset.
+    private var latestContractProbeGeneration: [String: UInt64] = [:]
+    private var contractProbeGenerationCounter: UInt64 = 0
+
+    /// Where "the active server" is read from at record and read time.
+    /// Overridable so tests can drive it without touching the real registry.
+    var activeServerIdProvider: () -> String? = { ServerRegistry.shared.activeServerId }
+
+    /// Invoked when an `.updateRequired` verdict deserves a fresh probe: the
+    /// server just came back from `.unreachable`, which is what an in-place
+    /// upgrade looks like from here. The verdict is otherwise sticky for the
+    /// process (the only probe is `AuthService.refreshActiveServerName`), so
+    /// without a re-probe the pill would outlive the upgrade until relaunch.
+    /// A hook rather than a direct call keeps `Networking` from depending on
+    /// `AuthService`; `ContentView` installs it at startup. The other recovery
+    /// edge, returning to the foreground, lives in `ContentView`'s scene-phase
+    /// handler. Neither edge changes the verdict itself: only a probe result
+    /// does, and a failed re-probe leaves it in place.
+    var onContractRecheckNeeded: (() -> Void)?
+
+    /// Drive the "server update required" message from this. False whenever
+    /// the recorded verdict belongs to a server other than the active one.
+    var isServerUpdateRequired: Bool {
+        contractStatus == .updateRequired && contractServerId == activeServerIdProvider()
+    }
+
+    /// Lock-protected mirror of the state every request consults, so the
+    /// request path can skip a main-actor hop in the common case. Written
+    /// from the `didSet` above.
+    private struct RequestPathSnapshot {
+        var hasUpdateRequiredVerdict = false
+    }
+
+    private nonisolated static let requestPathSnapshot = Mutex(RequestPathSnapshot())
+
+    /// Whether any `.updateRequired` verdict is recorded. While false,
+    /// `isServerUpdateRequired` is false too; while true, read that property
+    /// on the main actor, because it also checks that the verdict's server is
+    /// the active one.
+    nonisolated static var hasUpdateRequiredVerdict: Bool {
+        requestPathSnapshot.withLock { $0.hasUpdateRequiredVerdict }
+    }
+
+    /// `isServerUpdateRequired` for callers off the main actor. Hops only
+    /// while an update-required verdict is recorded.
+    nonisolated static func readServerUpdateRequired() async -> Bool {
+        guard hasUpdateRequiredVerdict else { return false }
+        return await MainActor.run { ConnectionMonitor.shared.isServerUpdateRequired }
+    }
+
+    /// Record the probe outcome for `serverId`. The result is dropped when
+    /// that server is not active at record time, so a probe of a setup
+    /// candidate or a probe that outlived a server switch cannot overwrite
+    /// the active verdict. Only `.v2` and `.updateServer` are contract
+    /// evidence; a transport or HTTP failure leaves the previous verdict for
+    /// the same server in place, exactly as the compatibility rule requires
+    /// (a timeout is not an old server).
+    func noteContractProbe(_ result: APIv2ProbeResult, serverId: String) {
+        noteContractProbe(result, serverId: serverId, generation: beginContractProbe(serverId: serverId))
+    }
+
+    /// Issue a generation for a probe of `serverId` that is about to start.
+    /// Probes can overlap (foreground return and unreachable->reachable both
+    /// re-probe), and an older probe finishing after a newer one must not
+    /// overwrite the newer verdict. Capture the generation before probing and
+    /// pass it to `noteContractProbe(_:serverId:generation:)`; only the latest
+    /// generation issued for that server id is recorded.
+    func beginContractProbe(serverId: String) -> UInt64 {
+        contractProbeGenerationCounter += 1
+        latestContractProbeGeneration[serverId] = contractProbeGenerationCounter
+        return contractProbeGenerationCounter
+    }
+
+    /// Record the probe outcome for `serverId` from the probe that was issued
+    /// `generation` by `beginContractProbe(serverId:)`. Dropped when a newer
+    /// generation has since been issued for that server, in addition to the
+    /// active-server rule of the two-argument overload.
+    func noteContractProbe(_ result: APIv2ProbeResult, serverId: String, generation: UInt64) {
+        guard latestContractProbeGeneration[serverId] == generation else {
+            Self.logger.debug("Dropping v2 contract verdict from a superseded probe generation")
+            return
+        }
+        guard serverId == activeServerIdProvider() else {
+            Self.logger.debug("Dropping v2 contract verdict for a server that is not active")
+            return
+        }
+        if contractServerId != serverId {
+            contractStatus = .unknown
+            contractServerId = serverId
+        }
+        switch result {
+        case .v2:
+            contractStatus = .v2
+        case .updateServer:
+            if contractStatus != .updateRequired {
+                Self.logger.warning("Server answered the v2 probe as v1-only; update required")
+            }
+            contractStatus = .updateRequired
+        case .failure:
+            break
+        }
+    }
+
+    /// Test reset for the shared monitor.
+    func resetContractStatus() {
+        contractStatus = .unknown
+        contractServerId = nil
+    }
+
+    /// Optimistic gate for starting server-backed work: `.unknown` passes so
+    /// the first request after launch is never blocked.
+    var isServerReachable: Bool {
+        isDeviceOnline && serverStatus != .unreachable
+    }
+
+    /// Drive "offline / can't reach server" UI from this: true only once a
+    /// failure has actually been observed (or the device itself is offline).
+    var isOffline: Bool {
+        !isDeviceOnline || serverStatus == .unreachable
+    }
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.cubbiestream.kyro",
+        category: "ConnectionMonitor"
+    )
+
+    private let pathMonitor = NWPathMonitor()
+    private var hasInitialPath = false
+    private var reprobeTask: Task<Void, Never>?
+    /// Seconds between health probes while the server is unreachable.
+    private let reprobeInterval: TimeInterval = 15
+
+    private init() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            let wifiOrWired = online && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
+            Task { @MainActor in
+                if self?.isOnWiFiOrWired != wifiOrWired { self?.isOnWiFiOrWired = wifiOrWired }
+                self?.applyPathUpdate(online: online)
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "com.cubbiestream.kyro.connection-monitor"))
+    }
+
+    // MARK: - Passive signals (reported by HTTPClient)
+
+    /// Any HTTP response arrived — the server is alive regardless of status
+    /// code.
+    func noteServerResponded() {
+        // Only the edge is evidence; the steady state is implied by the
+        // absence of a later transition. This also keeps the hot path out of
+        // the diagnostics ring.
+        guard serverStatus != .reachable else { return }
+        Self.logger.info("Server marked reachable")
+        #if os(iOS) || os(tvOS)
+        // Essential: recovery is half the story in an "it won't connect"
+        // report. Without it, a bundle shows the failures and gives no way
+        // to tell an outage that ended from one that is still happening.
+        DiagTrace.log(
+            .essential,
+            category: .network,
+            tag: "Reach",
+            message: "server reachable",
+            attrs: ["outcome": .string(HTTPDiagnosticsOutcome.reachable)]
+        )
+        #endif
+        // Only the unreachable -> reachable edge is upgrade evidence; the
+        // initial `.unknown` -> `.reachable` step is the first request after
+        // launch, which `refreshActiveServerName` already covers.
+        let recoveredFromOutage = serverStatus == .unreachable
+        serverStatus = .reachable
+        stopReprobeLoop()
+        if recoveredFromOutage, isServerUpdateRequired {
+            Self.logger.info("Server recovered while update-required; requesting contract re-probe")
+            onContractRecheckNeeded?()
+        }
+    }
+
+    /// A request failed at the transport layer (no HTTP response). Callers
+    /// must not report cancellations here.
+    func noteServerUnreachable() {
+        guard serverStatus != .unreachable else { return }
+        Self.logger.info("Server marked unreachable")
+        #if os(iOS) || os(tvOS)
+        // Essential, and the single most important line in a connectivity
+        // report: it is the moment the app decided the server was down, which
+        // is what every "offline" banner and blocked playback entry point
+        // downstream is reacting to. Logged once per transition, not per
+        // failed request.
+        DiagTrace.log(
+            .essential,
+            level: .warning,
+            category: .network,
+            tag: "Reach",
+            message: "server unreachable",
+            attrs: ["outcome": .string(HTTPDiagnosticsOutcome.unreachable)]
+        )
+        #endif
+        serverStatus = .unreachable
+        startReprobeLoop()
+    }
+
+    // MARK: - Active probe
+
+    /// The retained unversioned health probe. It is public and stays outside
+    /// the v2 contract and the v1 tombstone.
+    nonisolated static let healthPath = "/api/v1/health"
+
+    /// One-shot health check of the active server. It goes out without
+    /// credentials, so an expired or revoked session can neither fail the
+    /// probe nor start a token refresh. `HTTPClient` reports the outcome, which
+    /// updates `serverStatus` as a side effect.
+    @discardableResult
+    func probeServer(using httpClient: HTTPClient = .shared) async -> Bool {
+        do {
+            let _: HealthStatus = try await httpClient.getUnauthenticatedFromActiveServer(Self.healthPath)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Wait (bounded) for `NWPathMonitor` to deliver its first path so early
+    /// launch decisions (e.g. landing on Downloads when offline) don't read
+    /// the optimistic default.
+    func waitForInitialPath(timeout: TimeInterval = 1.0) async {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while !hasInitialPath, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    // MARK: - Internals
+
+    private func applyPathUpdate(online: Bool) {
+        hasInitialPath = true
+        // `NWPathMonitor` re-delivers paths on churn that doesn't change
+        // usability; only real transitions proceed.
+        guard online != isDeviceOnline else { return }
+        isDeviceOnline = online
+        Self.logger.info("Device network path: \(online ? "online" : "offline", privacy: .public)")
+        #if os(iOS) || os(tvOS)
+        // Essential. This is the line that separates the two reports that look
+        // identical from the user's side: "the app can't reach my server" and
+        // "my phone had no network". Without it every device-side outage reads
+        // as a server fault.
+        //
+        // Only the boolean is recorded — never the interface type, SSID, or
+        // any other property of `NWPath`, all of which describe the user's
+        // physical location.
+        DiagTrace.log(
+            .essential,
+            level: online ? .info : .warning,
+            category: .network,
+            tag: "Reach",
+            message: "device network path changed",
+            attrs: ["outcome": .string(online ? HTTPDiagnosticsOutcome.online : HTTPDiagnosticsOutcome.offline)]
+        )
+        #endif
+        if online {
+            // Regained a network path — find out whether the server is back
+            // rather than waiting for the next user-initiated request. The
+            // loop was suspended while offline (probes can't succeed without
+            // a path), so restart it too in case the server is still down.
+            if serverStatus == .unreachable {
+                startReprobeLoop()
+                Task { await self.probeServer() }
+            }
+        } else {
+            stopReprobeLoop()
+        }
+    }
+
+    private func startReprobeLoop() {
+        guard reprobeTask == nil, isDeviceOnline else { return }
+        #if os(iOS) || os(tvOS)
+        // Arming is logged once; ticks are not (failed probes are logged by
+        // HTTPClient, recovery by `noteServerResponded`).
+        DiagTrace.log(
+            .essential,
+            category: .network,
+            tag: "Reach",
+            message: "reprobe loop armed",
+            attrs: ["outcome": .string(HTTPDiagnosticsOutcome.unreachable)]
+        )
+        #endif
+        reprobeTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                try? await Task.sleep(for: .seconds(self.reprobeInterval))
+                guard !Task.isCancelled else { return }
+                guard self.serverStatus == .unreachable, self.isDeviceOnline else { return }
+                await self.probeServer()
+            }
+        }
+    }
+
+    private func stopReprobeLoop() {
+        reprobeTask?.cancel()
+        reprobeTask = nil
+    }
+}

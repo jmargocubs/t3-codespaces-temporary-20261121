@@ -1,0 +1,546 @@
+import Foundation
+
+/// Explicit projection into existing presentation models. Numeric IDs remain a
+/// legacy consumer boundary: reject unsupported opaque values rather than using
+/// zero, dropping versions, or changing the watch transport decoder.
+private func catalogLegacyID(_ value: String) throws -> Int {
+    guard let number = Int(value), number > 0, String(number) == value else {
+        throw APIv2Error.unsupportedCatalogReadValue
+    }
+    return number
+}
+
+private func catalogLegacyInt(_ value: Int64) throws -> Int {
+    guard let number = Int(exactly: value) else { throw APIv2Error.unsupportedCatalogReadValue }
+    return number
+}
+
+extension ItemDetail {
+    init(catalog value: APIv2CatalogRead.CatalogItemDetail) throws {
+        self.contentId = value.contentId
+        self.type = value.`type`
+        self.status = value.status
+        self.title = value.title
+        self.sortTitle = value.sortTitle
+        self.originalTitle = value.originalTitle
+        self.originalLanguage = value.originalLanguage
+        self.showStatus = value.showStatus
+        self.year = try value.year.map { try catalogLegacyInt($0) }
+        self.overview = value.overview
+        self.tagline = value.tagline
+        self.runtime = try value.runtime.map { try catalogLegacyInt($0) }
+        self.contentRating = value.contentRating
+        self.advisoryAge = try value.advisoryAge.map { try catalogLegacyInt($0) }
+        self.advisorySource = value.advisorySource
+        self.genres = value.genres
+        self.ratingImdb = value.ratingImdb
+        self.ratingTmdb = value.ratingTmdb
+        self.ratingRtCritic = try value.ratingRtCritic.map { try catalogLegacyInt($0) }
+        self.ratingRtAudience = try value.ratingRtAudience.map { try catalogLegacyInt($0) }
+        self.ratings = value.ratings?.map {
+            DisplayRating(source: $0.source, name: $0.name, score: $0.score, display: $0.display)
+        }
+        self.imdbId = value.imdbId
+        self.tmdbId = value.tmdbId
+        self.tvdbId = value.tvdbId
+        self.cast = try value.cast.map { try CastMember(catalog: $0) }
+        self.crew = value.crew.map { CrewMember(catalog: $0) }
+        self.studios = value.studios
+        self.networks = value.networks
+        self.countries = value.countries
+        self.releaseDate = value.releaseDate
+        self.firstAirDate = value.firstAirDate
+        self.lastAirDate = value.lastAirDate
+        self.posterThumbhash = value.posterThumbhash
+        self.backdropThumbhash = value.backdropThumbhash
+        self.seasonCount = try value.seasonCount.map { try catalogLegacyInt($0) }
+        self.seriesId = value.seriesId
+        self.seriesTitle = value.seriesTitle
+        self.seasonNumber = try value.seasonNumber.map { try catalogLegacyInt($0) }
+        self.episodeNumber = try value.episodeNumber.map { try catalogLegacyInt($0) }
+        self.episodeCount = try value.episodeCount.map { try catalogLegacyInt($0) }
+        self.airDate = value.airDate
+        self.isSpecials = value.isSpecials
+        self.userData = try value.userData.map { try LeafItemUserData(catalog: $0) }
+        self.versions = try value.versions.map { try FileVersion(catalog: $0) }
+        self.playbackVariants = try value.playbackVariants.map { variants in
+            try variants.map { try PlaybackVariant(catalog: $0) }
+        }
+        self.subtitles = value.subtitles.map { SubtitleInfoBasic(catalog: $0) }
+        self.intro = value.intro.map { TimeRange(catalog: $0) }
+        self.credits = value.credits.map { TimeRange(catalog: $0) }
+        self.effectiveSubtitleMode = value.effectiveSubtitleMode
+        self.effectiveShowForcedSubtitles = value.effectiveShowForcedSubtitles
+        self.effectiveSubtitleTrackSignature = value.effectiveSubtitleTrackSignature.map { SubtitleTrackSignature(catalog: $0) }
+        self.overlaySummary = value.overlaySummary.map { OverlaySummary(catalog: $0) }
+        self.audiobook = try value.audiobook.map { try AudiobookDetail(catalog: $0) }
+        self.pendingTranslationLanguage = value.pendingTranslationLanguage
+        self.machineTranslatedFields = value.machineTranslatedFields
+        self.themes = value.themes
+        self.videos = value.videos.map { $0.map { ItemVideo(catalog: $0) } }
+        self.extras = try value.extras.map { try $0.map { try ItemExtra(catalog: $0) } }
+        self.userState = value.userState.map {
+            MediaItemUserState(played: $0.played, isFavorite: $0.isFavorite, inWatchlist: $0.inWatchlist)
+        }
+        self.posterIsEpisodeStill = value.posterIsEpisodeStill
+        self.backdropIsEpisodeStill = value.backdropIsEpisodeStill
+        self.posterUrl = value.posterUrl
+        self.backdropUrl = value.backdropUrl
+        self.logoUrl = value.logoUrl
+    }
+}
+
+extension PlaybackVariant {
+    init(catalog value: APIv2CatalogRead.PlaybackVariant) throws {
+        self.variantId = value.variantId
+        self.editionRaw = value.editionRaw
+        self.editionKey = value.editionKey
+        self.presentationKind = value.presentationKind
+        self.presentationGroupKey = value.presentationGroupKey
+        self.partCount = try catalogLegacyInt(value.partCount)
+        self.totalDuration = value.totalDuration.map(Double.init)
+        self.defaultFileId = try value.defaultFileId.map { try catalogLegacyID($0) }
+        self.parts = try value.parts.map { try PlaybackVariantPart(catalog: $0) }
+    }
+}
+
+extension PlaybackVariantPart {
+    init(catalog value: APIv2CatalogRead.PlaybackVariantPart) throws {
+        self.partIndex = try catalogLegacyInt(value.partIndex)
+        self.defaultFileId = try value.defaultFileId.map { try catalogLegacyID($0) }
+        self.totalDuration = value.totalDuration.map(Double.init)
+        self.versions = try value.versions.map { try FileVersion(catalog: $0) }
+    }
+}
+
+extension Season {
+    init(catalog value: APIv2CatalogRead.Season) throws {
+        self.contentId = value.contentId
+        self.seasonNumber = try catalogLegacyInt(value.seasonNumber)
+        self.isSpecials = value.isSpecials
+        self.title = value.title
+        self.overview = value.overview
+        self.airDate = value.airDate
+        self.episodeCount = try catalogLegacyInt(value.episodeCount)
+        self.posterThumbhash = value.posterThumbhash
+        self.userData = try value.userData.map { try SeasonUserData(catalog: $0) }
+        self.posterUrl = value.posterUrl
+        self.machineTranslatedFields = value.machineTranslatedFields
+    }
+}
+
+extension EpisodeListItem {
+    init(catalog value: APIv2CatalogRead.Episode) throws {
+        self.contentId = value.contentId
+        self.seasonNumber = try catalogLegacyInt(value.seasonNumber)
+        self.episodeNumber = try catalogLegacyInt(value.episodeNumber)
+        self.title = value.title
+        self.overview = value.overview
+        self.airDate = value.airDate
+        self.runtime = try catalogLegacyInt(value.runtime)
+        self.imdbId = value.imdbId
+        self.tmdbId = value.tmdbId
+        self.tvdbId = value.tvdbId
+        self.stillThumbhash = value.stillThumbhash
+        self.userData = try value.userData.map { try LeafItemUserData(catalog: $0) }
+        self.files = try value.files.map { try $0.map { try EpisodeFile(catalog: $0) } }
+        self.stillIsEpisodeStill = value.stillIsEpisodeStill
+        self.stillUrl = value.stillUrl
+        self.machineTranslatedFields = value.machineTranslatedFields
+        self.pendingTranslationLanguage = value.pendingTranslationLanguage
+    }
+}
+
+extension Person {
+    init(catalog value: APIv2CatalogRead.Person) throws {
+        self.id = value.id
+        self.name = value.name
+        self.bio = value.bio
+        self.birthDate = value.birthDate
+        self.deathDate = value.deathDate
+        self.birthplace = value.birthplace
+        self.photoThumbhash = value.photoThumbhash
+        self.tmdbId = value.tmdbId
+        self.imdbId = value.imdbId
+        self.tvdbId = value.tvdbId
+        self.photoUrl = value.photoUrl
+    }
+}
+
+extension CastMember {
+    init(catalog value: APIv2CatalogRead.CastCredit) throws {
+        self.name = value.name
+        self.character = value.character
+        self.order = try catalogLegacyInt(value.order)
+        self.personId = value.personId
+        self.tmdbId = value.tmdbId
+        self.tvdbId = value.tvdbId
+        self.imdbId = value.imdbId
+        self.photoThumbhash = value.photoThumbhash
+        self.photoUrl = value.photoUrl
+    }
+}
+
+extension CrewMember {
+    init(catalog value: APIv2CatalogRead.CrewCredit) {
+        self.name = value.name
+        self.job = value.job
+        self.personId = value.personId
+        self.tmdbId = value.tmdbId
+        self.tvdbId = value.tvdbId
+        self.imdbId = value.imdbId
+        self.photoThumbhash = value.photoThumbhash
+        self.photoUrl = value.photoUrl
+    }
+}
+
+extension LeafItemUserData {
+    init(catalog value: APIv2CatalogRead.WatchRollup) throws {
+        self.played = value.played
+        self.isInProgress = value.isInProgress
+        self.positionSeconds = value.positionSeconds
+        self.durationSeconds = value.durationSeconds
+        self.lastFileId = try value.lastFileId.map { try catalogLegacyID($0) }
+        self.lastResolution = value.lastResolution
+    }
+}
+
+extension FileVersion {
+    init(catalog value: APIv2CatalogRead.FileVersion) throws {
+        self.fileId = try catalogLegacyID(value.fileId)
+        self.fileName = value.fileName
+        self.resolution = value.resolution
+        self.codecVideo = value.codecVideo
+        self.codecAudio = value.codecAudio
+        self.hdr = value.hdr
+        self.container = value.container
+        self.fileSize = value.fileSize
+        self.duration = Double(value.duration)
+        self.bitrate = try catalogLegacyInt(value.bitrate)
+        self.videoTracks = try value.videoTracks.map { try $0.map { try VideoTrack(catalog: $0) } }
+        self.audioTracks = try value.audioTracks.map { try $0.map { try AudioTrack(catalog: $0) } }
+        self.subtitleTracks = try value.subtitleTracks.map { try $0.map { try SubtitleTrack(catalog: $0) } }
+        self.chapters = try value.chapters.map { try $0.map { try VersionChapter(catalog: $0) } }
+        self.intro = value.intro.map { TimeRange(catalog: $0) }
+        self.credits = value.credits.map { TimeRange(catalog: $0) }
+        self.recap = value.recap.map { TimeRange(catalog: $0) }
+        self.presentationKind = value.presentationKind
+        self.presentationGroupKey = value.presentationGroupKey
+        self.presentationPartIndex = try value.presentationPartIndex.map { try catalogLegacyInt($0) }
+        self.presentationPartTotal = try value.presentationPartTotal.map { try catalogLegacyInt($0) }
+        self.editionRaw = value.editionRaw
+        self.editionKey = value.editionKey
+        self.effectiveAudioTrackIndex = try value.effectiveAudioTrackIndex.map { try catalogLegacyInt($0) }
+        self.effectiveAudioLanguage = value.effectiveAudioLanguage
+        self.trickplayAvailable = nil
+    }
+}
+
+extension FileVersion {
+    init(watch value: APIv2CatalogRead.WatchFileVersion) throws {
+        self.fileId = try catalogLegacyID(value.fileId)
+        self.fileName = value.fileName
+        self.resolution = value.resolution
+        self.codecVideo = value.codecVideo
+        self.codecAudio = value.codecAudio
+        self.hdr = value.hdr
+        self.container = value.container
+        self.fileSize = value.fileSize
+        self.duration = Double(value.duration)
+        self.bitrate = try catalogLegacyInt(value.bitrate)
+        self.videoTracks = try value.videoTracks.map { try $0.map { try VideoTrack(catalog: $0) } }
+        self.audioTracks = try value.audioTracks.map { try $0.map { try AudioTrack(catalog: $0) } }
+        self.subtitleTracks = try value.subtitleTracks.map { try $0.map { try SubtitleTrack(catalog: $0) } }
+        self.chapters = try value.chapters.map { try $0.map { try VersionChapter(catalog: $0) } }
+        self.intro = value.intro.map { TimeRange(watch: $0) }
+        self.credits = value.credits.map { TimeRange(watch: $0) }
+        self.recap = value.recap.map { TimeRange(watch: $0) }
+        self.presentationKind = value.presentationKind
+        self.presentationGroupKey = value.presentationGroupKey
+        self.presentationPartIndex = try value.presentationPartIndex.map { try catalogLegacyInt($0) }
+        self.presentationPartTotal = try value.presentationPartTotal.map { try catalogLegacyInt($0) }
+        self.editionRaw = value.editionRaw
+        self.editionKey = value.editionKey
+        self.effectiveAudioTrackIndex = try value.effectiveAudioTrackIndex.map { try catalogLegacyInt($0) }
+        self.effectiveAudioLanguage = value.effectiveAudioLanguage
+        self.trickplayAvailable = value.trickplayAvailable
+    }
+}
+
+extension WatchDetail {
+    init(v2 value: APIv2CatalogRead.WatchDetail) throws {
+        contentId = value.contentId
+        type = value.type
+        title = value.title
+        year = value.year
+        overview = value.overview
+        versions = try value.versions.map { try FileVersion(watch: $0) }
+        subtitles = value.subtitles.map { SubtitleInfoBasic(catalog: $0) }
+        intro = value.intro.map { TimeRange(watch: $0) }
+        credits = value.credits.map { TimeRange(watch: $0) }
+        recap = value.recap.map { TimeRange(watch: $0) }
+        userData = try value.userData.map { try LeafItemUserData(catalog: $0) }
+        seriesId = value.seriesId
+        seriesTitle = value.seriesTitle
+        seasonNumber = value.seasonNumber
+        episodeNumber = value.episodeNumber
+        effectiveSubtitleLanguage = value.effectiveSubtitleLanguage
+        effectiveSubtitleMode = value.effectiveSubtitleMode
+        effectiveShowForcedSubtitles = value.effectiveShowForcedSubtitles
+        effectiveSubtitleTrackSignature = value.effectiveSubtitleTrackSignature.map { SubtitleTrackSignature(catalog: $0) }
+    }
+}
+
+extension TimeRange {
+    init(watch value: APIv2CatalogRead.WatchMarker) {
+        start = value.startSeconds
+        end = value.endSeconds
+    }
+}
+
+extension SubtitleInfoBasic {
+    init(catalog value: APIv2CatalogRead.SubtitleInfo) {
+        self.source = value.source
+        self.language = value.language
+        self.codec = value.codec
+        self.forced = value.forced
+        self.title = value.title
+    }
+}
+
+extension TimeRange {
+    init(catalog value: APIv2CatalogRead.Marker) {
+        self.start = value.start
+        self.end = value.end
+    }
+}
+
+extension SubtitleTrackSignature {
+    init(catalog value: APIv2CatalogRead.WatchSubtitleSignature) {
+        self.source = value.source
+        self.language = value.language
+        self.codec = value.codec
+        self.label = value.label
+        self.forced = value.forced
+        self.hearingImpaired = value.hearingImpaired
+    }
+}
+
+extension OverlaySummary {
+    init(catalog value: APIv2CatalogRead.CatalogItemOverlay) {
+        self.resolution = value.resolution
+        self.hdr = value.hdr
+        self.audio = value.audio
+        self.audioChannels = value.audioChannels
+        self.videoCodec = value.videoCodec
+        self.container = value.container
+        self.aspectRatio = value.aspectRatio
+        self.releaseType = value.releaseType
+        self.edition = value.edition
+        self.multiAudio = value.multiAudio
+        self.multiSub = value.multiSub
+    }
+}
+
+extension AudiobookDetail {
+    init(catalog value: APIv2CatalogRead.AudiobookDetailExtension) throws {
+        self.authors = value.authors.map { AudiobookPerson(catalog: $0) }
+        self.narrators = value.narrators.map { AudiobookPerson(catalog: $0) }
+        self.publisher = value.publisher
+        self.totalDurationSeconds = try catalogLegacyInt(value.totalDurationSeconds)
+        self.series = try value.series.map { try AudiobookSeriesGroup(catalog: $0) }
+        self.otherNarrations = try value.otherNarrations.map { try AudiobookNarration(catalog: $0) }
+        self.related = try AudiobookRelatedContent(catalog: value.related)
+    }
+}
+
+extension ItemVideo {
+    init(catalog value: APIv2CatalogRead.ItemVideoInfo) {
+        self.kind = value.kind
+        self.site = value.site
+        self.siteKey = value.siteKey
+        self.name = value.name
+        self.language = value.language
+        self.isOfficial = value.isOfficial
+    }
+}
+
+extension ItemExtra {
+    init(catalog value: APIv2CatalogRead.ItemExtraInfo) throws {
+        self.contentId = value.contentId
+        self.kind = value.kind
+        self.title = value.title
+        self.durationSeconds = try value.durationSeconds.map { try catalogLegacyInt($0) }
+        self.fileId = try value.fileId.map { try catalogLegacyInt($0) }
+        self.stillUrl = value.stillUrl
+        self.stillThumbhash = value.stillThumbhash
+    }
+}
+
+extension SeasonUserData {
+    init(catalog value: APIv2CatalogRead.WatchRollup) throws {
+        self.played = value.played
+        self.watchedCount = try catalogLegacyInt(value.watchedCount)
+        self.unplayedCount = try catalogLegacyInt(value.unplayedCount)
+        self.inProgressCount = try catalogLegacyInt(value.inProgressCount)
+    }
+}
+
+extension EpisodeFile {
+    init(catalog value: APIv2CatalogRead.EpisodeFile) throws {
+        self.fileId = try catalogLegacyID(value.fileId)
+        self.resolution = value.resolution
+        self.codecVideo = value.codecVideo
+        self.hdr = value.hdr
+        self.audioChannels = try value.audioChannels.map { try catalogLegacyInt($0) }
+        self.container = value.container
+        self.fileSize = value.fileSize
+    }
+}
+
+extension VideoTrack {
+    init(catalog value: APIv2CatalogRead.VideoTrack) throws {
+        self.index = nil
+        self.codec = value.codec
+        self.width = try value.width.map { try catalogLegacyInt($0) }
+        self.height = try value.height.map { try catalogLegacyInt($0) }
+        self.frameRate = value.frameRate
+        self.bitrate = try value.bitrate.map { try catalogLegacyInt($0) }
+        self.profile = value.profile
+        self.level = try value.level.map { try catalogLegacyInt($0) }
+        self.bitDepth = try value.bitDepth.map { try catalogLegacyInt($0) }
+        self.colorRange = value.colorRange
+        self.colorSpace = value.colorSpace
+        self.colorPrimaries = value.colorPrimaries
+        self.colorTransfer = value.colorTransfer
+        self.videoRange = value.videoRange
+        self.dolbyVision = value.dolbyVision
+        self.title = value.title
+        self.language = nil
+    }
+}
+
+extension AudioTrack {
+    init(catalog value: APIv2CatalogRead.AudioTrack) throws {
+        self.index = nil
+        self.codec = value.codec
+        self.channels = try value.channels.map { try catalogLegacyInt($0) }
+        self.channelLayout = value.layout
+        self.bitrate = try value.bitrate.map { try catalogLegacyInt($0) }
+        self.sampleRate = try value.sampleRate.map { try catalogLegacyInt($0) }
+        self.language = value.language
+        self.title = value.title
+        self.embeddedTitle = value.embeddedTitle
+        self.isDefault = value.`default`
+    }
+}
+
+extension SubtitleTrack {
+    init(catalog value: APIv2CatalogRead.VersionSubtitleTrack) throws {
+        self.index = try value.index.map { try catalogLegacyInt($0) }
+        self.codec = value.codec
+        self.language = value.language
+        self.title = value.title
+        self.embeddedTitle = value.embeddedTitle
+        self.forced = value.forced
+        self.hearingImpaired = value.hearingImpaired
+        self.isDefault = value.`default`
+        self.external = value.external
+        self.externalPath = value.fileName
+    }
+}
+
+extension VersionChapter {
+    init(catalog value: APIv2CatalogRead.VersionChapter) throws {
+        self.index = try catalogLegacyInt(value.index)
+        self.title = value.title
+        self.startSeconds = value.startSeconds
+        self.endSeconds = value.endSeconds
+        self.source = value.source
+        self.thumbnailUrl = value.thumbnailUrl
+        self.thumbnailThumbhash = value.thumbnailThumbhash
+    }
+}
+
+extension AudiobookPerson {
+    init(catalog value: APIv2CatalogRead.AudiobookPerson) {
+        self.personId = value.personId
+        self.name = value.name
+        self.photoThumbhash = value.photoThumbhash
+        self.photoUrl = value.photoUrl
+    }
+}
+
+extension AudiobookSeriesGroup {
+    init(catalog value: APIv2CatalogRead.AudiobookSeriesGroup) throws {
+        self.name = value.name
+        self.entries = try value.entries.map { try AudiobookRelatedItem(catalog: $0) }
+    }
+}
+
+extension AudiobookNarration {
+    init(catalog value: APIv2CatalogRead.AudiobookNarration) throws {
+        self.contentId = value.contentId
+        self.title = value.title
+        self.year = try value.year.map { try catalogLegacyInt($0) }
+        self.narrators = value.narrators
+    }
+}
+
+extension AudiobookRelatedContent {
+    init(catalog value: APIv2CatalogRead.AudiobookRelatedContent) throws {
+        self.alsoByAuthor = try value.alsoByAuthor.map { try AudiobookRelatedItem(catalog: $0) }
+        self.similar = try value.similar.map { try AudiobookRelatedItem(catalog: $0) }
+    }
+}
+
+extension AudiobookRelatedItem {
+    init(catalog value: APIv2CatalogRead.AudiobookRelatedItem) throws {
+        self.contentId = value.contentId
+        self.title = value.title
+        self.year = try value.year.map { try catalogLegacyInt($0) }
+        self.seriesIndex = try value.seriesIndex.map { try catalogLegacyInt($0) }
+        self.posterUrl = value.posterUrl
+    }
+}
+
+extension Library {
+    init(v2 value: APIv2UserLibrary) throws {
+        self.init(id: try catalogLegacyID(value.id), name: value.name, type: value.type,
+                  sortOrder: value.sortOrder, posterUrl: value.posterUrl)
+    }
+}
+
+extension ServerTrickplay {
+    init(v2 value: APIv2CatalogRead.WatchTrickplay) throws {
+        fileId = try catalogLegacyID(value.fileId)
+        guard value.intervalMs > 0, value.thumbnailWidth > 0, value.thumbnailHeight > 0,
+              value.tileColumns > 0, value.tileRows > 0, value.thumbnailCount > 0 else {
+            throw InvalidManifest.geometry
+        }
+        interval = Double(value.intervalMs) / 1000
+        thumbnailWidth = try catalogLegacyInt(value.thumbnailWidth)
+        thumbnailHeight = try catalogLegacyInt(value.thumbnailHeight)
+        columns = try catalogLegacyInt(value.tileColumns)
+        rows = try catalogLegacyInt(value.tileRows)
+        count = try catalogLegacyInt(value.thumbnailCount)
+        let urls = value.sheets.sorted { $0.index < $1.index }.compactMap { sheet -> URL? in
+            guard let url = URL(string: sheet.url),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+            return url
+        }
+        // A sheet's size in pixels must fit an Int; checked so a bad manifest
+        // is refused rather than trapping on overflow.
+        let (perSheet, tileOverflow) = columns.multipliedReportingOverflow(by: rows)
+        let (_, widthOverflow) = columns.multipliedReportingOverflow(by: thumbnailWidth)
+        let (_, heightOverflow) = rows.multipliedReportingOverflow(by: thumbnailHeight)
+        guard !tileOverflow, !widthOverflow, !heightOverflow else {
+            throw InvalidManifest.geometry
+        }
+        guard urls.count == value.sheets.count, urls.count == 1 + (count - 1) / perSheet else {
+            throw InvalidManifest.sheets
+        }
+        sheetURLs = urls
+        expiresAt = value.expiresAt
+    }
+}

@@ -1,0 +1,706 @@
+{
+  "header": {
+    "id": "401816775",
+    "competitions": [
+      {
+        "id": "401816775",
+        "date": "2026-09-02T16:40Z",
+        "competitors": [
+          {
+            "id": "17",
+            "homeAway": "home",
+            "team": {
+              "id": "17",
+              "abbreviation": "CIN",
+              "displayName": "Cincinnati Reds",
+              "shortDisplayName": null
+            }
+          },
+          {
+            "id": "25",
+            "homeAway": "away",
+            "team": {
+              "id": "25",
+              "abbreviation": "SD",
+              "displayName": "San Diego Padres",
+              "shortDisplayName": null
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "boxscore": {
+    "teams": [
+      {
+        "team": {
+          "id": "25",
+          "abbreviation": "SD",
+          "displayName": "San Diego Padres",
+          "shortDisplayName": "Padres"
+        },
+        "homeAway": "away",
+        "statistics": [
+          {
+            "name": "batting",
+            "label": null,
+            "displayValue": null
+          },
+          {
+            "name": "pitching",
+            "label": null,
+            "displayValue": null
+          },
+          {
+            "name": "fielding",
+            "label": null,
+            "displayValue": null
+          },
+          {
+            "name": "records",
+            "label": null,
+            "displayValue": null
+          }
+        ]
+      },
+      {
+        "team": {
+          "id": "17",
+          "abbreviation": "CIN",
+          "displayName": "Cincinnati Reds",
+          "shortDisplayName": "Reds"
+        },
+        "homeAway": "home",
+        "statistics": [
+          {
+            "name": "batting",
+            "label": null,
+            "displayValue": null
+          },
+          {
+            "name": "pitching",
+            "label": null,
+            "displayValue": null
+          },
+          {
+            "name": "fielding",
+            "label": null,
+            "displayValue": null
+          },
+          {
+            "name": "records",
+            "label": null,
+            "displayValue": null
+          }
+        ]
+      }
+    ],
+    "players": [
+      {
+        "team": {
+          "id": "25",
+          "abbreviation": "SD",
+          "displayName": "San Diego Padres",
+          "shortDisplayName": "Padres"
+        },
+        "statistics": [
+          {
+            "name": null,
+            "displayName": null,
+            "labels": [
+              "H-AB",
+              "AB",
+              "R",
+              "H",
+              "RBI",
+              "HR",
+              "BB",
+              "K",
+              "#P",
+              "AVG",
+              "OBP",
+              "SLG"
+            ],
+            "athletes": [
+              {
+                "active": true,
+                "starter": true,
+                "didNotPlay": null,
+                "athlete": {
+                  "id": "35983",
+                  "displayName": "Fernando Tatis Jr.",
+                  "shortName": "F. Tatis Jr.",
+                  "position": {
+                    "name": "Right Field",
+                    "displayName": "Right Fielder",
+                    "abbreviation": "RF"
+                  }
+                },
+                "stats": [
+                  "2-4",
+                  "4",
+                  "1",
+                  "2",
+                  "1",
+                  "0",
+                  "0",
+                  "2",
+                  "19",
+                  ".284",
+                  ".350",
+                  ".449"
+                ]
+              },
+              {
+                "active": true,
+                "starter": true,
+                "didNotPlay": null,
+                "athlete": {
+                  "id": "39710",
+                  "displayName": "Samad Taylor",
+                  "shortName": "S. Taylor",
+                  "position": {
+                    "name": "Left Field",
+                    "displayName": "Left Fielder",
+                    "abbreviation": "LF"
+                  }
+                },
+                "stats": [
+                  "0-3",
+                  "3",
+                  "0",
+                  "0",
+                  "0",
+                  "0",
+                  "1",
+                  "1",
+                  "20",
+                  ".333",
+                  ".418",
+                  ".417"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "team": {
+          "id": "17",
+          "abbreviation": "CIN",
+          "displayName": "Cincinnati Reds",
+          "shortDisplayName": "Reds"
+        },
+        "statistics": [
+          {
+            "name": null,
+            "displayName": null,
+            "labels": [
+              "H-AB",
+              "AB",
+              "R",
+              "H",
+              "RBI",
+              "HR",
+              "BB",
+              "K",
+              "#P",
+              "AVG",
+              "OBP",
+              "SLG"
+            ],
+            "athletes": [
+              {
+                "active": false,
+                "starter": true,
+                "didNotPlay": null,
+                "athlete": {
+                  "id": "5122878",
+                  "displayName": "Hector Rodriguez",
+                  "shortName": "H. Rodriguez",
+                  "position": {
+                    "name": "Right Field",
+                    "displayName": "Right Fielder",
+                    "abbreviation": "RF"
+                  }
+                },
+                "stats": [
+                  "1-5",
+                  "5",
+                  "1",
+                  "1",
+                  "1",
+                  "1",
+                  "0",
+                  "1",
+                  "19",
+                  ".240",
+                  ".305",
+                  ".480"
+                ]
+              },
+              {
+                "active": true,
+                "starter": false,
+                "didNotPlay": null,
+                "athlete": {
+                  "id": "36020",
+                  "displayName": "TJ Friedl",
+                  "shortName": "T. Friedl",
+                  "position": {
+                    "name": "Center Field",
+                    "displayName": "Center Fielder",
+                    "abbreviation": "CF"
+                  }
+                },
+                "stats": [
+                  "0-0",
+                  "0",
+                  "0",
+                  "0",
+                  "0",
+                  "0",
+                  "0",
+                  "0",
+                  "0",
+                  ".165",
+                  ".248",
+                  ".251"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "article": {
+    "id": 49806202,
+    "headline": "Brito, Bleday and Rodríguez homer, Reds score 7 unanswered runs to beat Padres 7-3",
+    "published": "2026-09-02T20:06:37Z",
+    "links": {
+      "web": {
+        "href": "http://www.espn.com/mlb/recap?gameId=401816775"
+      }
+    },
+    "categories": [
+      {
+        "type": "league",
+        "team": null
+      },
+      {
+        "type": "team",
+        "team": {
+          "id": 17
+        }
+      },
+      {
+        "type": "team",
+        "team": {
+          "id": 25
+        }
+      },
+      {
+        "type": "event",
+        "team": null
+      }
+    ]
+  },
+  "news": {
+    "articles": [
+      {
+        "id": 50453514,
+        "headline": "Tarik Skubal free agency tracker: Latest on top MLB free agent",
+        "published": "2026-11-11T18:29:25Z",
+        "links": {
+          "web": {
+            "href": "https://www.espn.com/mlb/story/_/id/50453514/tarik-skubal-free-agency-updates"
+          }
+        },
+        "categories": [
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "athlete",
+            "team": null
+          }
+        ]
+      },
+      {
+        "id": 50046775,
+        "headline": "2026 MLB offseason manager changes: Tracking hirings, firings",
+        "published": "2026-11-11T16:28:05Z",
+        "links": {
+          "web": {
+            "href": "https://www.espn.com/mlb/story/_/id/50046775/mlb-2026-manager-changes-tracker-hirings-firings-top-replacement-candidates"
+          }
+        },
+        "categories": [
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 12
+            }
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 3
+            }
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 18
+            }
+          }
+        ]
+      },
+      {
+        "id": 50453386,
+        "headline": "Astros hire Yankees bench coach Brad Ausmus as new manager",
+        "published": "2026-11-11T18:49:40Z",
+        "links": {
+          "web": {
+            "href": "https://www.espn.com/mlb/story/_/id/50453386/source-astros-hire-brad-ausmus-new-manager"
+          }
+        },
+        "categories": [
+          {
+            "type": "team",
+            "team": {
+              "id": 18
+            }
+          },
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 10
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "keyEvents": [],
+  "rosters": [
+    {
+      "team": {
+        "id": "17",
+        "abbreviation": "CIN",
+        "displayName": "Cincinnati Reds",
+        "shortDisplayName": null
+      },
+      "roster": [
+        {
+          "active": false,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "5122878",
+            "displayName": "Hector Rodriguez",
+            "shortName": "H. Rodriguez",
+            "position": null
+          },
+          "position": {
+            "name": "Right Field",
+            "displayName": "Right Fielder",
+            "abbreviation": "RF"
+          },
+          "stats": [
+            {
+              "name": "RBIs",
+              "displayName": "Runs Batted In",
+              "displayValue": "1"
+            },
+            {
+              "name": "hits",
+              "displayName": "Hits",
+              "displayValue": "1"
+            },
+            {
+              "name": "stolenBases",
+              "displayName": "Stolen Bases",
+              "displayValue": "0"
+            },
+            {
+              "name": "atBats",
+              "displayName": "At Bats",
+              "displayValue": "5"
+            },
+            {
+              "name": "homeRuns",
+              "displayName": "Home Runs",
+              "displayValue": "1"
+            },
+            {
+              "name": "avg",
+              "displayName": "Batting Average",
+              "displayValue": ".200"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": false,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "36020",
+            "displayName": "TJ Friedl",
+            "shortName": "T. Friedl",
+            "position": null
+          },
+          "position": {
+            "name": "Left Field",
+            "displayName": "Left Fielder",
+            "abbreviation": "LF"
+          },
+          "stats": [
+            {
+              "name": "RBIs",
+              "displayName": "Runs Batted In",
+              "displayValue": "0"
+            },
+            {
+              "name": "hits",
+              "displayName": "Hits",
+              "displayValue": "0"
+            },
+            {
+              "name": "stolenBases",
+              "displayName": "Stolen Bases",
+              "displayValue": "0"
+            },
+            {
+              "name": "atBats",
+              "displayName": "At Bats",
+              "displayValue": "0"
+            },
+            {
+              "name": "homeRuns",
+              "displayName": "Home Runs",
+              "displayValue": "0"
+            },
+            {
+              "name": "avg",
+              "displayName": "Batting Average",
+              "displayValue": ".000"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "4917694",
+            "displayName": "Elly De La Cruz",
+            "shortName": "E. De La Cruz",
+            "position": null
+          },
+          "position": {
+            "name": "Designated Hitter",
+            "displayName": "Designated Hitter",
+            "abbreviation": "DH"
+          },
+          "stats": [
+            {
+              "name": "RBIs",
+              "displayName": "Runs Batted In",
+              "displayValue": "0"
+            },
+            {
+              "name": "hits",
+              "displayName": "Hits",
+              "displayValue": "2"
+            },
+            {
+              "name": "stolenBases",
+              "displayName": "Stolen Bases",
+              "displayValue": "0"
+            },
+            {
+              "name": "atBats",
+              "displayName": "At Bats",
+              "displayValue": "4"
+            },
+            {
+              "name": "homeRuns",
+              "displayName": "Home Runs",
+              "displayValue": "0"
+            },
+            {
+              "name": "avg",
+              "displayName": "Batting Average",
+              "displayValue": ".500"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "team": {
+        "id": "25",
+        "abbreviation": "SD",
+        "displayName": "San Diego Padres",
+        "shortDisplayName": null
+      },
+      "roster": [
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "35983",
+            "displayName": "Fernando Tatis Jr.",
+            "shortName": "F. Tatis Jr.",
+            "position": null
+          },
+          "position": {
+            "name": "Second Base",
+            "displayName": "Second Baseman",
+            "abbreviation": "2B"
+          },
+          "stats": [
+            {
+              "name": "RBIs",
+              "displayName": "Runs Batted In",
+              "displayValue": "1"
+            },
+            {
+              "name": "hits",
+              "displayName": "Hits",
+              "displayValue": "2"
+            },
+            {
+              "name": "stolenBases",
+              "displayName": "Stolen Bases",
+              "displayValue": "0"
+            },
+            {
+              "name": "atBats",
+              "displayName": "At Bats",
+              "displayValue": "4"
+            },
+            {
+              "name": "homeRuns",
+              "displayName": "Home Runs",
+              "displayValue": "0"
+            },
+            {
+              "name": "avg",
+              "displayName": "Batting Average",
+              "displayValue": ".500"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "39710",
+            "displayName": "Samad Taylor",
+            "shortName": "S. Taylor",
+            "position": null
+          },
+          "position": {
+            "name": "Left Field",
+            "displayName": "Left Fielder",
+            "abbreviation": "LF"
+          },
+          "stats": [
+            {
+              "name": "RBIs",
+              "displayName": "Runs Batted In",
+              "displayValue": "0"
+            },
+            {
+              "name": "hits",
+              "displayName": "Hits",
+              "displayValue": "0"
+            },
+            {
+              "name": "stolenBases",
+              "displayName": "Stolen Bases",
+              "displayValue": "0"
+            },
+            {
+              "name": "atBats",
+              "displayName": "At Bats",
+              "displayValue": "3"
+            },
+            {
+              "name": "homeRuns",
+              "displayName": "Home Runs",
+              "displayValue": "0"
+            },
+            {
+              "name": "avg",
+              "displayName": "Batting Average",
+              "displayValue": ".000"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "4872691",
+            "displayName": "Jackson Merrill",
+            "shortName": "J. Merrill",
+            "position": null
+          },
+          "position": {
+            "name": "Center Field",
+            "displayName": "Center Fielder",
+            "abbreviation": "CF"
+          },
+          "stats": [
+            {
+              "name": "RBIs",
+              "displayName": "Runs Batted In",
+              "displayValue": "0"
+            },
+            {
+              "name": "hits",
+              "displayName": "Hits",
+              "displayValue": "0"
+            },
+            {
+              "name": "stolenBases",
+              "displayName": "Stolen Bases",
+              "displayValue": "0"
+            },
+            {
+              "name": "atBats",
+              "displayName": "At Bats",
+              "displayValue": "4"
+            },
+            {
+              "name": "homeRuns",
+              "displayName": "Home Runs",
+              "displayValue": "0"
+            },
+            {
+              "name": "avg",
+              "displayName": "Batting Average",
+              "displayValue": ".000"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

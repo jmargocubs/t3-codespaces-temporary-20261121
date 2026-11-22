@@ -1,0 +1,12053 @@
+import AetherEngine
+import AVFoundation
+import CoreGraphics
+import Foundation
+import OSLog
+import SwiftUI
+#if os(iOS) || os(tvOS)
+import UIKit
+#else
+import AppKit
+#endif
+
+/// Engine-neutral chapter projection consumed by Silo's controls.
+struct PlayerChapterInfo: Equatable, Identifiable, Sendable {
+    let index: Int
+    let title: String?
+    let time: Double
+    var id: Int { index }
+}
+
+/// Pure decision boundary for the credits setting's playback behavior.
+///
+/// Keeping the range/key checks outside the player backend makes every edge
+/// deterministic to test: the VM owns the seek side effect, while this policy
+/// decides whether the current time is the first eligible visit to this
+/// session/file/marker combination.
+enum CreditsAutoSkipPolicy {
+    static func target(
+        enabled: Bool,
+        playbackEligible: Bool,
+        time: Double,
+        range: TimeRange?,
+        markerKey: String?,
+        lastSkippedKey: String?
+    ) -> Double? {
+        guard enabled,
+              playbackEligible,
+              time.isFinite,
+              let range,
+              range.start.isFinite,
+              range.end.isFinite,
+              range.start >= 0,
+              range.end > range.start,
+              let markerKey,
+              markerKey != lastSkippedKey,
+              time >= range.start,
+              time < range.end else {
+            return nil
+        }
+        return range.end
+    }
+}
+
+/// `playback.auto_skip_recap`: the credits rule, plus three more. A Watch
+/// Party never skips a recap on its own, because the seek would move every
+/// member; they keep the Skip Recap button. Nothing skips before the load's
+/// first frame: a recap often starts at 0:00, and seeking that early can
+/// prevent the startup milestone, as with intros. And every recap already
+/// skipped stays skipped, not only the last one, so a replan to another file
+/// and back does not skip the first file's recap again.
+enum RecapAutoSkipPolicy {
+    static func target(
+        enabled: Bool,
+        isWatchParty: Bool,
+        playbackStarted: Bool,
+        playbackEligible: Bool,
+        time: Double,
+        range: TimeRange?,
+        markerKey: String?,
+        skippedKeys: Set<String>
+    ) -> Double? {
+        guard !isWatchParty, playbackStarted else { return nil }
+        if let markerKey, skippedKeys.contains(markerKey) { return nil }
+        return CreditsAutoSkipPolicy.target(
+            enabled: enabled,
+            playbackEligible: playbackEligible,
+            time: time,
+            range: range,
+            markerKey: markerKey,
+            lastSkippedKey: nil
+        )
+    }
+}
+
+/// What the up-next screen offers: the series' next episode, a shuffle's
+/// next pick, which may be a movie, or, when neither exists, the first On
+/// Deck item.
+struct PlayerNextUpEpisode: Identifiable, Hashable {
+    let contentId: String
+    let seriesId: String?
+    let seriesTitle: String?
+    let seasonNumber: Int
+    let episodeNumber: Int
+    let title: String
+    let overview: String?
+    let runtime: Int?
+    let stillUrl: String?
+    let stillThumbhash: String?
+    let airDate: String?
+    /// False for a shuffled movie, which has no season or episode line.
+    let isEpisode: Bool
+    /// The profile's watch state for the next episode, so the Up Next screen
+    /// can apply spoiler protection.
+    let watchState: EpisodeWatchState
+    /// Taken from On Deck because the current item has no successor. It may
+    /// be another title in another library.
+    var isFromOnDeck = false
+
+    var id: String { contentId }
+    var episodeLabel: String? { isEpisode ? "S\(seasonNumber):E\(episodeNumber)" : nil }
+
+    init(episode: EpisodeListItem, seriesId: String?, seriesTitle: String?) {
+        isEpisode = true
+        contentId = episode.contentId
+        self.seriesId = seriesId
+        self.seriesTitle = seriesTitle
+        seasonNumber = episode.seasonNumber
+        episodeNumber = episode.episodeNumber
+        let trimmedTitle = episode.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedTitle, !trimmedTitle.isEmpty {
+            title = trimmedTitle
+        } else {
+            title = "Episode \(episode.episodeNumber)"
+        }
+        overview = episode.overview
+        runtime = episode.runtime
+        stillUrl = episode.stillUrl
+        stillThumbhash = episode.stillThumbhash
+        airDate = episode.airDate
+        watchState = EpisodeWatchState(episode.userData)
+    }
+
+    init(shufflePick item: ShuffleItem) {
+        contentId = item.contentId
+        isEpisode = item.isEpisode
+        seriesId = item.isEpisode ? item.seriesId : nil
+        seriesTitle = item.isEpisode ? item.seriesTitle : nil
+        seasonNumber = item.seasonNumber ?? 0
+        episodeNumber = item.episodeNumber ?? 0
+        let trimmedTitle = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        title = trimmedTitle.isEmpty && item.isEpisode ? "Episode \(episodeNumber)" : trimmedTitle
+        overview = item.overview
+        runtime = item.runtime
+        // An episode card's poster is its 16:9 still; a movie's poster is
+        // portrait, so it shows its backdrop instead.
+        stillUrl = (item.isEpisode ? item.posterUrl : nil) ?? item.backdropUrl
+        stillThumbhash = (item.isEpisode ? item.posterThumbhash : nil) ?? item.backdropThumbhash
+        airDate = item.releaseDate
+        // Shuffle picks carry no watch state, so an episode reads as untouched.
+        watchState = EpisodeWatchState(played: false)
+    }
+
+    init(onDeckItem item: PlayerOnDeckItem) {
+        let section = item.sectionItem
+        isFromOnDeck = true
+        contentId = item.contentId
+        isEpisode = section.isEpisodeItem
+        seriesId = isEpisode ? section.seriesId : nil
+        seriesTitle = isEpisode ? section.seriesTitle : nil
+        seasonNumber = section.seasonNumber ?? 0
+        episodeNumber = section.episodeNumber ?? 0
+        let trimmedTitle = section.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        title = trimmedTitle.isEmpty && isEpisode ? "Episode \(episodeNumber)" : trimmedTitle
+        overview = section.overview
+        runtime = section.runtime
+        stillUrl = item.artworkUrl
+        stillThumbhash = item.artworkThumbhash
+        airDate = nil
+        watchState = EpisodeWatchState(sectionItem: section)
+    }
+}
+
+struct PlayerOnDeckItem: Identifiable, Hashable {
+    let sectionItem: SectionItem
+    let contentId: String
+    let title: String
+    let seriesTitle: String?
+    let seasonNumber: Int?
+    let episodeNumber: Int?
+    let positionSeconds: Double?
+    let durationSeconds: Double?
+    let artworkUrl: String?
+    let artworkThumbhash: String?
+
+    var id: String { contentId }
+
+    init(
+        item: SectionItem,
+        artworkUrl preferredArtworkUrl: String? = nil,
+        artworkThumbhash preferredArtworkThumbhash: String? = nil
+    ) {
+        sectionItem = item
+        contentId = item.contentId
+        title = item.title
+        seriesTitle = item.seriesTitle
+        seasonNumber = item.seasonNumber
+        episodeNumber = item.episodeNumber
+        positionSeconds = item.positionSeconds
+        durationSeconds = item.durationSeconds
+        artworkUrl = preferredArtworkUrl ?? item.backdropUrl
+        artworkThumbhash = preferredArtworkThumbhash ?? item.backdropThumbhash
+    }
+}
+
+struct PlayerBackendCapabilities: Equatable {
+    let supportsSecondarySubtitles: Bool
+    let supportsSubtitleDelay: Bool
+    let supportsSubtitleStyling: Bool
+
+    static func aether(
+        subtitleOverlayControls: Bool,
+        hasTextSubtitleTrack: Bool
+    ) -> PlayerBackendCapabilities {
+        PlayerBackendCapabilities(
+            supportsSecondarySubtitles: hasTextSubtitleTrack,
+            supportsSubtitleDelay: subtitleOverlayControls,
+            supportsSubtitleStyling: subtitleOverlayControls
+        )
+    }
+}
+
+/// Video playback teardown at an app identity boundary — sign-out, server or
+/// profile switch, or a cleared session.
+///
+/// Those transitions replace the authenticated view hierarchy, which removes
+/// the player cover. That path deliberately defers the player's `cleanup()`
+/// while Picture in Picture is engaged, so nothing else ends an engaged video
+/// session: the previous identity's engine, its open server playback session,
+/// and a live PiP window would otherwise all survive into the next identity.
+///
+/// Callable from the shared auth paths on every platform; a no-op where video
+/// Picture in Picture is not hosted.
+enum PlayerIdentityBoundary {
+    static func endEngagedVideoPictureInPicture() {
+        #if os(iOS)
+        PictureInPictureCoordinator.endEngagedSessionForIdentityChange()
+        #endif
+    }
+}
+
+@MainActor
+@Observable
+class PlayerViewModel {
+    private let initialLibraryId: Int?
+    var libraryId: Int? {
+        if let lastLoadRequest { return lastLoadRequest.libraryId }
+        return initialLibraryId
+    }
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.cubbiestream.kyro",
+        category: "Player"
+    )
+
+    fileprivate let aetherPlaybackController: AetherPlaybackController
+    @ObservationIgnored
+    private var activeAetherLoadEpoch: AetherPlaybackController.LoadEpoch?
+    /// The epoch whose `finishLoad` has returned, i.e. whose engine startup ran
+    /// to completion and whose decode route is therefore settled.
+    ///
+    /// Aether publishes its track inventory during startup (`streamsProbed`),
+    /// several steps before it dispatches the source onto a backend. Applying a
+    /// deferred track pick at that point makes the engine rebuild its pipeline
+    /// against a route it has not chosen yet — on a software-decode source
+    /// (VC-1, AV1) the rebuild lands on the native path, which rejects the
+    /// codec, kills the in-flight load and leaves the app on a spinner. Nothing
+    /// that drives the engine off a *pending* selection may run before this is
+    /// set for the current epoch.
+    @ObservationIgnored
+    private var establishedAetherLoadEpoch: AetherPlaybackController.LoadEpoch?
+    @ObservationIgnored
+    private var committedProtocolV3LoadEpoch: AetherPlaybackController.LoadEpoch?
+    @ObservationIgnored
+    private var pendingProtocolV3FirstFrameEpoch: AetherPlaybackController.LoadEpoch?
+    @ObservationIgnored
+    private var pendingProtocolV3SeekReanchorPosition: Double?
+    /// The load epoch whose startup milestone (`handleFileLoaded`) has already
+    /// run. Video loads reach that milestone on Aether's first frame; audio-only
+    /// loads have no picture and reach it when the audio route starts playing.
+    /// Both funnel through one epoch-scoped latch so a load can never take the
+    /// milestone twice.
+    private var startedAetherLoadEpoch: AetherPlaybackController.LoadEpoch?
+    /// A user track change that arrived while a replan was already in flight.
+    /// Re-issued when the in-flight replan settles so the local selection the
+    /// UI already shows is actually applied by the server. Position is
+    /// re-read at drain time — playback moved on while we waited.
+    @ObservationIgnored
+    private var pendingProtocolV3TrackChange: QueuedProtocolV3TrackChange?
+    private let scrubPreviewProvider: AetherScrubPreviewProvider
+    /// Fetches the server's seek-bar previews for `serverTrickplayKey`, the
+    /// item and file they belong to.
+    @ObservationIgnored
+    private var serverTrickplayTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var serverTrickplayKey: String?
+    /// Fetches Seekr title-level scrub previews when enabled.
+    @ObservationIgnored
+    private var seekrPreviewTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var seekrPreviewKey: String?
+    /// Content key used to persist the manual Seekr sync offset.
+    @ObservationIgnored
+    private var seekrSyncTitleKey: String?
+    var assSubtitles: ASSSubtitleSession { aetherPlaybackController.assSubtitles }
+    var subtitleCueHold: SubtitleCueHold { aetherPlaybackController.cueHold }
+    var aetherEngine: AetherEngine { aetherPlaybackController.engine }
+    private var hasActiveAetherSession: Bool {
+        aetherPlaybackController.activeSpec != nil
+    }
+
+    /// Keeps the auxiliary Aether still decoder in the same lifetime as the
+    /// transport. Replacement loads preserve Aether's display/audio handoff;
+    /// callers that own final teardown can await the returned task.
+    @discardableResult
+    private func disposeAetherPlayback(forReplacement: Bool = false) -> Task<Void, Never>? {
+        let previewShutdown = scrubPreviewProvider.endSession()
+        isLoadingSubtitles = false
+        activeAetherLoadEpoch = nil
+        establishedAetherLoadEpoch = nil
+        committedProtocolV3LoadEpoch = nil
+        pendingProtocolV3FirstFrameEpoch = nil
+        pendingProtocolV3SeekReanchorPosition = nil
+        pendingProtocolV3TrackChange = nil
+        // Seekr sheets are title-scoped. Always drop them on dispose so a
+        // replacement load cannot briefly scrub another title's tiles. Same-file
+        // replans reload via `loadSeekrPreviews` after activate.
+        clearSeekrPreviews()
+        if forReplacement {
+            aetherPlaybackController.prepareForReplacement()
+        } else {
+            aetherPlaybackController.stop()
+            clearServerTrickplay()
+        }
+        return previewShutdown
+    }
+
+    /// Hands the scrub previews the server's thumbnails for the file being
+    /// played, when its version has them. A reload of the same file, such as
+    /// a replan or quality switch, keeps the sheets already fetched.
+    private func loadServerTrickplay(for prepared: PreparedPlayback) {
+        let version = prepared.selectedVersion
+        guard version.trickplayAvailable == true else {
+            clearServerTrickplay()
+            return
+        }
+        let contentId = prepared.watchDetail.contentId
+        let fileId = version.fileId
+        let key = "\(contentId)#\(fileId)"
+        guard key != serverTrickplayKey else { return }
+        clearServerTrickplay()
+        serverTrickplayKey = key
+        serverTrickplayTask = Task { [weak self] in
+            let trickplay: ServerTrickplay
+            do {
+                trickplay = try await SiloAPI.shared.watchTrickplay(contentId: contentId, fileId: fileId)
+            } catch {
+                // A cancelled request was cleared, and the key may already
+                // name its replacement.
+                guard !Task.isCancelled else { return }
+                // Stills from the player's cache remain the fallback. Forget
+                // the key so a later load of the same file tries again.
+                Self.logger.info("Seek-bar previews unavailable: \(error.localizedDescription, privacy: .public)")
+                if let self, self.serverTrickplayKey == key { self.serverTrickplayKey = nil }
+                return
+            }
+            // The prefetch does not hold the view model.
+            let sheets = self?.installServerTrickplay(trickplay, contentId: contentId, key: key)
+            await sheets?.prefetch()
+        }
+    }
+
+    /// Hands the scrub previews the sheets for `key`, unless the load was
+    /// cleared or replaced meanwhile.
+    private func installServerTrickplay(
+        _ trickplay: ServerTrickplay,
+        contentId: String,
+        key: String
+    ) -> ServerTrickplaySheets? {
+        guard !Task.isCancelled, serverTrickplayKey == key else { return nil }
+        let fileId = trickplay.fileId
+        let sheets = ServerTrickplaySheets(trickplay) {
+            try? await SiloAPI.shared.watchTrickplay(contentId: contentId, fileId: fileId)
+        }
+        scrubPreviewProvider.serverPreviews = sheets
+        return sheets
+    }
+
+    private func clearServerTrickplay() {
+        serverTrickplayTask?.cancel()
+        serverTrickplayTask = nil
+        serverTrickplayKey = nil
+        if let sheets = scrubPreviewProvider.serverPreviews {
+            Task { await sheets.shutdown() }
+        }
+        scrubPreviewProvider.serverPreviews = nil
+    }
+
+    /// Loads Seekr scrub previews for the playing title when the user has
+    /// enabled them and external ids are available. Missing titles and
+    /// network failures leave playback unchanged.
+    private func loadSeekrPreviews(for prepared: PreparedPlayback) {
+        let durationSeconds = prepared.session.durationSeconds
+            ?? prepared.selectedVersion.duration
+            ?? duration
+        loadSeekrPreviews(watchDetail: prepared.watchDetail, durationSeconds: durationSeconds)
+    }
+
+    /// Mid-session enable path: use the active title without restarting playback.
+    private func reloadSeekrPreviewsForCurrentPlayback() {
+        guard let detail = currentWatchDetail else {
+            clearSeekrPreviews()
+            return
+        }
+        let durationSeconds = currentSelectedVersion?.duration ?? duration
+        loadSeekrPreviews(watchDetail: detail, durationSeconds: durationSeconds)
+    }
+
+    func applySeekrPreviewsEnabled(_ enabled: Bool) {
+        guard !isDisposed else { return }
+        if enabled {
+            reloadSeekrPreviewsForCurrentPlayback()
+        } else {
+            clearSeekrPreviews()
+            // Drop the displayed still only if its source was Seekr, so disabling
+            // Seekr does not clear an active cache, server, or extractor preview.
+            if scrubPreviewImageSource == .seekr {
+                scrubPreviewImage = nil
+                scrubPreviewImageSourceTime = nil
+                scrubPreviewImageSource = nil
+            }
+        }
+    }
+
+    func setScrubPreviewForTesting(
+        image: CGImage?,
+        sourceTime: Double?,
+        source: AetherScrubPreviewProvider.Source?
+    ) {
+        self.scrubPreviewImage = image
+        self.scrubPreviewImageSourceTime = sourceTime
+        self.scrubPreviewImageSource = source
+    }
+
+    private func loadSeekrPreviews(watchDetail: WatchDetail, durationSeconds: Double?) {
+        guard SeekrPreviewSettings.shared.previewsEnabled else {
+            clearSeekrPreviews()
+            return
+        }
+        guard SeekrCredentials.apiKey() != nil else {
+            clearSeekrPreviews()
+            return
+        }
+        let resolvedDuration = durationSeconds ?? duration
+        let durationMs = Int64((max(resolvedDuration, 0) * 1_000).rounded())
+        guard durationMs > 0 else {
+            clearSeekrPreviews()
+            return
+        }
+        let contentId = watchDetail.contentId
+        let key = "seekr:\(contentId)#\(durationMs)"
+        guard key != seekrPreviewKey else { return }
+        clearSeekrPreviews()
+        seekrPreviewKey = key
+        seekrPreviewTask = Task { [weak self] in
+            guard let content = await self?.resolveSeekrContent(for: watchDetail) else {
+                await MainActor.run {
+                    if let self, self.seekrPreviewKey == key { self.seekrPreviewKey = nil }
+                }
+                return
+            }
+            guard !Task.isCancelled else { return }
+            // Re-check the toggle after the network hop so a mid-flight disable
+            // never installs sheets.
+            let stillEnabled = await MainActor.run {
+                SeekrPreviewSettings.shared.previewsEnabled && self?.seekrPreviewKey == key
+            }
+            guard stillEnabled, !Task.isCancelled else { return }
+            let outcome = await SeekrClient.shared.loadTrack(content: content, durationMs: durationMs)
+            guard !Task.isCancelled else { return }
+            switch outcome {
+            case let .success(track):
+                let titleKey = content.cacheKey
+                let install: (offset: Int64, currentTime: Double, allowed: Bool) = await MainActor.run {
+                    guard let self,
+                          !self.isDisposed,
+                          SeekrPreviewSettings.shared.previewsEnabled,
+                          self.seekrPreviewKey == key,
+                          self.currentWatchDetail?.contentId == contentId else {
+                        return (0, 0, false)
+                    }
+                    let offset = Int64(SeekrPreviewSettings.shared.syncOffsetMs(forTitleKey: titleKey))
+                    return (offset, self.currentTime, true)
+                }
+                guard install.allowed else {
+                    return
+                }
+                let sheets = SeekrPreviewSheets(track: track, offsetMs: install.offset)
+                let installed = await MainActor.run { () -> Bool in
+                    guard let self,
+                          !self.isDisposed,
+                          SeekrPreviewSettings.shared.previewsEnabled,
+                          self.seekrPreviewKey == key,
+                          self.currentWatchDetail?.contentId == contentId else {
+                        return false
+                    }
+                    self.seekrSyncTitleKey = titleKey
+                    self.scrubPreviewProvider.seekrPreviews = sheets
+                    return true
+                }
+                if installed {
+                    await sheets.warm(aroundSourceSeconds: install.currentTime)
+                } else {
+                    await sheets.shutdown()
+                }
+            case .failure:
+                // Still frames and server trickplay remain the fallback.
+                await MainActor.run {
+                    if let self, self.seekrPreviewKey == key { self.seekrPreviewKey = nil }
+                }
+            }
+        }
+    }
+
+    /// Resolves TMDB/IMDb identifiers for Seekr. Episodes need the series'
+    /// ids plus season/episode from the watch detail.
+    private func resolveSeekrContent(for detail: WatchDetail) async -> SeekrContent? {
+        let contentId = detail.contentId
+        if detail.type == "episode",
+           let season = detail.seasonNumber,
+           let episode = detail.episodeNumber {
+            let seriesId = detail.seriesId ?? contentId
+            // Episode TMDB/IMDb ids are per-episode; Seekr needs the show ids.
+            if let series = try? await SiloAPI.shared.itemDetail(contentId: seriesId) {
+                let content = SeekrContent.episode(
+                    showTmdbId: series.tmdbId.flatMap { Int($0) },
+                    showImdbId: series.imdbId,
+                    season: season,
+                    episode: episode
+                )
+                if content.isValid { return content }
+            }
+            return nil
+        }
+
+        if let item = try? await SiloAPI.shared.itemDetail(contentId: contentId) {
+            let content = SeekrContent.movie(
+                tmdbId: item.tmdbId.flatMap { Int($0) },
+                imdbId: item.imdbId
+            )
+            if content.isValid { return content }
+        }
+        return nil
+    }
+
+    private func clearSeekrPreviews() {
+        seekrPreviewTask?.cancel()
+        seekrPreviewTask = nil
+        seekrPreviewKey = nil
+        seekrSyncTitleKey = nil
+        if let sheets = scrubPreviewProvider.seekrPreviews {
+            Task { await sheets.shutdown() }
+        }
+        scrubPreviewProvider.seekrPreviews = nil
+    }
+
+    /// True when Seekr sheets are installed for the current title.
+    var hasSeekrPreviews: Bool { scrubPreviewProvider.seekrPreviews != nil }
+
+    /// Manual Seekr preview sync for the current title, in milliseconds.
+    var seekrPreviewSyncOffsetMs: Int {
+        get {
+            guard let key = seekrSyncTitleKey else { return 0 }
+            return SeekrPreviewSettings.shared.syncOffsetMs(forTitleKey: key)
+        }
+        set {
+            guard let key = seekrSyncTitleKey else { return }
+            SeekrPreviewSettings.shared.setSyncOffsetMs(newValue, forTitleKey: key)
+            let sheets = scrubPreviewProvider.seekrPreviews
+            let offset = Int64(newValue)
+            Task { await sheets?.updateOffsetMs(offset) }
+        }
+    }
+
+    var isPlaying = false
+    var currentTime: Double = 0 {
+        didSet { updateCreditsWindow() }
+    }
+    var duration: Double = 0
+    var title: String = ""
+    var isLoading = true
+    var isBuffering = false
+    /// The engine phase last reported for the active load. Kept so a source
+    /// stall can be re-judged as the playhead moves or stops.
+    @ObservationIgnored
+    private var aetherPhase: PlaybackPhase = .idle
+    /// When the playhead last moved, on any load.
+    @ObservationIgnored
+    private var playheadSample: (seconds: Double, movedAt: ContinuousClock.Instant)?
+    /// Where the software route's last seek landed, until its clock moves on.
+    @ObservationIgnored
+    private var softwareSeekLanding = SoftwareSeekLanding()
+    /// Whether the native clock has moved since AVPlayer began reporting
+    /// `.playing`.
+    @ObservationIgnored
+    private var playingClockAdvance = PlayingClockAdvance()
+    /// Since when the engine has held no media ahead of its clock, sampled
+    /// while the source is stalled. nil while media is buffered ahead.
+    @ObservationIgnored
+    private var stalledBufferEmptySince: ContinuousClock.Instant?
+    /// Re-judges a `.stalled` phase while it lasts; see `PlayerStallPresentation`.
+    @ObservationIgnored
+    private var sourceStallWatch: Task<Void, Never>?
+    var isLoadingSubtitles = false {
+        didSet {
+            guard isLoadingSubtitles != oldValue else { return }
+            subtitleSync.setActiveTrackLoading(isLoadingSubtitles)
+        }
+    }
+    /// Fill progress (0–100) toward the buffering-resume threshold; nil
+    /// when not buffering or when the active backend doesn't report it.
+    var bufferingProgress: Double?
+    var error: String?
+    var showControls = false
+    #if os(iOS)
+    var shouldShowMobilePlayerChrome: Bool {
+        // Loading and Next Up must not independently reveal player chrome.
+        // Their close button follows the same tap/auto-hide state as transport.
+        showControls
+    }
+    #endif
+    var activeNotice: PlayerNotice?
+    /// False when the failure behind `error` is a `PlaybackV3TerminalFailure`
+    /// marked not retryable (the server's terminal outcome for an empty or
+    /// damaged source, for example), so the error view offers no Retry that
+    /// would only fail the same way again.
+    var errorIsRetryable = true
+    /// Mid-stream connection state (§6.2): `reconnecting` while the player
+    /// retries after the server dropped, `lost` once it gave up.
+    private(set) var connectionState: PlaybackConnectionState = .connected {
+        didSet { if connectionState != oldValue { syncBufferingQualitySignals() } }
+    }
+    var isReconnecting: Bool { connectionState == .reconnecting }
+    /// The notice the player shows: the reconnect status while it runs,
+    /// otherwise the latest transient notice.
+    var presentedNotice: PlayerNotice? {
+        isReconnecting ? Self.reconnectingNotice : activeNotice
+    }
+    /// The error view's retry action, which restarts the reconnect after the
+    /// player gave up on a lost connection.
+    var retryButtonTitle: String {
+        connectionState == .lost ? "Try again" : "Retry"
+    }
+    private static let reconnectingNotice = PlayerNotice(
+        title: "Reconnecting…",
+        message: "The connection to the server was lost. Playback will continue where you left off.",
+        tone: .info
+    )
+    static let connectionLostMessage =
+        "Connection lost\nSilo couldn't reconnect to the server. Check your connection, then try again to continue where you left off."
+    var remoteDismissToken: UUID?
+    var audioTracks: [PlayerTrack] = []
+    var subtitleTracks: [PlayerTrack] = [] {
+        didSet { updateSubtitleSyncActiveTrack() }
+    }
+    /// Realtime AI cues stay in Silo's product layer because Aether 6.34 does
+    /// not expose a host cue-injection API. The presentation overlay merges
+    /// these normalized source-time cues with Aether's decoded cue arrays.
+    var livePrimarySubtitleCues: [LiveSubtitleCue] = []
+    var liveSecondarySubtitleCues: [LiveSubtitleCue] = []
+    /// Server-resolved preferred subtitle language for the current item,
+    /// snapshotted at prepare time. Used only to float the matching
+    /// language group to the top of the displayed track lists.
+    private var subtitleOrderingLanguage: String?
+    var chapters: [PlayerChapterInfo] = []
+    var introRange: TimeRange?
+    var recapRange: TimeRange? {
+        didSet { updateCreditsWindow() }
+    }
+    var creditsRange: TimeRange? {
+        didSet { updateCreditsWindow() }
+    }
+    /// Whether the playhead is inside `creditsRange`. Stored so readers of
+    /// `showCreditsSkip` change only on entering or leaving the credits, not
+    /// on every clock tick.
+    private(set) var isInCreditsWindow = false
+    private(set) var isInRecapWindow = false
+    /// The intro-skip pill — `ask`'s "Skip Intro" offer or `always`'s undo.
+    /// See IntroSkipPrompt.swift and the server's intro-skip-mode spec.
+    let introSkipPrompt = IntroSkipPrompt()
+    /// Lowers quality when playback keeps buffering, with its prompt and undo
+    /// pills. See BufferingQualityController.swift and the server's
+    /// buffering-quality spec.
+    let bufferingQuality: BufferingQualityController
+    /// Turns playback facts into the controller's media events.
+    @ObservationIgnored private var bufferingSignals = BufferingSignalMapper()
+    /// The buffering controller's clock, which also times the reader's ticks.
+    @ObservationIgnored private let bufferingClock: PlayerPromptClock
+    /// What the engine's reader receives from the origin: outage silence and
+    /// the plan's `throughput_kbps`.
+    @ObservationIgnored private var upstreamMeter = UpstreamReadMeter()
+    /// The device's own receive count, for what a shared link delivered.
+    @ObservationIgnored private var interfaceReceiveCounter = InterfaceReceiveCounter()
+    /// Numbers each adopted plan, so a replan that comes back with the same
+    /// server `plan_id` is still a new plan to the controller.
+    @ObservationIgnored private var bufferingPlanRevision: UInt64 = 0
+    /// An adopted plan a `plan_summary` can still name.
+    private struct BufferingPlanEntry {
+        /// The controller's id for it.
+        let id: String
+        let prepared: PreparedPlaybackV3
+        let sessionId: String
+        /// Its summary's `event_id`, the same for every copy the device
+        /// keeps and sends, so the server takes it once.
+        let summaryEventId = UUID().uuidString.lowercased()
+        let adoptedAt = Date()
+    }
+    /// The playing plan, which its `plan_summary` names.
+    @ObservationIgnored private var bufferingPlan: BufferingPlanEntry?
+    /// The controller's id for the current plan. Read by tests.
+    var bufferingPlanId: String? { bufferingPlan?.id }
+    /// `streamLoadGeneration` when the current plan was adopted. A replan or
+    /// load started since then is a reload until its own plan is adopted.
+    @ObservationIgnored private var bufferingAdoptedStreamLoadGeneration: UInt64?
+    /// A same-plan reload (credential refresh, background restore) whose
+    /// transport has not played yet.
+    @ObservationIgnored private var bufferingReloadEpoch: AetherPlaybackController.LoadEpoch?
+    /// Re-reads the playback facts that no engine event announces: a renderer
+    /// wait's buffer draining into a stall, and the software route's clock
+    /// stopping.
+    @ObservationIgnored private var bufferingSignalPoll: Task<Void, Never>?
+    /// The stream load whose source swap has begun.
+    @ObservationIgnored private var bufferingSourceSwapGeneration: UInt64?
+    /// Whether this player last told the speed scheduler it loads or plays.
+    @ObservationIgnored private var speedTestHoldActive = true
+    /// A **Restore quality** the player could not send while another replan
+    /// or a start was in flight; sent when that one settles.
+    @ObservationIgnored private var deferredBufferingRestore: BufferingQualityController.ReplanRequest?
+    /// The deferred Restore's `learned_limit: "clear"`, until a request
+    /// carries it: the Restore itself, or the start or replan that replaces
+    /// it. It goes out once. Read by tests.
+    @ObservationIgnored private(set) var owesBufferingLearnedLimitClear = false
+    /// The failure of a load whose missed start deadline the buffering
+    /// controller answered with a lowering, until that lowering's plan is
+    /// adopted. A lowering refused, failed or never adopted hands it to the
+    /// usual recovery.
+    @ObservationIgnored private var heldStartDeadlineFailure: HeldStartDeadlineFailure?
+    private struct HeldStartDeadlineFailure {
+        let loadEpoch: AetherPlaybackController.LoadEpoch?
+        let recovery: (position: Double, classification: String, message: String)
+    }
+    /// The playing plan's own start deadline, on a route AetherEngine sets
+    /// none for, from the plan's adoption until its first frame, its end or
+    /// the next plan.
+    @ObservationIgnored private var armedStartDeadline: ArmedStartDeadline?
+    @ObservationIgnored private var startDeadlineTimer: PlayerPromptTimer?
+    private struct ArmedStartDeadline {
+        let loadEpoch: AetherPlaybackController.LoadEpoch
+        var deadline: PlaybackStartDeadline
+    }
+    /// The viewer's quality change on its way: a pick, a version switch or
+    /// the move to the other connection's quality, sent and not yet adopted
+    /// or refused. A newer one supersedes it.
+    @ObservationIgnored private var pendingViewerQualityChange: UInt64?
+    @ObservationIgnored private var viewerQualityChangeSerial: UInt64 = 0
+    /// The app is in the background, or the Mac's player window can't be
+    /// seen: the player cannot show its pills.
+    private(set) var isPlayerSurfaceHidden = false
+    /// A sheet covers the player where its pills show (iPhone and iPad).
+    private(set) var isPlayerCoveredBySheet = false
+    /// A buffering notice waiting for the notice slot: it shows once the
+    /// player can show it and no other notice holds the slot.
+    @ObservationIgnored private var pendingBufferingNotice: BufferingQualityController.Notice?
+    @ObservationIgnored private var surfaceVisibilityObservers: [NSObjectProtocol] = []
+    #if os(macOS)
+    /// Resigning active keeps the plan's running summary; quitting ends it.
+    @ObservationIgnored private var macBufferingSummaryObservers: [NSObjectProtocol] = []
+    #endif
+    var selectedAudioId: Int64?
+    var selectedSubtitleId: Int64? {
+        didSet {
+            guard selectedSubtitleId != oldValue else { return }
+            updateSubtitleSyncActiveTrack()
+        }
+    }
+    var selectedSecondarySubtitleId: Int64?
+    var qualityOptions: [ApplePlaybackQualityOption] = [ApplePlaybackQuality.auto]
+    var activeQualityId: String = ApplePlaybackQuality.autoId
+    /// False when the plan offers a single quality; the in-player quality
+    /// controls are hidden then. The saved preference is left alone.
+    var hasQualityChoice: Bool { ApplePlaybackQuality.hasChoice(among: qualityOptions) }
+    var isQualitySwitching = false
+    var qualitySwitchError: String?
+    var isScrubbing = false
+    var scrubPreviewTime: Double = 0
+    /// Latest generation-fenced Aether still for the active scrub target.
+    /// Nil is a first-class state: native cache misses and sources that cannot
+    /// vend an independent reader keep the existing time-only affordance.
+    var scrubPreviewImage: CGImage?
+    private(set) var scrubPreviewImageSourceTime: Double?
+    private(set) var scrubPreviewImageSource: AetherScrubPreviewProvider.Source?
+    /// True while the iOS touch-and-hold fast-forward gesture is engaged.
+    /// The temporary rate is applied straight to the backend and never
+    /// persisted, so releasing always restores `settings.playbackSpeed`.
+    var isHoldFastForwarding = false
+    /// Seconds of media buffered ahead of `currentTime`, projected from
+    /// Aether's public telemetry. The scrubber omits its buffered layer when
+    /// the active route cannot report a comparable value.
+    var bufferedAheadSeconds: Double = 0
+    /// End of the buffered range as a fraction of `duration`, clamped to 0...1.
+    var bufferedEndFraction: Double {
+        guard duration > 0 else { return 0 }
+        return min(max((currentTime + bufferedAheadSeconds) / duration, 0), 1)
+    }
+    /// Diagnostics for the stats panels. Projected on read and cached per
+    /// `playbackStatsRevision`, so nothing is formatted while no panel is on
+    /// screen.
+    var playbackStats: PlaybackStats {
+        let revision = playbackStatsRevision
+        if let cached = cachedPlaybackStats, cached.revision == revision {
+            return cached.stats
+        }
+        let stats = projectPlaybackStats()
+        cachedPlaybackStats = (revision, stats)
+        return stats
+    }
+    /// Bumped when the stats inputs change; panels observe it through
+    /// `playbackStats`.
+    private var playbackStatsRevision: UInt64 = 0
+    @ObservationIgnored
+    private var cachedPlaybackStats: (revision: UInt64, stats: PlaybackStats)?
+    @ObservationIgnored
+    private var playbackStatsRevisedAt: Date = .distantPast
+    var showNextUpScreen = false
+    /// A Next Up load keeps its preview until the successor's own startup
+    /// milestone. Repeated actions cannot reload it or expand an unready frame.
+    private(set) var isNextUpTransitioning = false
+    var nextUpEpisode: PlayerNextUpEpisode?
+    var nextUpOnDeckItems: [PlayerOnDeckItem] = []
+    var isLoadingNextUpEpisode = false
+    var isLoadingNextUpOnDeck = false
+    var nextUpLookupError: String?
+    /// Set when an autoplay-initiated `beginFreshLoad` fails (timeout or any
+    /// other error during `startSession`). Surfaces a recoverable message in
+    /// the Next Up screen's `finishedMessage` instead of taking over the whole
+    /// player with `viewModel.error`. Cleared by `resetPublishedLoadState` on
+    /// the next successful load.
+    var nextUpStartError: String?
+    var nextUpCountdownSeconds: Int?
+    var nextUpCountdownTotalSeconds: Int = 10
+    var nextUpScreenVideoEnded = false
+    /// Set while this playback belongs to a shuffle: the up-next screen
+    /// offers the server's pick instead of the series' next episode, and
+    /// every pick plays from its beginning.
+    private(set) var shuffleState: PlayerShuffleState?
+    /// Stop shuffling clears `shuffleState` before the player closes; the
+    /// close still returns to the page the shuffle started from.
+    private var stoppedShuffling = false
+    private(set) var isAdvancingShuffle = false
+    private(set) var isPickingAnotherShufflePick = false
+    /// A shuffle action that failed, shown on the up-next screen.
+    private(set) var shuffleActionError: String?
+    @ObservationIgnored
+    private var shuffleTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var shuffleRefreshTask: Task<Void, Never>?
+    private enum NextUpPresentationSource {
+        case automatic
+        case hud
+        /// Skip Credits reached the end of the file. The credits keep playing
+        /// in the preview while a fixed countdown runs.
+        case credits
+    }
+    private var nextUpPresentationSource: NextUpPresentationSource = .automatic
+    private var serverProvidedChapters: [PlayerChapterInfo] = []
+
+    /// Secondary metadata surfaced to the player overlay. Populated from
+    /// `WatchDetail` + `FileVersion` once `PlaybackSessionBridge.startSession`
+    /// resolves. Empty until then; the overlay hides the corresponding rows.
+    var metadata: PlayerMetadata = .empty
+
+    /// True while the tvOS floating options HUD is presented. Single source
+    /// of truth so both `TVPlayerControls` (presentation) and `PlayerView`
+    /// (shell-level Menu / exit handling) can agree on state without relying
+    /// on an indirection flag. Driven by `openHUD()` / `closeHUD()`.
+    var isHUDPresented = false
+
+    /// True while the intro-skip pill is on screen. Its timer, not the intro's
+    /// range, decides this: the pill is up for a few seconds, not the whole
+    /// intro.
+    var showIntroSkip: Bool {
+        introSkipPrompt.isVisible
+    }
+
+    /// The buffering prompt or undo pill while it is on screen.
+    var bufferingPill: BufferingQualityController.Pill? {
+        bufferingQuality.pill
+    }
+
+    var showBufferingPill: Bool {
+        bufferingQuality.pill != nil
+    }
+
+    private var markerPlaybackHasStarted: Bool {
+        guard let epoch = activeAetherLoadEpoch else { return false }
+        return startedAetherLoadEpoch == epoch
+    }
+
+    var showCreditsSkip: Bool {
+        // A party member who may not seek has nothing to press.
+        markerPlaybackHasStarted && !isLoading && isInCreditsWindow && canRequestSeek
+    }
+
+    var showRecapSkip: Bool {
+        markerPlaybackHasStarted && !isLoading && isInRecapWindow && canRequestSeek
+    }
+    var showSegmentSkip: Bool { showRecapSkip || showCreditsSkip }
+    var segmentSkipLabel: String { showRecapSkip ? "Skip Recap" : "Skip Credits" }
+
+    func skipCurrentSegment() {
+        if showRecapSkip, let recapRange {
+            seekTo(seconds: recapRange.end)
+        } else if showCreditsSkip {
+            skipCredits()
+        }
+    }
+
+    private func updateCreditsWindow() {
+        let inRecap = recapRange.map { currentTime >= $0.start && currentTime < $0.end } ?? false
+        if isInRecapWindow != inRecap { isInRecapWindow = inRecap }
+        let inWindow = creditsRange.map { currentTime >= $0.start && currentTime < $0.end } ?? false
+        if isInCreditsWindow != inWindow { isInCreditsWindow = inWindow }
+    }
+
+    /// Signed rate of an in-flight seek session. Zero when the user isn't
+    /// in seek mode. Positive = forward, negative = backward. Magnitudes
+    /// are drawn from `Self.seekRates`. Entered by holding an arrow past
+    /// the tap threshold; exited via Select (commit) or Menu (cancel).
+    /// Within the session, D-pad Left/Right step the rate along the signed
+    /// `seekRates` ladder.
+    ///
+    /// Observed by the tvOS shell to render the indicator chip and to
+    /// keep the focus sink alive so press events aren't orphaned by a
+    /// focus shift to the scrubber.
+    var holdSeekRate: Int = 0
+    /// Convenience — any non-zero rate means we're actively seeking.
+    var isHoldSeeking: Bool { holdSeekRate != 0 }
+
+    #if os(tvOS)
+    enum TVHUDEntryPoint: Equatable {
+        case settings
+    }
+
+    var requestedTVHUDEntryPoint: TVHUDEntryPoint?
+    #endif
+
+    /// Signed speed ladder the user steps through with Left/Right taps
+    /// during a seek session. No zero: "pause" is spelled as Select
+    /// (commit) or Menu (cancel) rather than a neutral rate. The ladder
+    /// tops out at 32× so a long file can be traversed in a few seconds
+    /// of tapping; the auto-ramp on entry only reaches 8× so the faster
+    /// rates require deliberate user steering.
+    static let seekRates: [Int] = [-32, -16, -8, -4, -2, -1, 1, 2, 4, 8, 16, 32]
+
+    /// Canonical user volume/mute, owned by the VM. A fresh Aether load can
+    /// replace its internal route, so the VM reapplies these values and keeps
+    /// the cast UI in sync.
+    private var userVolume: Float = 1.0
+    private var userMuted = false
+    private var streamLoadGeneration: UInt64 = 0
+    var backendCapabilities: PlayerBackendCapabilities {
+        let engine = aetherPlaybackController.engine
+        let nativeSubtitleIsSelected = engine.activeSubtitleTrackIndex.flatMap { selectedID in
+            engine.subtitleTracks.first { $0.id == selectedID }
+        }?.isNativelyRenderedSubtitle == true
+        return .aether(
+            subtitleOverlayControls: !nativeSubtitleIsSelected,
+            hasTextSubtitleTrack: subtitleTracks.contains {
+                !SubtitleCodecClassifier.isBitmap($0.codec)
+            }
+        )
+    }
+    var activeRouteLabel: String {
+        guard let delivery = aetherPlaybackController.activeSpec?.delivery else {
+            return "AetherEngine"
+        }
+        switch delivery {
+        case PlaybackProtocolV3.PlanDelivery.originalHTTP: return "Original"
+        case PlaybackProtocolV3.PlanDelivery.remuxProgressive: return "Server Remux"
+        case PlaybackProtocolV3.PlanDelivery.remuxHLS: return "Server Remux HLS"
+        case PlaybackProtocolV3.PlanDelivery.transcodeHLS: return "Server Transcode HLS"
+        default: return delivery.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+    /// One-line, user-facing Aether route description for the player HUD.
+    var playbackRouteDisplay: String {
+        "AetherEngine · \(activeRouteLabel)"
+    }
+    var routeStatusRows: [PlayerRouteStatusRow] {
+        [
+            PlayerRouteStatusRow(label: "Playback", value: activeRouteLabel),
+            PlayerRouteStatusRow(label: "Engine", value: "AetherEngine"),
+            PlayerRouteStatusRow(
+                label: "Route",
+                value: aetherPlaybackController.engine.videoRoute.rawValue
+            ),
+        ]
+    }
+    var routeDecisionSummary: String? {
+        activePreparedProtocolV3?.plan.decisionReason
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
+    }
+    var routeWarnings: [String] {
+        activePreparedProtocolV3?.plan.degradationWarnings.map(\.message) ?? []
+    }
+    var hasTrackSelectionOptions: Bool { !audioTracks.isEmpty || !subtitleTracks.isEmpty }
+    var supportsSecondarySubtitles: Bool { backendCapabilities.supportsSecondarySubtitles }
+    /// `subtitleTracks` grouped by language and sorted by preferred format
+    /// for display. The stored array stays in source/append order (the
+    /// selection and track-replacement logic depends on it); ordering is a
+    /// display-only projection. The two in-player pickers iterate this.
+    var orderedSubtitleTracks: [PlayerTrack] {
+        orderedSubtitles(subtitleTracks)
+    }
+    var availableSecondarySubtitleTracks: [PlayerTrack] {
+        guard backendCapabilities.supportsSecondarySubtitles else { return [] }
+        return orderedSubtitles(subtitleTracks.filter {
+            !SubtitleCodecClassifier.isBitmap($0.codec) && canRenderAsSecondarySubtitle($0)
+        })
+    }
+    private func orderedSubtitles(_ tracks: [PlayerTrack]) -> [PlayerTrack] {
+        SubtitleDisplayOrder.order(tracks, preferredLanguage: subtitleOrderingLanguage) { track in
+            SubtitleDisplayOrder.Descriptor(
+                language: track.lang,
+                codec: track.codec,
+                isForced: track.isForced,
+                isHearingImpaired: track.isHearingImpaired,
+                isDefault: track.isDefault
+            )
+        }
+    }
+    /// Set in `cleanup()` / `deinit`. All async callbacks into the VM gate
+    /// on this so a late-landing handoff signal can't spin up a fresh
+    /// pipeline on a view that's already gone.
+    private var isDisposed = false
+    var needsReplacementForPresentation: Bool { isDisposed }
+    /// Whether Aether currently has a receiver-fetchable native video route.
+    /// Header-authenticated remote HLS remains false because the receiver
+    /// cannot reproduce the sender's AVURLAsset request headers.
+    private(set) var supportsExternalPlayback = false
+    #if os(iOS)
+    private var isPlayerPresentationVisible = false
+    /// AVKit's restore completion handler, held while the re-presented cover
+    /// is still on its way to `PlayerView.onAppear`. See
+    /// `restorePictureInPictureUserInterface`.
+    private var pendingRestoreCompletion: ((Bool) -> Void)?
+    private var pendingRestoreTimeoutTask: Task<Void, Never>?
+    /// How long the re-presented cover gets to actually mount before the
+    /// restore is treated as failed. Generous next to a SwiftUI presentation,
+    /// short next to a session that would otherwise play on forever.
+    private static let pictureInPictureRestoreTimeoutNanoseconds: UInt64 = 3_000_000_000
+    #endif
+    /// True after the active backend reports natural EOF. Used to keep the
+    /// UI in a terminal paused state without letting tail-drain callbacks
+    /// overwrite it or surface a false decode error.
+    var hasReachedEndOfFile = false
+    /// The item played to its end. An end of stream short of the end (the
+    /// source went away) parks the player the same way but finishes nothing.
+    private var finishedAtEndOfFile: Bool {
+        hasReachedEndOfFile && !reachedEndPrematurely
+    }
+    let settings = PlayerSettings.shared
+    /// Profile-wide skip intervals. Read at each skip, so a change made while
+    /// the player is open applies to the next press.
+    let seekIntervalPreferences = SeekIntervalPreferences.shared
+    let sleepTimer = SleepTimer()
+    private let nowPlaying = AetherVideoNowPlayingCoordinator()
+    private var isObservingSeekIntervals = false
+    /// Optional poster / backdrop URLs supplied by the presenter so the
+    /// now-playing widget can publish artwork without re-fetching the
+    /// catalog item just for poster URLs. Populated via
+    /// `applyArtworkURLHints`. Nil falls back to a `/catalog/items/{id}`
+    /// fetch in `pushNowPlayingArtwork`.
+    private var artworkPosterURLHint: String?
+    private var artworkBackdropURLHint: String?
+
+    /// Rate-limits Now Playing updates. The OS animates scrubber progress
+    /// between updates based on `playbackRate`, so we only need to push an
+    /// elapsed-time field once every couple of seconds.
+    private var lastNowPlayingPush: Date = .distantPast
+
+    private let sessionBridge = PlaybackSessionBridge()
+    @ObservationIgnored
+    private var realtimeClient: PlaybackRealtimeClient!
+    /// AI subtitle suite (translate/transcribe); built lazily on first
+    /// main-actor access. The UI binds to the controller's own observable
+    /// state.
+    @ObservationIgnored
+    private(set) lazy var subtitleAI: SubtitleAIController = MainActor.assumeIsolated {
+        SubtitleAIController(
+            mediaFileId: { [weak self] in self?.currentSelectedVersion?.fileId },
+            currentTime: { [weak self] in self?.currentTime ?? 0 },
+            sessionId: { [weak self] in self?.activePlaybackSessionId },
+            realtimeUnavailable: { [weak self] in !(self?.subtitleAILiveOverlayAvailable ?? false) },
+            liveCoordinator: self.makeLiveSubtitleCoordinator(),
+            handoffContext: { [weak self] in self?.makeSubtitleHandoffContext() },
+            registerAndSelectDescriptor: { [weak self] descriptor in
+                self?.registerCompletedAISubtitle(descriptor)
+            },
+            registerDescriptorWithoutSelecting: { [weak self] descriptor in
+                self?.registerCompletedAISubtitle(descriptor, autoSelect: false)
+            }
+        )
+    }
+
+    /// Timing and sync state of the playing file's syncable subtitles (stored
+    /// ones and sidecar files). A timing change it observes fetches that
+    /// track's cues again.
+    ///
+    /// Not lazy: track and loading changes report to it from teardown paths,
+    /// where creating it (and its weak back-reference) is not allowed.
+    @ObservationIgnored
+    let subtitleSync = SubtitleSyncModel()
+
+    /// Last-known realtime websocket connectivity, mirrored from the actor so
+    /// the synchronous subtitle-AI submit path can tell the difference between
+    /// "socket connected" and "not failed yet". A fast first iOS submit can
+    /// beat the websocket handshake; treating that as live-ready asks the
+    /// server to stream cues into a socket that cannot receive them yet.
+    private var realtimeConnectedSnapshot = false
+
+    /// Last-known realtime websocket availability. This flips only when the
+    /// circuit breaker gives up; the separate connectivity snapshot above
+    /// covers normal connecting/reconnecting gaps.
+    private var realtimeUnavailableSnapshot = false
+
+    /// A marker update can finish after the playback session starts but before
+    /// the realtime websocket has connected. Reconcile once after the socket
+    /// is live so that event-delivery race cannot hide intro/credits prompts
+    /// for the current Aether load. A `markers_updated` event that lands
+    /// while a reconcile read is in flight replaces that read with a fresh
+    /// one, so the event is never overwritten by an older snapshot and the
+    /// marker kinds it omits still get reconciled.
+    private var markerReconcileRequestId: UUID?
+    private var markerReconcileTask: Task<Void, Never>?
+    /// Reads the file-specific markers for a reconcile. Tests replace it.
+    @ObservationIgnored
+    var markerDetailLoader: @MainActor (_ contentId: String, _ libraryId: Int?) async throws -> WatchDetail = {
+        try await SiloAPI.shared.watchDetail(contentId: $0, libraryId: $1)
+    }
+
+    /// Whether the realtime websocket can currently receive live AI-subtitle
+    /// cues. The preparing/pause flow starts on submit for both live and
+    /// poll-only jobs; this flag only decides whether the request includes
+    /// `session_id` for realtime cue streaming.
+    var subtitleAILiveOverlayAvailable: Bool {
+        realtimeConnectedSnapshot && !realtimeUnavailableSnapshot && activePlaybackSessionId != nil
+    }
+
+    /// The `observeUnavailability` token, retained so `cleanup()` can remove
+    /// the observer explicitly. `unbind()` preserves observers across fresh
+    /// load cycles because this snapshot is a long-lived PlayerViewModel concern.
+    private var realtimeUnavailabilityObserverToken: UUID?
+    private var realtimeConnectivityObserverToken: UUID?
+    private var cleanupCompletionTask: Task<Void, Never>?
+    /// Natural EOF should not wait for the ten-second periodic reporter. Keep
+    /// the immediate write so teardown/autoplay can await it before claiming
+    /// and stopping the same server session.
+    private var naturalEndProgressTask: Task<Void, Never>?
+
+    /// Build the live-subtitle coordinator with adapters bound to this VM. The
+    /// adapters touch the VM's playback + live-track + notice surface, so they
+    /// live in this file. Called only from the `subtitleAI` lazy initializer,
+    /// which already runs inside `MainActor.assumeIsolated`; the adapters and
+    /// coordinator have `@MainActor` initializers, so this constructs them on
+    /// the asserted main actor. It only wires immutable closures.
+    private func makeLiveSubtitleCoordinator() -> LiveSubtitleCoordinator {
+        let controls = LiveSubtitlePlaybackAdapter(owner: self)
+        let sink = LiveSubtitleSinkAdapter(owner: self)
+        return LiveSubtitleCoordinator(
+            controls: controls,
+            sink: sink,
+            // The coordinator snapshots the live `selectedSubtitleId` at
+            // `started` (the selection it restores on failure).
+            selectionSnapshot: { [weak self] in self?.selectedSubtitleId }
+        )
+    }
+    private var hideControlsTask: Task<Void, Never>?
+    private var noticeDismissTask: Task<Void, Never>?
+    /// Id of the live-subtitle "Preparing subtitles" notice while it's on
+    /// screen, so `dismissLiveSubtitlePreparingNotice()` can clear it the moment
+    /// playback resumes without clobbering a newer, unrelated notice.
+    private var liveSubtitlePreparingNoticeId: UUID?
+    private var remoteDismissTask: Task<Void, Never>?
+    private var progressTask: Task<Void, Never>?
+    private var staleSessionRecoveryTask: Task<Void, Never>?
+    /// Held so the init-time `refreshSettingsFromServer` call can be cancelled
+    /// from `cleanup()`. Without a handle the task lingered on a dismissed VM
+    /// and could observe `self` after dispose.
+    private var settingsRefreshTask: Task<Void, Never>?
+    /// Skip intervals don't shape the session request, so playback start
+    /// doesn't wait on this refresh (a capability probe plus a settings read).
+    private var seekIntervalRefreshTask: Task<Void, Never>?
+    private var freshLoadTask: Task<Void, Never>?
+    private var freshLoadGeneration: UInt64 = 0
+    /// True while `freshLoadTask` is the sole owner of a load failure's
+    /// outcome. Aether publishes its typed failure before the load throws, so
+    /// without this the direct-play and offline paths surface the same
+    /// failure twice — once through `handleAetherFailure` and again through
+    /// the load's own catch.
+    private var freshLoadOwnsFailureHandling = false
+    /// The most recent `audioTrackSwitchFailed` Aether published while a load
+    /// owned failure handling. The engine kills the in-flight load as part of
+    /// the same rebuild, so the load's own catch sees only a cancellation and
+    /// would otherwise have no idea why it was abandoned.
+    @ObservationIgnored
+    private var lastAetherAudioTrackSwitchFailure: PlaybackErrorInfo?
+    /// Serializes every Protocol V3 source replacement, including a same-plan
+    /// reload whose only change is a refreshed bearer. Reusing this gate keeps
+    /// credential recovery from racing route replans, seeks, or track changes.
+    private var protocolV3ReplanTask: Task<Void, Never>?
+    /// The running mid-stream reconnect (§6.2), its pending attempt timer,
+    /// and the start request a new session uses when the old one is gone.
+    @ObservationIgnored
+    private var reconnectCycle = PlaybackReconnectCycle()
+    /// Set once the server said the session was ended for good, so progress,
+    /// replan and reconnect do not each start their own exit.
+    private var serverEndedSessionHandled = false
+    @ObservationIgnored
+    private var reconnectTimerTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var reconnectLoadRequest: LoadRequest?
+    /// Whether any transport of the current viewing has shown a frame. A
+    /// recovery replan that cannot reach the server then joins the reconnect
+    /// instead of ending playback; before that it is a startup failure.
+    @ObservationIgnored
+    private var viewingHasPlayed = false
+    /// Whether the current transport's source stopped delivering, and a
+    /// seek target it has not played from yet. Decides whether an end of
+    /// stream is a lost connection and where a reconnect resumes.
+    @ObservationIgnored
+    private var sourceWatch = PlaybackSourceWatch()
+    /// Where the last reconnect after an early end of stream resumed, until a
+    /// load or replan other than a reconnect starts. A server-produced stream
+    /// that ends there again is ending where its media does
+    /// (`PlaybackReconnectPolicy.endOfStreamReconnectPosition`).
+    @ObservationIgnored
+    private var lastEndReconnect: Double?
+    /// Set when the latest end of stream came short of the end of the item.
+    /// Such an end never finishes the item: no watched state, no completed
+    /// progress report.
+    @ObservationIgnored
+    private var reachedEndPrematurely = false
+    private var nextUpLookupTask: Task<Void, Never>?
+    private var nextUpOnDeckTask: Task<Void, Never>?
+    private var nextUpCountdownTask: Task<Void, Never>?
+    /// Trailing-edge skip debounce: each tap updates the preview and resets
+    /// this timer. The seek fires exactly once, after `skipDebounceNanos` of
+    /// quiet. A leading-edge seek was tempting for responsiveness but led
+    /// to visible stutter on bursts — the video would seek to tap #1, play
+    /// briefly, and then jump again on the trailing commit. A single
+    /// deferred seek is smooth at any burst length.
+    private var skipDebounceTask: Task<Void, Never>?
+    private let skipDebounceNanos: UInt64 = 200_000_000 // 200ms
+
+    /// Drives the repeating preview advance while a seek session is
+    /// active. Ticks at `holdSeekTickNanos`, advancing `scrubPreviewTime`
+    /// by `holdSeekBaseStep * holdSeekRate` seconds each tick. Runs
+    /// until `commitHoldSeek` / `cancelHoldSeek`.
+    private var holdSeekTask: Task<Void, Never>?
+    /// Auto-ramps the rate magnitude 1 → 2 → 4 → 8 during the first ~4 s
+    /// of a hold so the user gets acceleration without having to manually
+    /// tap up. Cancelled the moment the user manually adjusts the rate
+    /// — they've taken control, stop second-guessing them.
+    private var holdSeekAutoRampTask: Task<Void, Never>?
+    private static let holdSeekBaseStep: Double = 2.0 // seconds per tick at 1x
+    private static let holdSeekTickNanos: UInt64 = 100_000_000 // 100ms (10Hz)
+
+    /// Seek-in-flight filter: both the pre-seek playhead and the target we
+    /// asked Aether to jump to. Clock reports that are closer to
+    /// `seekOriginTime` than to `seekTargetTime` are treated as stale and
+    /// dropped. This is direction-agnostic and handles back-to-back seeks.
+    /// The filter releases as soon as a report crosses the midpoint
+    /// between origin and target, which is the earliest point we can
+    /// confidently say the new position has landed. Safety timeout below
+    /// drops the filter if no matching report arrives (e.g. transport
+    /// error on HLS transcode), since a stuck filter would pin the
+    /// scrubber to the optimistic target forever.
+    private var seekOriginTime: Double?
+    private var seekTargetTime: Double?
+    /// This member's newest room seek request the room has not run yet; see
+    /// `WatchPartyHeldSeek`.
+    private var watchPartyHeldSeek: WatchPartyHeldSeek?
+    /// The position progress reports save. A held room seek request is on
+    /// the timeline before the room runs it, and may never run; until it
+    /// does, the engine has not moved, so the resume point stays there.
+    var progressReportPosition: Double {
+        watchPartyHeldSeek == nil ? currentTime : watchPartyPlaybackSnapshot.sourceTime
+    }
+    private var seekFilterTimeoutTask: Task<Void, Never>?
+    /// The in-flight `commitSeek` await. Held so a new load can cancel a seek
+    /// whose `.requiresReplan` answer would otherwise arrive after the item
+    /// it was issued against is gone.
+    private var seekReplanTask: Task<Void, Never>?
+    private var seekOperationGeneration: UInt64 = 0
+    private static let seekFilterNanos: UInt64 = 5_000_000_000 // 5s
+    /// The active offline download when playback was prepared locally (no
+    /// server session). While set, watch progress is routed to
+    /// `DownloadManager.recordOfflineProgress` — which queues it for the
+    /// next `/sync/progress` flush — instead of the session bridge, so
+    /// nothing on this path ever hits a server session/progress endpoint.
+    private struct OfflinePlaybackContext {
+        let mediaItemId: String
+        let isServerPreparedFile: Bool
+    }
+    private var offlinePlaybackContext: OfflinePlaybackContext?
+    /// Mirrors the server's default watched threshold (90%) so an offline
+    /// watch latches `completed` — and with it delete-watched retention and
+    /// the reclaim sheet — the same way an online session would, and so a
+    /// Series page moves past an episode the server now counts as watched.
+    private static let defaultWatchedFraction: Double = 0.9
+
+    /// Cached external subtitle URLs returned by the server; added to the
+    /// player once the file has loaded.
+    private var pendingExternalSubtitles: [SubtitleUrl] = []
+    /// Full sidecar subtitle set for the current item. Unlike
+    /// `pendingExternalSubtitles`, this survives the first successful
+    /// registration so route recovery can re-register sidecars later.
+    private var knownExternalSubtitles: [SubtitleUrl] = []
+    /// Picker rows for sidecars this session registered with Aether itself —
+    /// a finished AI translation/transcription or a downloaded subtitle.
+    ///
+    /// Under Protocol V3 the published picker is rebuilt from the plan's
+    /// inventory, and the plan that is active when a job completes predates
+    /// the new track, so without this the finished subtitle would vanish from
+    /// the menu until the next replan. Rows are unioned in, de-duped against
+    /// the plan, and dropped once the server publishes the same ordinal.
+    private var locallyRegisteredSidecarSubtitleTracks: [PlayerTrack] = []
+    /// Local rendering can change without replacing the video plan. Retain
+    /// the choice through inventory updates and same-session video reloads.
+    private var localProtocolV3SubtitleSelection: ProtocolV3SubtitleSelection?
+    /// Server-supplied preferred track indices (ffmpeg stream indices). Kept
+    /// until we've observed a matching track in the core's track-list and
+    /// applied it, or until the user makes a manual selection.
+    private var pendingAudioFfIndex: Int?
+    private var pendingSubtitleFfIndex: Int?
+    /// True when the most recent `loadAndPlay` came in with an explicit
+    /// subtitle index from the caller (route arg / detail screen). The
+    /// auto-resolver yields to the user in that case.
+    private var hasExplicitSubtitleChoice: Bool = false
+    /// External subtitle picks don't have an FFmpeg stream index, so a
+    /// reload/resume has to remember the synthesised sidecar `trackId`
+    /// and re-apply it once `subtitle_urls` have been registered again.
+    private var pendingSidecarSubtitleTrackId: Int64?
+    /// A protocol-v3 subtitle can remain represented by a sidecar picker row
+    /// even when the replacement plan renders it on the server (for example,
+    /// bitmap PGS subtitles burned into HLS). Preserve that picker selection
+    /// across an Aether reload without also opening the sidecar locally.
+    private var pendingServerRenderedSubtitleTrackId: Int64?
+    /// Seamless live→persisted swap: the synthetic AI-live track id whose row
+    /// is closed only after the handed-off persisted track is selected.
+    private var pendingLiveSubtitleCloseTrackId: Int64?
+    /// Bounded fallback timer that closes a deferred live track if the persisted
+    /// selection never lands. Cancelled when the seamless close fires or on
+    /// cleanup.
+    private var deferredLiveSubtitleCloseTask: Task<Void, Never>?
+    /// Snapshot of the server-cascaded subtitle prefs for the currently
+    /// loaded content. Captured from `WatchDetail.effective_*` at
+    /// session-start time and consumed once the player reports its
+    /// track list. Cleared on cleanup so a follow-up load doesn't apply
+    /// stale prefs to a different file.
+    private var prefsForCurrentItem: PrefsSnapshot?
+    private struct PrefsSnapshot {
+        let preferredLanguage: String?
+        let additionalPreferredLanguages: [String]
+        let mode: SubtitleMode?
+        let showForced: Bool
+        let forcedOnly: Bool
+        let preferAccessibilityTracks: Bool
+        let disableWhenNoLanguageMatch: Bool
+        let trackSignature: SubtitleTrackSignature?
+    }
+    /// Set after the resolver has fired once for the current item so we
+    /// don't keep re-evaluating (and overriding the user) on every
+    /// subsequent track-list update.
+    private var prefsResolvedForCurrentItem: Bool = false
+    /// A caption pick that arrived before the current V3 load or replan
+    /// committed and therefore could not replan yet. The resolved pick itself
+    /// is kept, not the preference snapshot that produced it: a system
+    /// caption request resolves from the OS language and would be lost if the
+    /// generic preference snapshot were rerun in its place. Drained once the
+    /// load's server transition commits, or when the replan task (or a seek
+    /// it queued) exits. A newer automatic decision replaces it.
+    private var deferredAutoSubtitlePick: SubtitleAutoSelection?
+    private var resolvedServerUrl: String = ""
+    private var currentWatchDetail: WatchDetail?
+    private var currentSelectedVersion: FileVersion?
+    private var activePreparedProtocolV3: PreparedPlaybackV3?
+    private var activePlaybackSessionId: String?
+    var watchPartyAdapter: WatchPartyPlaybackAdapter?
+    private var watchPartyLocalPreparation = false
+    /// The rate a party member should play at: 1, or a correction nudge.
+    private var watchPartyCorrectionRate: Double = 1
+    /// The rate last handed to Aether, or nil when unknown. Aether starts
+    /// playback on any nonzero rate, so the rate only reaches it while it
+    /// plays; a paused member picks the rate up when it next plays.
+    private var watchPartyAppliedRate: Double?
+    private var watchPartyReloadBudget = WatchPartyReloadBudget()
+    /// Where a member that does not correct by rate aims its next in-place
+    /// seek, and the drift loop's seek while it runs.
+    private var watchPartyInPlaceCatchup = WatchPartyInPlaceCatchup()
+    private var watchPartyInPlaceSeekTask: Task<Void, Never>?
+    var isWatchPartyPlayback: Bool { watchPartyAdapter?.context != nil }
+    var canRequestPlayPause: Bool { !isWatchPartyPlayback || watchPartyAdapter?.canPlayPause == true }
+    var canRequestSeek: Bool { !isWatchPartyPlayback || watchPartyAdapter?.canSeek == true }
+    var effectivePlaybackSpeed: Double { isWatchPartyPlayback ? watchPartyCorrectionRate : settings.playbackSpeed }
+    private var autoSkippedCreditsKey: String?
+    /// Recaps already skipped for the current content, by marker key.
+    private var autoSkippedRecapKeys: Set<String> = []
+    /// Skip Credits reached the end of the file while playback continued.
+    /// The viewer chose to finish the item, so it completes even after Keep
+    /// Watching, until a seek leaves the credits.
+    private var didSkipCreditsToEnd = false
+    private var skippedCreditsToEnd: Bool {
+        guard didSkipCreditsToEnd else { return false }
+        guard let creditsRange else { return true }
+        return currentTime >= creditsRange.start
+    }
+    private var staleSessionRecoverySessionId: String?
+    struct LoadRequest {
+        var libraryId: Int? = nil
+        let contentId: String
+        let preferredFileId: Int?
+        let preferredAudioTrackIndex: Int?
+        let preferredSubtitleTrackIndex: Int?
+        let preferredSidecarSubtitleTrackId: Int64?
+        let startFromBeginning: Bool
+        /// Authoritative protocol-v3 combined ordinal. Unlike
+        /// `preferredSubtitleTrackIndex`, this also represents external,
+        /// downloaded, and server-extracted subtitle rows.
+        var preferredProtocolV3SubtitleIndex: Int? = nil
+        /// Set for local playback of a completed download. Routes the
+        /// prepare through `OfflinePlaybackBuilder` instead of a server
+        /// session, so retry after an error stays on the offline path.
+        var offlineDownloadId: String? = nil
+        /// Explicit quality for this load (mid-stream quality-change replan);
+        /// wins over `PlayerSettings.preferredQuality` in the bridge.
+        var preferredQualityOverride: String? = nil
+        /// Continue Watching only: select the server's last-used source file
+        /// before applying the profile-wide automatic quality preference.
+        var prefersLastUsedVersion = false
+        /// `false` for a Watch Party room: its exact source and position.
+        var allowAlternateVersions: Bool? = nil
+        /// The viewer picked `preferredFileId` in a version picker. The start
+        /// keeps that version rather than letting the server play another.
+        var pinsVersion = false
+        /// A shuffle plays a multi-part item from its first part.
+        var startsAtFirstPart = false
+
+        /// Rebuild a request for the same playback session while retaining the
+        /// user's temporary quality choice. Recovery must not fall back to the
+        /// persisted preference merely because tracks or the file id changed.
+        func copyForRecovery(
+            preferredFileId: Int?,
+            preferredAudioTrackIndex: Int?,
+            preferredSubtitleTrackIndex: Int?,
+            preferredSidecarSubtitleTrackId: Int64?,
+            offlineDownloadId: String?,
+            serverSubtitlesDisabled: Bool = false
+        ) -> LoadRequest {
+            var request = LoadRequest(
+                contentId: contentId,
+                preferredFileId: preferredFileId,
+                preferredAudioTrackIndex: preferredAudioTrackIndex,
+                preferredSubtitleTrackIndex: preferredSubtitleTrackIndex,
+                preferredSidecarSubtitleTrackId: preferredSidecarSubtitleTrackId,
+                startFromBeginning: false,
+                offlineDownloadId: offlineDownloadId,
+                preferredQualityOverride: preferredQualityOverride
+            )
+            request.libraryId = libraryId
+            // A completed download can be selected after the last server plan.
+            // Ask the replacement session for that combined ordinal; retaining
+            // the old plan's ordinal would reselect its embedded subtitle.
+            // Local decoder Off also accompanies burn-in. Only an explicit
+            // server disable may erase the server's selected ordinal.
+            if serverSubtitlesDisabled {
+                request.preferredProtocolV3SubtitleIndex = nil
+            } else if let preferredSidecarSubtitleTrackId,
+                      SubtitleTrackIdSpace.isSidecar(preferredSidecarSubtitleTrackId) {
+                request.preferredProtocolV3SubtitleIndex = SubtitleTrackIdSpace.sidecarIndex(
+                    from: preferredSidecarSubtitleTrackId
+                )
+            } else {
+                request.preferredProtocolV3SubtitleIndex = preferredProtocolV3SubtitleIndex
+            }
+            request.prefersLastUsedVersion = prefersLastUsedVersion
+            request.allowAlternateVersions = allowAlternateVersions
+            request.pinsVersion = pinsVersion
+            return request
+        }
+
+        /// Retry starts a new session after transient player state is cleared.
+        /// Carry the renderer choice as an explicit V3 intent into that start.
+        func adoptingLocalProtocolV3SubtitleSelection(
+            _ selection: ProtocolV3SubtitleSelection,
+            plan: PlaybackV3Plan
+        ) -> LoadRequest {
+            guard let index = selection.replanIndex(in: plan) else { return self }
+            var request = copyForRecovery(
+                preferredFileId: plan.effectiveMediaFileId,
+                preferredAudioTrackIndex: preferredAudioTrackIndex,
+                preferredSubtitleTrackIndex: selection == .off ? -1 : nil,
+                preferredSidecarSubtitleTrackId: selection.appTrackID(in: plan),
+                offlineDownloadId: offlineDownloadId
+            )
+            request.preferredProtocolV3SubtitleIndex = index
+            return request
+        }
+
+        /// Refresh the inputs used by session renewal from an adopted V3 plan.
+        /// Player track lists are transient and may already be empty when a
+        /// failed transport reports that its server session disappeared.
+        ///
+        /// `keepsExplicitOff` is set when the viewer chose the subtitles
+        /// themselves. An off plan then stays an explicit Off (`-1`), so a
+        /// retry or renewal starts fully off instead of letting the automatic
+        /// policy pick a forced track for a server-side mode Off.
+        ///
+        /// The session's quality is not adopted. The request keeps only a
+        /// quality the viewer picked in the player; an automatic one is
+        /// derived again from the saved pair for the connection, with its
+        /// exact cap rather than the nearest local rung's. `viewerQualityId`
+        /// is the quality a viewer's switch asked for, carried into the
+        /// candidate's recovery intent before it loads.
+        func adoptingProtocolV3Intent(
+            plan: PlaybackV3Plan,
+            selectedVersion: FileVersion,
+            keepsExplicitOff: Bool = false,
+            viewerQualityId: String? = nil
+        ) -> LoadRequest {
+            // Shared resolution order; see
+            // `PlaybackV3Plan.selectedSubtitleInventoryItem`. An `off` plan
+            // selects nothing even if it still carries a stale identity.
+            let isSubtitleOff = plan.subtitle.mode == PlaybackProtocolV3.SubtitleMode.off
+            let selectedSubtitleIndex = isSubtitleOff
+                ? nil
+                : plan.selectedSubtitleCombinedIndex
+            let selectedSubtitle = isSubtitleOff ? nil : plan.selectedSubtitleInventoryItem
+            let embeddedFFmpegIndex: Int? = selectedSubtitle.flatMap { item in
+                // A sidecar is the server-selected artifact even when it was
+                // extracted from an embedded stream. Arming both identities
+                // would publish and select the same subtitle twice.
+                if let embedded = plan.subtitle.embedded { return embedded.streamIndex }
+                guard item.source == "embedded", item.delivery != "sidecar" else { return nil }
+                return ApplePlaybackV3PlanAdapter.ffmpegSubtitleStreamIndex(
+                    serverCombinedIndex: item.combinedIndex,
+                    in: selectedVersion,
+                    inventory: plan.subtitle.inventory
+                )
+            }
+            let sidecarTrackId: Int64? = selectedSubtitle.flatMap { item in
+                guard plan.subtitle.embedded == nil, item.delivery == "sidecar" else { return nil }
+                return SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: item.combinedIndex)
+            }
+            var request = copyForRecovery(
+                preferredFileId: plan.effectiveMediaFileId,
+                preferredAudioTrackIndex: plan.selectedTracks.audio?.index,
+                preferredSubtitleTrackIndex: isSubtitleOff && keepsExplicitOff ? -1 : embeddedFFmpegIndex,
+                preferredSidecarSubtitleTrackId: sidecarTrackId,
+                offlineDownloadId: offlineDownloadId
+            )
+            request.preferredProtocolV3SubtitleIndex = selectedSubtitleIndex
+            if let viewerQualityId {
+                request.preferredQualityOverride = viewerQualityId
+            }
+            return request
+        }
+    }
+
+    /// Where a `beginFreshLoad` invocation came from. Determines (a) whether
+    /// `startSession` is bounded by a timeout and (b) how a load failure is
+    /// surfaced to the user. The trigger is orthogonal to the `LoadRequest`
+    /// itself, so it's threaded as a separate parameter.
+    private enum LoadOrigin {
+        /// User picked an item — no timeout, full-screen error on failure.
+        case userInitiated
+        /// Auto-play hand-off from the Next Up postroll — timeout-bounded,
+        /// failures restore the postroll with `nextUpStartError` set.
+        case autoplay
+        /// Automatic playback recovery. Failures stay on the player surface
+        /// instead of using the Next Up postroll.
+        case recovery
+        /// A mid-stream reconnect's new session after the old one did not
+        /// survive (§6.2). Failures go back to the reconnect, which waits
+        /// for the next attempt or gives up.
+        case reconnect
+    }
+
+    private enum BeginFreshLoadError: Error {
+        case startSessionTimeout
+    }
+
+    private static let autoplayStartSessionTimeout: TimeInterval = 15
+    private var lastLoadRequest: LoadRequest?
+    /// The local route the stream on screen was loaded over (`LocalRoute`),
+    /// or nil when it came from the saved address.
+    private var streamLocalRoute: LocalRoute?
+    /// Whether the load the engine just abandoned was to play when ready, as
+    /// it stood then: Play or Pause may have changed it during the load, and
+    /// tearing the load down clears it from the controller.
+    private var abandonedLoadPlayIntent: Bool?
+    private static let nextUpCountdownDefaultSeconds = 10
+    private static let nextUpHUDCountdownThresholdSeconds: Double = 100
+    private static let nearEndPlaybackErrorThresholdSeconds: Double = 8
+    private var nextUpAutoplayCancelled = false
+    /// Set when the user taps Keep Watching; suppresses re-presenting the
+    /// pre-end Next Up prompt while the playhead stays inside the prompt
+    /// window. Cleared when the playhead leaves the window (seek back) or a
+    /// new item loads, so the prompt can appear again naturally. Does not
+    /// apply to the end-of-playback screen.
+    private var nextUpPromptDismissed = false
+    private(set) var contentIdsNeedingDetailRefresh: Set<String> = []
+    /// Series of the last episode whose watch detail loaded. Covers the gap
+    /// while a replacement episode loads and `currentWatchDetail` is empty.
+    private var lastSeriesPlayback: (seriesId: String, seasonNumber: Int?)?
+    /// `SeriesPlaybackReturnInbox` generation when this player was created.
+    private let seriesReturnGeneration: Int
+    /// `PlayerCleanupBarrier` generation when this player was created.
+    private let cleanupBarrierGeneration: Int
+    #if os(iOS) || os(macOS)
+    @ObservationIgnored
+    private var refreshHomeAfterPlaybackWrite: (@MainActor () -> Void)?
+    #endif
+    var nextUpCarouselItems: [PlayerOnDeckItem] {
+        let hiddenIds = Set([lastLoadRequest?.contentId, nextUpEpisode?.contentId].compactMap { $0 })
+        return nextUpOnDeckItems.filter { !hiddenIds.contains($0.contentId) }
+    }
+
+    var canShowNextUpScreen: Bool {
+        nextUpEpisode != nil
+            || !nextUpCarouselItems.isEmpty
+            || isLoadingNextUpEpisode
+            || isLoadingNextUpOnDeck
+    }
+
+    /// Play Now has been pressed and the next item is not on screen yet.
+    var isStartingNextUp: Bool { isNextUpTransitioning || isAdvancingShuffle }
+
+    var canPickAnotherShufflePick: Bool {
+        shuffleState?.canPickAnother == true && !isStartingNextUp
+    }
+
+    /// Re-applies subtitle styling when the user edits the system's
+    /// Subtitles & Captioning preferences mid-playback.
+    private var systemCaptionObserverToken: NSObjectProtocol?
+    private var seekrPreviewsEnabledObserverToken: NSObjectProtocol?
+    @ObservationIgnored private var externalPlaybackTask: Task<Void, Never>?
+    /// Provider-owned media (IPTV VOD) this player opened directly. Non-nil routes the engine's
+    /// startup, end and failure events away from Silo's session, replan and progress logic.
+    @ObservationIgnored private(set) var externalPlayback: ExternalPlaybackRequest?
+    /// Credential-free failure code shown under an external playback error, e.g.
+    /// `reason=access_refused engine=sourcerefused code=403 hops=1 status=403 …`.
+    var externalPlaybackDiagnosticCode: String?
+    /// Triggers a V3 replan when the audio route the session was planned
+    /// against changes. iOS/tvOS only — macOS has no `AVAudioSession`.
+    private var outputRouteObserverToken: NSObjectProtocol?
+    /// Flushes the resume point when the app is about to stop getting
+    /// foreground time. The periodic reporter ticks every 10s, so without
+    /// this a backgrounded (or terminated) player loses up to that much
+    /// progress. Deliberately does not stop the session — PiP and background
+    /// audio keep playing after this fires.
+    private var foregroundExitObserverToken: NSObjectProtocol?
+    /// Moves playback between the main and cellular quality pairs when the
+    /// connection changes (iPhone and iPad). Set at the end of `init`.
+    /// Read by tests.
+    @ObservationIgnored private(set) var networkQuality: PlaybackNetworkQualityController?
+    @ObservationIgnored private var networkPathObservation: PlaybackNetworkMonitor.ObserverToken?
+    /// A fixed quality the viewer picked in the player, once it took effect,
+    /// and the title it belongs to. Nil while playback follows the saved
+    /// settings, which an Auto pick also means. See
+    /// ``recordViewerQualityPick(_:forContentId:onMeteredNetwork:)``.
+    private var explicitQualityPick: (contentId: String?, qualityId: String)?
+
+    /// Whether playback uses the cellular pair right now. A Watch Party keeps
+    /// the main pair.
+    private var usesMeteredQuality: Bool {
+        !isWatchPartyPlayback && PlaybackNetworkMonitor.shared.isMetered
+    }
+
+    /// `bufferingQualityClock` drives the buffering controller's timers; tests
+    /// pass a manual one.
+    init(libraryId: Int? = nil, bufferingQualityClock: PlayerPromptClock? = nil) {
+        self.initialLibraryId = libraryId
+        let bufferingClock = bufferingQualityClock ?? LivePlayerPromptClock()
+        self.bufferingClock = bufferingClock
+        self.bufferingQuality = BufferingQualityController(clock: bufferingClock)
+        self.seriesReturnGeneration = SeriesPlaybackReturnInbox.generation
+        self.cleanupBarrierGeneration = PlayerCleanupBarrier.playerCreated()
+        let controller: AetherPlaybackController
+        do {
+            controller = try AetherPlaybackController()
+        } catch {
+            fatalError("AetherEngine initialization failed: \(error)")
+        }
+        aetherPlaybackController = controller
+        scrubPreviewProvider = AetherScrubPreviewProvider(engine: controller.engine)
+        scrubPreviewProvider.onPreview = { [weak self] preview in
+            guard let self else { return }
+            self.scrubPreviewImage = preview?.image
+            self.scrubPreviewImageSourceTime = preview?.sourceTime
+            self.scrubPreviewImageSource = preview?.source
+        }
+        subtitleSync.onTimingChanged = { [weak self] key in
+            self?.refetchSubtitleCues(syncKey: key)
+        }
+        aetherPlaybackController.onEvent = { [weak self] event in
+            self?.handleAetherEvent(event)
+        }
+        aetherPlaybackController.onControllerEvent = { [weak self] event in
+            self?.handleAetherControllerEvent(event)
+        }
+        aetherPlaybackController.onTransportAvailabilityChanged = { [weak self] available in
+            guard let self, !self.isDisposed, self.isWatchPartyPlayback else { return }
+            self.cancelWatchPartyCorrection()
+            self.publishWatchPartySnapshot()
+            if available { self.watchPartyAdapter?.onResyncRequired?() }
+        }
+        aetherPlaybackController.onSystemCaptionRequest = { [weak self] epoch, request in
+            self?.handleSystemCaptionRequest(epoch: epoch, request: request)
+        }
+        realtimeClient = PlaybackRealtimeClient(
+            commandHandler: { [weak self] command in
+                guard let self else {
+                    throw PlaybackRealtimeCommandExecutionError.commandFailed
+                }
+                try await self.handleRealtimeCommand(command)
+            },
+            eventHandler: { [weak self] event in
+                guard let self else { return }
+                await self.handleRealtimeEvent(event)
+            }
+        )
+        // Mirror websocket connectivity so the synchronous subtitle-AI
+        // controller requests live cue streaming only when the socket is
+        // actually ready. If the first iOS submit beats the handshake, the job
+        // still uses the shared paused preparing flow, but completes via the
+        // poller instead of waiting for websocket `started`/`cues` frames.
+        let client = realtimeClient
+        Task { [weak self] in
+            guard let self, let client else { return }
+            let connectivityToken = await client.observeConnectivity { [weak self] connected in
+                guard let self else { return }
+                let wasConnected = self.realtimeConnectedSnapshot
+                self.realtimeConnectedSnapshot = connected
+                if connected && !wasConnected {
+                    self.reconcileMarkersAfterRealtimeConnect()
+                }
+                if !connected && wasConnected {
+                    self.subtitleAI.realtimeDidBecomeUnavailable()
+                }
+            }
+            let token = await client.observeUnavailability { [weak self] unavailable in
+                guard let self else { return }
+                let wasAvailable = !self.realtimeUnavailableSnapshot
+                self.realtimeUnavailableSnapshot = unavailable
+                if unavailable && wasAvailable {
+                    self.subtitleAI.realtimeDidBecomeUnavailable()
+                }
+            }
+            self.realtimeConnectivityObserverToken = connectivityToken
+            self.realtimeUnavailabilityObserverToken = token
+        }
+        sleepTimer.configure { [weak self] in
+            if self?.isWatchPartyPlayback == true {
+                self?.cleanup()
+                return
+            }
+            self?.aetherPlaybackController.pause()
+        }
+
+        systemCaptionObserverToken = NotificationCenter.default.addObserver(
+            forName: SystemCaptionAppearance.settingsChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isDisposed,
+                      self.settings.subtitleMatchesSystemAppearance else { return }
+                self.settings.refreshSubtitleSystemAppearance()
+                self.subtitleOrderingLanguage = self.settings
+                    .subtitleSystemSelectionPreferences.preferredLanguages.first
+                guard !self.hasExplicitSubtitleChoice else { return }
+                self.prefsForCurrentItem = self.systemCaptionPrefsSnapshot()
+                self.prefsResolvedForCurrentItem = false
+                self.applyAutoSubtitlePreferencesIfNeeded(forceReevaluation: true)
+            }
+        }
+        seekrPreviewsEnabledObserverToken = NotificationCenter.default.addObserver(
+            forName: SeekrPreviewSettings.previewsEnabledDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let enabled = note.userInfo?["enabled"] as? Bool
+                ?? SeekrPreviewSettings.shared.previewsEnabled
+            Task { @MainActor [weak self] in
+                self?.applySeekrPreviewsEnabled(enabled)
+            }
+        }
+        #if !os(macOS)
+        outputRouteObserverToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let activeProtocolV3 = self.activePreparedProtocolV3,
+                      !self.isDisposed,
+                      !self.isLoading else { return }
+                let observedSnapshot = ApplePlaybackV3Capabilities.snapshot()
+                guard PlaybackSessionBridge.isMaterialOutputRouteChange(
+                    activeOutputContextId: activeProtocolV3.outputContextId,
+                    observedOutputContextId: observedSnapshot.outputContextId
+                ) else {
+                    Self.logger.debug(
+                        "Ignoring AVAudioSession route notification with unchanged Playback V3 output context"
+                    )
+                    return
+                }
+                self.attemptProtocolV3Replan(
+                    position: self.currentTime,
+                    classification: "output_route_changed",
+                    message: "The Apple audio output route changed.",
+                    outputRouteSnapshot: observedSnapshot
+                )
+            }
+        }
+        #endif
+        #if os(iOS) || os(tvOS)
+        let foregroundExitNotification = UIApplication.didEnterBackgroundNotification
+        #else
+        let foregroundExitNotification = NSApplication.willTerminateNotification
+        #endif
+        foregroundExitObserverToken = NotificationCenter.default.addObserver(
+            forName: foregroundExitNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.flushPlaybackProgressNow(reason: "foreground_exit")
+                #if os(iOS) || os(tvOS)
+                self?.keepRunningBufferingPlanSummary()
+                #endif
+            }
+        }
+        #if os(macOS)
+        // A Mac app leaves the foreground when it resigns active; one that
+        // quits ends the plan, and the app waits briefly for its summary.
+        macBufferingSummaryObservers = [
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.keepRunningBufferingPlanSummary() }
+            },
+            NotificationCenter.default.addObserver(
+                forName: PlanSummaryJournal.appWillQuit, object: nil, queue: nil
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.endBufferingPlan() }
+            },
+        ]
+        #endif
+        settingsRefreshTask = Task { @MainActor [weak self] in
+            await self?.refreshSettingsFromServer()
+        }
+        seekIntervalRefreshTask = Task { [seekIntervalPreferences] in
+            await seekIntervalPreferences.refresh()
+        }
+        let networkQuality = PlaybackNetworkQualityController(
+            isMetered: { PlaybackNetworkMonitor.shared.isMetered },
+            pair: { [settings] metered in settings.playbackQualityAxes(onMeteredNetwork: metered) },
+            replan: { [weak self] axes in self?.replanForConnectionChange(axes) ?? .unavailable }
+        )
+        self.networkQuality = networkQuality
+        networkPathObservation = PlaybackNetworkMonitor.shared.observe { [weak networkQuality] in
+            Task { @MainActor in networkQuality?.connectionDidChange() }
+        }
+        bufferingQuality.onOutput = { [weak self] output in
+            self?.handleBufferingQualityOutput(output)
+        }
+        bufferingQuality.measuredThroughputKbps = { [weak self] in self?.bufferingPlanArrivalKbps }
+        bufferingQuality.arrivalLowerBoundKbps = { [weak self] in
+            guard let self, aetherPlaybackController.activeSpec?.options.nativeRemoteHLS == false else { return nil }
+            return upstreamMeter.arrivalLowerBoundKbps
+        }
+        bufferingQuality.linkThroughputKbps = { [weak self] in
+            guard let self, aetherPlaybackController.activeSpec?.options.nativeRemoteHLS == false else { return nil }
+            return upstreamMeter.linkThroughputKbps
+        }
+        observeBufferingHostInputs()
+        observeBufferingConnectivity()
+        observeBufferingSurfaceVisibility()
+    }
+
+    /// The connection moved between metered and unmetered and the other
+    /// quality pair applies. A Watch Party keeps the room's stream as it is.
+    /// Internal for tests.
+    func replanForConnectionChange(
+        _ axes: AppleQualityAxes
+    ) -> PlaybackNetworkQualityController.ReplanOutcome {
+        guard !isDisposed, !isWatchPartyPlayback else { return .unavailable }
+        // Checked before the session: a change that lands while the first
+        // load is still starting waits and is checked again, not dropped.
+        guard protocolV3ReplanTask == nil, !isLoading, !isQualitySwitching else { return .busy }
+        guard activePreparedProtocolV3 != nil else { return .unavailable }
+        let issued = attemptProtocolV3Replan(
+            position: currentTime.isFinite ? max(0, currentTime) : 0,
+            classification: "quality_changed",
+            message: "The connection changed between mobile data and Wi-Fi.",
+            operation: PlaybackProtocolV3.ReplanOperation.qualityChange,
+            qualityAxes: axes,
+            viewerQualityChange: true
+        )
+        return issued ? .issued : .busy
+    }
+
+    /// Best-effort, non-blocking write of the current resume point, outside
+    /// the 10s reporting cadence. Used when the app loses the foreground and
+    /// on terminal failure, where the next scheduled tick may never run.
+    private func flushPlaybackProgressNow(reason: String) {
+        guard !isDisposed else { return }
+        if let offline = offlinePlaybackContext {
+            recordOfflineProgress(context: offline)
+            return
+        }
+        guard activePlaybackSessionId != nil else { return }
+        let position = progressReportPosition
+        guard position.isFinite, position >= 0 else { return }
+        let isPaused = !isPlaying
+        Self.logger.debug("Flushing playback progress (\(reason, privacy: .public))")
+        Task { [sessionBridge] in
+            _ = await sessionBridge.reportProgress(position: position, isPaused: isPaused)
+        }
+    }
+
+    private func currentPhaseIsLoading() -> Bool {
+        PlayerStallPresentation.isLoading(
+            phase: aetherPhase,
+            isPlaying: isPlaying,
+            playheadMovedAt: playheadSample?.movedAt,
+            bufferEmptySince: stalledBufferEmptySince,
+            // Both set `isLoading` before awaiting the server, while the
+            // outgoing load still reports its phase.
+            preparingReplacement: protocolV3ReplanTask != nil || freshLoadTask != nil,
+            now: .now
+        )
+    }
+
+    /// Records whether the engine still holds media ahead of its clock while
+    /// the source is stalled. An audio-only load has no buffer-ahead surface
+    /// (its buffered position mirrors the clock), so only its playhead counts.
+    private func sampleStalledBuffer() {
+        guard case .stalled = aetherPhase, !isAudioOnlyAetherLoad else {
+            stalledBufferEmptySince = nil
+            return
+        }
+        if engineHasMediaAhead {
+            stalledBufferEmptySince = nil
+        } else if stalledBufferEmptySince == nil {
+            stalledBufferEmptySince = .now
+        }
+    }
+
+    /// Whether the engine holds media ahead of its clock. Always false for
+    /// an audio-only load, whose buffered position mirrors the clock.
+    private var engineHasMediaAhead: Bool {
+        guard !isAudioOnlyAetherLoad else { return false }
+        let engine = aetherPlaybackController.engine
+        return PlayerStallPresentation.hasMediaAhead(
+            bufferedPosition: engine.bufferedPosition,
+            clockTime: engine.currentTime
+        )
+    }
+
+    /// A source outage leaves the player loading only once the buffer runs
+    /// out: the playhead stops, or (after a seek past the buffer) the clock
+    /// runs on with nothing buffered ahead of it. Neither change produces a
+    /// phase event, so re-judge on a short poll until the phase or the load
+    /// changes.
+    private func watchSourceStall(epoch: AetherPlaybackController.LoadEpoch) {
+        sourceStallWatch?.cancel()
+        sourceStallWatch = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, !Task.isCancelled, !self.isDisposed,
+                      self.activeAetherLoadEpoch == epoch,
+                      case .stalled = self.aetherPhase else { return }
+                self.sampleStalledBuffer()
+                let loading = self.currentPhaseIsLoading()
+                guard loading != self.isLoading else { continue }
+                self.isLoading = loading
+                self.syncIntroSkipPrompt()
+            }
+        }
+    }
+
+    private func handleAetherEvent(_ scopedEvent: AetherPlaybackController.ScopedEvent) {
+        guard !isDisposed, scopedEvent.epoch == activeAetherLoadEpoch else { return }
+        defer { syncBufferingQualitySignals() }
+        guard !noteBufferingTransportEvent(scopedEvent) else { return }
+        guard !handleExternalPlaybackEvent(scopedEvent.event) else { return }
+        defer { publishWatchPartySnapshot() }
+        switch scopedEvent.event {
+        case .state(let state):
+            switch state {
+            case .playing:
+                isPlaying = true
+                // A rate the party set while the engine rebuffered applies as
+                // soon as it plays again, not at the next clock update. The
+                // engine publishes this state from `willSet`, so it still
+                // reads the old one here; hand the rate over once it is set.
+                if isWatchPartyPlayback {
+                    let epoch = scopedEvent.epoch
+                    Task { @MainActor [weak self] in
+                        await Task.yield()
+                        guard let self, self.activeAetherLoadEpoch == epoch else { return }
+                        self.syncWatchPartyRate()
+                    }
+                }
+                pushNowPlayingSnapshot()
+                // An audio-only load has no picture, so Aether's audio route
+                // never latches `hasFirstFrameReadyForDisplay` and the
+                // `.firstFrame` milestone below never arrives. The audio route
+                // reaching playback is the equivalent milestone; without it
+                // these loads would never start progress reporting and would
+                // lose their server session mid-listen.
+                if isAudioOnlyAetherLoad {
+                    handleAetherStartupMilestone(epoch: scopedEvent.epoch)
+                }
+            case .paused:
+                isPlaying = false
+                pushNowPlayingSnapshot()
+            case .idle, .ended, .error:
+                isPlaying = false
+            case .loading, .seeking:
+                break
+            }
+            syncIntroSkipPrompt()
+        case .phase(let phase):
+            sourceWatch.observe(phase)
+            aetherPhase = phase
+            sampleStalledBuffer()
+            isLoading = currentPhaseIsLoading()
+            if case .stalled = phase {
+                watchSourceStall(epoch: scopedEvent.epoch)
+            } else {
+                sourceStallWatch?.cancel()
+                sourceStallWatch = nil
+            }
+            refreshPlaybackStats(force: true)
+            syncIntroSkipPrompt()
+        case .playerTime(let playerSeconds):
+            if playerSeconds.isFinite, playheadSample?.seconds != playerSeconds {
+                playheadSample = (playerSeconds, .now)
+            }
+            // While reconnecting the transport is dead; its clock can still
+            // tick or park, but the position is the reconnect's until the
+            // replacement transport is installed.
+            guard !hasReachedEndOfFile,
+                  !isReconnecting,
+                  !reconnectCycle.isHandingOff,
+                  playerSeconds.isFinite,
+                  let timeline = aetherPlaybackController.activeSpec?.timeline else { return }
+            let movieTime = timeline.sourcePosition(forPlayerTime: playerSeconds)
+            if Self.isUnexpectedBackwardPlaybackTime(
+                movieTime,
+                currentTime: currentTime,
+                explicitSeekInFlight: seekTargetTime != nil
+            ) {
+                pushNowPlayingIfDue()
+                return
+            }
+            if let origin = seekOriginTime, let target = seekTargetTime {
+                // A held room request is released by the room's seek to it,
+                // not by ticks: playback from an earlier room seek in the
+                // burst can cross the midpoint before that seek arrives.
+                if watchPartyHeldSeek != nil || Self.isStaleSeekTick(movieTime, origin: origin, target: target) {
+                    pushNowPlayingIfDue()
+                    return
+                }
+                seekOriginTime = nil
+                seekTargetTime = nil
+                seekFilterTimeoutTask?.cancel()
+                seekFilterTimeoutTask = nil
+            }
+            currentTime = movieTime
+            sourceWatch.observePlayhead(movieTime, hasMediaAhead: engineHasMediaAhead)
+            updateNextUpPresentation(for: movieTime)
+            syncIntroSkipPrompt()
+            // Not `movieTime`: an intro skip just above may have moved the
+            // playhead past a recap that overlaps the intro.
+            autoSkipRecapIfNeeded(at: currentTime)
+            autoSkipCreditsIfNeeded(at: movieTime)
+            pushNowPlayingIfDue()
+            refreshPlaybackStats()
+            updateWatchPartyCatchup()
+        case .duration(let reportedDuration):
+            // Aether reports duration on the player/transport axis, while
+            // `currentTime` (and every marker, chapter and progress report
+            // derived from it) is on the source axis. Adopting the raw value
+            // under an HLS reanchor would shorten the scrubber by exactly the
+            // timeline offset, so convert before publishing.
+            if duration <= 0, reportedDuration.isFinite, reportedDuration > 0 {
+                if let timeline = aetherPlaybackController.activeSpec?.timeline {
+                    duration = timeline.sourcePosition(forPlayerTime: reportedDuration)
+                } else {
+                    duration = reportedDuration
+                }
+            }
+        case .buffering(let buffering):
+            isBuffering = buffering
+            refreshPlaybackStats(force: true)
+            syncIntroSkipPrompt()
+        case .subtitleLoading(let loading):
+            isLoadingSubtitles = loading
+        case .firstFrame:
+            handleAetherStartupMilestone(epoch: scopedEvent.epoch)
+        case .inventoryChanged:
+            adoptAetherInventory()
+            refreshPlaybackStats(force: true)
+        case .telemetryChanged:
+            noteUpstreamTelemetry()
+            refreshPlaybackStats(force: true)
+        case .ended:
+            handleEndOfFile()
+            refreshPlaybackStats(force: true)
+        case .failure(let failure):
+            handleAetherFailure(failure)
+        case .transportRestoreFailed(let message):
+            // The engine tore its media session down in the background and the
+            // rebuild for this Play failed. That is a source failure like any
+            // other post-load one — the committed plan may simply have expired
+            // while suspended — so it goes through the same recovery boundary
+            // (replan / stale-session renewal) instead of straight to the
+            // terminal wall. `handlePlaybackError` still finalizes the cases
+            // that genuinely have nowhere left to go.
+            handlePlaybackError(message)
+        case .nativeTransportChanged, .itemStalled, .itemMediaRequestFailed, .transportIntentChanged:
+            break // noteBufferingTransportEvent
+        }
+    }
+
+    private func handleAetherControllerEvent(_ event: AetherPlaybackController.ControllerEvent) {
+        guard !isDisposed else { return }
+        switch event {
+        case .systemMediaChanged:
+            syncNowPlayingDestination()
+            refreshPlaybackStats(force: true)
+        case .externalPlaybackChanged(let supported):
+            supportsExternalPlayback = supported
+            refreshPlaybackStats(force: true)
+        }
+    }
+
+    /// Publishes the forward buffer for the scrubbers and invalidates the
+    /// stats panels. Clock ticks (`force == false`) invalidate at most about
+    /// once a second.
+    private func refreshPlaybackStats(force: Bool = false) {
+        let buffered = aetherPlaybackController.activeSpec == nil
+            ? 0
+            : max(0, aetherPlaybackController.engine.liveTelemetry?.forwardBufferSeconds ?? 0)
+        if bufferedAheadSeconds != buffered { bufferedAheadSeconds = buffered }
+
+        let now = Date()
+        if !force, now.timeIntervalSince(playbackStatsRevisedAt) < 0.9 { return }
+        playbackStatsRevisedAt = now
+        playbackStatsRevision &+= 1
+    }
+
+    /// Shows empty stats until the next refresh.
+    private func clearPlaybackStats() {
+        playbackStatsRevision &+= 1
+        cachedPlaybackStats = (playbackStatsRevision, .empty)
+    }
+
+    private func projectPlaybackStats() -> PlaybackStats {
+        guard let spec = aetherPlaybackController.activeSpec else { return .empty }
+        let secondaryLabel = selectedSecondarySubtitleId.flatMap { selectedID in
+            subtitleTracks.first { $0.trackId == selectedID }?.singleLineLabel
+        }
+        let playbackPlan = activePreparedProtocolV3?.plan
+        let source = AetherPlaybackStatsSourceMetadata(
+            sourceURL: spec.sourceURL,
+            delivery: spec.delivery,
+            container: currentSelectedVersion?.container,
+            playbackRate: isHoldFastForwarding ? 2 : effectivePlaybackSpeed,
+            secondarySubtitleLabel: secondaryLabel,
+            plannedSourceDynamicRange: playbackPlan?.source.dynamicRange,
+            plannedOutputDynamicRange: playbackPlan?.effectiveRecipe.dynamicRange,
+            plannedSourceDolbyVisionProfile: playbackPlan?.source.dolbyVisionProfile
+        )
+        return AetherPlaybackStatsProjection.make(
+            snapshot: AetherPlaybackStatsSnapshot(engine: aetherPlaybackController.engine),
+            source: source
+        )
+    }
+
+    private func handleAetherFailure(_ failure: PlaybackErrorInfo) {
+        if failure.kind == .audioTrackSwitchFailed {
+            // The engine tore its pipeline down for the switch and the rebuild
+            // failed, so there is nothing left playing whatever the phase. It
+            // also restored `activeAudioTrackIndex`, so republish the engine's
+            // truth before any recovery re-reads the selection.
+            lastAetherAudioTrackSwitchFailure = failure
+            selectedAudioId = aetherPlaybackController.engine.activeAudioTrackIndex
+                .map(Int64.init)
+            isBuffering = false
+            isLoadingSubtitles = false
+            bufferingProgress = nil
+            isQualitySwitching = false
+            if freshLoadOwnsFailureHandling || !isAetherLoadEstablished {
+                // The load this switch killed is unwinding right now;
+                // `resolveAbandonedAetherLoad` turns its cancellation into this
+                // failure so exactly one handler recovers it.
+                return
+            }
+            // Mid-playback, after the load was established: the switch was an
+            // explicit pick, so recover the session the same way any other
+            // post-load engine failure is recovered rather than stranding the
+            // user on a spinner.
+            showNotice(
+                title: "Couldn't change audio",
+                message: "The audio track couldn't be switched. The previous track was kept.",
+                tone: .warning,
+                duration: 5
+            )
+            handlePlaybackError(failure.message, failure: failure)
+            return
+        }
+        // Aether deliberately publishes its typed failure *before* the load
+        // throws, so every in-flight load would otherwise be handled twice:
+        // once here and once in the load's own catch. The owning load task is
+        // the single handler on every path — V3, direct play and offline
+        // alike — because only it knows the load's origin, and therefore
+        // whether the failure gets the full-screen wall or the recoverable
+        // Next Up surface.
+        if freshLoadOwnsFailureHandling {
+            return
+        }
+        if activePreparedProtocolV3 != nil,
+           committedProtocolV3LoadEpoch == nil {
+            // Same rule for a replan's load: it owns provisional-route
+            // recovery, and reacting here too would start two competing
+            // replans.
+            return
+        }
+        if reconnectCycle.isActive {
+            // While the server is unreachable a dying transport says nothing
+            // about its route; the reconnect replaces it anyway (§6.2).
+            return
+        }
+        if attemptProtocolV3AuthenticationReload(after: failure) {
+            return
+        }
+        // A stream that already showed frames and then lost the server has
+        // not failed its route: reconnect instead of `failure_recovery`, which
+        // would exclude the route (§6.2). A transport that never showed a
+        // frame keeps the ordinary recovery, since that route may be one this
+        // device cannot reach.
+        if currentTransportHasShownFrame,
+           PlaybackReconnectPolicy.isConnectionLoss(failure, serverUnreachable: isServerUnreachable),
+           beginReconnect(position: sourcePlayhead, resume: aetherPlaybackController.shouldPlayWhenReady) {
+            return
+        }
+        let serverCanAdapt: Set<PlaybackErrorKind> = [
+            .sourceRefused,
+            .vodSourceFailed,
+            .nativeItemFailed,
+            .noPlayableTrackWithinBudget,
+            .masterPlaylistRejected,
+            .softwarePipelineFailed,
+            .audioBridgeProducedNoOutput,
+            .dolbyVisionRequiresHardware,
+            .demuxedAudioLiveUnsupported,
+        ]
+        // Aether publishes errorInfo before a throwing load returns. Only the
+        // owning load task may recover a provisional plan; starting a second
+        // replan here would race its rollback/route-ladder handling.
+        if serverCanAdapt.contains(failure.kind),
+           activePreparedProtocolV3 != nil,
+           committedProtocolV3LoadEpoch != nil {
+            // On Auto in "Automatically", a start that never became playable
+            // within the engine's own deadline lowers, as a long stall would,
+            // rather than asking for the same quality again.
+            if failure.kind == .noPlayableTrackWithinBudget,
+               !currentTransportHasShownFrame || !bufferingSignals.planHasRun,
+               protocolV3ReplanTask == nil, freshLoadTask == nil, !isWatchPartyPlayback,
+               bufferingQuality.startDeadlinePassed() {
+                Self.logger.info("[CMP-BUFFERING] start deadline passed: lowering instead of failure recovery")
+                holdStartDeadlineFailure(
+                    position: sourcePlayhead,
+                    classification: failure.kind.rawValue,
+                    message: failure.message
+                )
+                return
+            }
+            attemptProtocolV3Replan(
+                position: sourcePlayhead,
+                classification: failure.kind.rawValue,
+                message: failure.message
+            )
+            return
+        }
+        if failure.kind == .sourceRateLimited {
+            showNotice(
+                title: "Playback delayed",
+                message: "The media source is rate limiting requests. Try again in a moment.",
+                tone: .info,
+                duration: 5
+            )
+            return
+        }
+        handlePlaybackError(failure.message, failure: failure)
+    }
+
+    /// Whether the active load asked Aether for its audio-only route, which
+    /// publishes no video-display signal at all.
+    private var isAudioOnlyAetherLoad: Bool {
+        aetherPlaybackController.activeSpec?.options.audioOnly == true
+    }
+
+    /// The single place a load's startup milestone is taken.
+    ///
+    /// Latched per epoch, because the milestone has two sources that must
+    /// never both count: Aether's first frame for anything with a picture, and
+    /// the audio route starting for an audio-only load. Everything a started
+    /// load owes the server — progress reporting, keepalives, the Playback V3
+    /// first-frame report — hangs off this one call.
+    private func handleAetherStartupMilestone(epoch: AetherPlaybackController.LoadEpoch) {
+        guard startedAetherLoadEpoch != epoch else { return }
+        startedAetherLoadEpoch = epoch
+        viewingHasPlayed = true
+        handleFileLoaded()
+        if let playing = lastLoadRequest?.contentId, shuffleState != nil {
+            shuffleState?.markPlayed(playing)
+            if !isNextUpTransitioning { publishShuffleNextUp() }
+        }
+        if isNextUpTransitioning {
+            isNextUpTransitioning = false
+            showNextUpScreen = false
+            nextUpEpisode = nil
+            nextUpOnDeckItems = []
+            if let detail = currentWatchDetail {
+                loadNextUpCandidate(for: detail)
+                loadNextUpOnDeckItems(for: detail)
+            }
+        }
+        if activePreparedProtocolV3 != nil {
+            pendingProtocolV3FirstFrameEpoch = epoch
+            completeProtocolV3FirstFrameIfCommitted(epoch)
+        } else {
+            startProgressReporting()
+        }
+        syncIntroSkipPrompt()
+        refreshPlaybackStats(force: true)
+    }
+
+    private func handleFileLoaded() {
+        hasReachedEndOfFile = false
+        error = nil
+        errorIsRetryable = true
+        isLoading = false
+        isPlaying = !aetherPlaybackController.isPaused
+        applySettingsToPlayer()
+        Self.logger.info(
+            "[CMP-SUB] file loaded engine=AetherEngine route=\(self.activeRouteLabel, privacy: .public) pendingExternal=\(self.pendingExternalSubtitles.count, privacy: .public) tracks=\(self.subtitleTracks.count, privacy: .public)"
+        )
+        loadPendingExternalSubtitles()
+        hideControlsTask?.cancel()
+        showControls = false
+        nowPlaying.update(
+            title: title,
+            duration: duration,
+            position: currentTime,
+            isPlaying: isPlaying,
+            playbackRate: effectivePlaybackSpeed
+        )
+    }
+
+    /// Aether may publish its first-frame flag synchronously while the server
+    /// plan is still provisional. Hold that observation until the owning load
+    /// and bridge transition both commit so a failed/cancelled candidate never
+    /// appears as successfully presented in Playback V3 telemetry.
+    private func markProtocolV3AetherLoadCommitted() {
+        guard activePreparedProtocolV3 != nil,
+              let epoch = activeAetherLoadEpoch else { return }
+        committedProtocolV3LoadEpoch = epoch
+        restoreLocalProtocolV3SubtitleSelection()
+        completeProtocolV3FirstFrameIfCommitted(epoch)
+        publishWatchPartySnapshot()
+    }
+
+    private func completeProtocolV3FirstFrameIfCommitted(
+        _ epoch: AetherPlaybackController.LoadEpoch
+    ) {
+        guard committedProtocolV3LoadEpoch == epoch,
+              pendingProtocolV3FirstFrameEpoch == epoch,
+              let planId = activePreparedProtocolV3?.plan.planId,
+              let sessionId = activePlaybackSessionId else { return }
+        pendingProtocolV3FirstFrameEpoch = nil
+        startProgressReporting()
+        Task { [sessionBridge] in
+            await sessionBridge.reportProtocolV3FirstFrame(
+                planId: planId,
+                sessionId: sessionId,
+                milliseconds: nil
+            )
+        }
+    }
+
+    private func handlePlaybackError(_ message: String, failure: PlaybackErrorInfo? = nil) {
+        let logMessage = MediaLogRedactor.sanitize(message)
+        Self.logger.error("Player error: \(logMessage, privacy: .public)")
+        guard !reconnectCycle.isActive else {
+            Self.logger.info("Ignoring playback error while reconnecting: \(logMessage, privacy: .public)")
+            return
+        }
+        guard !hasReachedEndOfFile else {
+            Self.logger.info("Ignoring playback error after EOF: \(logMessage, privacy: .public)")
+            return
+        }
+        if shouldTreatPlaybackErrorAsNaturalEnd() {
+            Self.logger.info("Treating near-end playback error as EOF: \(logMessage, privacy: .public)")
+            handleEndOfFile()
+            return
+        }
+        if activePreparedProtocolV3 != nil,
+           committedProtocolV3LoadEpoch != nil {
+            attemptProtocolV3Recovery(after: message)
+            return
+        }
+        if isPlaybackSessionMissingMessage(message) || isExpiredPlaybackSessionSource(failure) {
+            if attemptStaleSessionRenewal(reason: "player_error", observedPosition: currentTime) {
+                return
+            }
+        }
+        progressTask?.cancel()
+        finalizeTerminalPlaybackError(message)
+    }
+
+    private func attemptProtocolV3Recovery(after message: String) {
+        attemptProtocolV3Replan(
+            position: sourcePlayhead,
+            classification: protocolV3FailureClassification(message),
+            message: message
+        )
+    }
+
+    /// Rebuilds the committed plan with the account bearer currently held by
+    /// `SiloAPI`. Protocol V3 media URLs are stable across access-token
+    /// refreshes, but Aether/AVPlayer freezes request headers at asset load.
+    /// A normal authenticated progress request first gives the shared HTTP
+    /// client a chance to refresh an expired token; the reload proceeds only
+    /// when that produced a different Authorization value.
+    @discardableResult
+    private func attemptProtocolV3AuthenticationReload(
+        after failure: PlaybackErrorInfo
+    ) -> Bool {
+        guard AetherAuthenticationRecoveryPolicy.isExpiredBearerFailure(failure) else {
+            return false
+        }
+        return beginProtocolV3AuthenticationReload(
+            fallbackClassification: failure.kind.rawValue,
+            fallbackMessage: failure.message
+        )
+    }
+
+    /// Only static-header transports need replacement after API rotation.
+    /// Server HLS resolves the current credential for each request, and direct
+    /// play with video takes it pushed into the engine; audio-only media keeps
+    /// the headers it opened with.
+    private func attemptProtocolV3AuthenticationReloadAfterProgress(
+        _ result: PlaybackProgressReportResult
+    ) async {
+        if result == .success, aetherPlaybackController.activeSpec?.requestHeaderResolver != nil {
+            aetherPlaybackController.refreshRequestHeaders()
+            return
+        }
+        guard result == .success,
+              protocolV3ReplanTask == nil,
+              let protocolV3 = activePreparedProtocolV3,
+              protocolV3.serverFeatures.contains(
+                  PlaybackProtocolV3.headerAuthenticatedMediaFeature
+              ),
+              let sessionId = activePlaybackSessionId,
+              let failedSpec = aetherPlaybackController.activeSpec,
+              failedSpec.options.httpRequestAuthorization == nil,
+              failedSpec.planID == protocolV3.plan.planId,
+              failedSpec.sessionID == sessionId,
+              committedProtocolV3LoadEpoch != nil,
+              let session = await sessionBridge.committedProtocolV3Session(
+                  planId: protocolV3.plan.planId,
+                  sessionId: sessionId
+              ),
+              let streamRequest = await makeStreamRequest(
+                  session: session,
+                  additionalHeaders: protocolV3.plan.stream.headers,
+                  requiresHeaderAuthenticatedMedia: true,
+                  allowsAuthorizedMediaOrigins:
+                      protocolV3.negotiatedAuthorizedMediaOrigins
+              ),
+              activePlaybackSessionId == sessionId,
+              activePreparedProtocolV3?.plan.planId == protocolV3.plan.planId,
+              aetherPlaybackController.activeSpec?.planID == failedSpec.planID,
+              aetherPlaybackController.activeSpec?.sessionID == sessionId,
+              AetherAuthenticationRecoveryPolicy.shouldReloadAfterProgress(
+                  result,
+                  activeHeaders: failedSpec.options.httpHeaders,
+                  currentHeaders: streamRequest.headers,
+                  hasRequestAuthorization: failedSpec.options.httpRequestAuthorization != nil
+              ) else {
+            return
+        }
+
+        _ = beginProtocolV3AuthenticationReload(
+            fallbackClassification: "authorization_rotated",
+            fallbackMessage: "Playback authorization changed while media was active.",
+            refreshedStreamRequest: streamRequest
+        )
+    }
+
+    @discardableResult
+    private func beginProtocolV3AuthenticationReload(
+        fallbackClassification: String,
+        fallbackMessage: String,
+        refreshedStreamRequest: StreamRequest? = nil
+    ) -> Bool {
+        guard protocolV3ReplanTask == nil,
+              let protocolV3 = activePreparedProtocolV3,
+              protocolV3.serverFeatures.contains(
+                  PlaybackProtocolV3.headerAuthenticatedMediaFeature
+              ),
+              let sessionId = activePlaybackSessionId,
+              let watchDetail = currentWatchDetail,
+              let selectedVersion = currentSelectedVersion,
+              let failedSpec = aetherPlaybackController.activeSpec,
+              failedSpec.options.httpRequestAuthorization == nil,
+              failedSpec.planID == protocolV3.plan.planId,
+              failedSpec.sessionID == sessionId,
+              committedProtocolV3LoadEpoch != nil else {
+            return false
+        }
+
+        if let refreshedStreamRequest,
+           !AetherAuthenticationRecoveryPolicy.shouldReload(
+               failedHeaders: failedSpec.options.httpHeaders,
+               refreshedHeaders: refreshedStreamRequest.headers
+           ) {
+            return false
+        }
+
+        let planId = protocolV3.plan.planId
+        let resumePosition = currentTime.isFinite ? max(0, currentTime) : 0
+        let failedHeaders = failedSpec.options.httpHeaders
+
+        progressTask?.cancel()
+        progressTask = nil
+        isLoading = true
+        isBuffering = false
+        isLoadingSubtitles = false
+        bufferingProgress = nil
+        // The credential refresh runs before any engine event; hold the intro
+        // pill's timer through it like any other stall.
+        syncIntroSkipPrompt()
+        streamLoadGeneration &+= 1
+        let recoveryGeneration = streamLoadGeneration
+
+        if refreshedStreamRequest == nil {
+            Self.logger.warning(
+                "Protocol V3 media credential expired; refreshing and reloading plan \(planId, privacy: .public) at source position \(resumePosition, privacy: .public)"
+            )
+        } else {
+            Self.logger.info(
+                "Protocol V3 media credential rotated; proactively reloading plan \(planId, privacy: .public) at source position \(resumePosition, privacy: .public)"
+            )
+        }
+
+        protocolV3ReplanTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            var shouldFallbackToReplan = true
+            defer {
+                self.protocolV3ReplanTask = nil
+                self.syncBufferingQualitySignals()
+                defer { self.publishWatchPartySnapshot() }
+                if !self.isDisposed,
+                   recoveryGeneration == self.streamLoadGeneration {
+                    if shouldFallbackToReplan {
+                        if !self.attemptProtocolV3Replan(
+                            position: resumePosition,
+                            classification: fallbackClassification,
+                            message: fallbackMessage
+                        ) {
+                            self.finalizeTerminalPlaybackError(fallbackMessage)
+                        }
+                    } else if let queuedTrackChange = self.pendingProtocolV3TrackChange {
+                        self.pendingProtocolV3TrackChange = nil
+                        self.attemptProtocolV3Replan(
+                            position: self.currentTime,
+                            classification: queuedTrackChange.classification,
+                            message: queuedTrackChange.message,
+                            requeueWhenBusy: true,
+                            trackTarget: queuedTrackChange.target
+                        )
+                    } else if let queuedTarget = self.pendingProtocolV3SeekReanchorPosition {
+                        self.pendingProtocolV3SeekReanchorPosition = nil
+                        self.commitSeek(to: queuedTarget, source: "queuedAuthReloadReanchor", roomCommand: self.isWatchPartyPlayback)
+                    } else {
+                        self.reapplyDeferredAutoSubtitlePolicyIfNeeded()
+                    }
+                }
+            }
+
+            do {
+                if refreshedStreamRequest == nil {
+                    // This request uses the normal API transport, whose 401 path
+                    // refreshes TokenStore before retrying. Its result is otherwise
+                    // best-effort; the header comparison below is authoritative.
+                    _ = await self.sessionBridge.reportProgress(
+                        position: resumePosition,
+                        isPaused: !self.aetherPlaybackController.shouldPlayWhenReady
+                    )
+                }
+                try self.requireCurrentStreamLoad(recoveryGeneration)
+                guard self.activePlaybackSessionId == sessionId,
+                      self.activePreparedProtocolV3?.plan.planId == planId,
+                      let session = await self.sessionBridge.committedProtocolV3Session(
+                          planId: planId,
+                          sessionId: sessionId
+                      ) else {
+                    throw CancellationError()
+                }
+                try self.requireCurrentStreamLoad(recoveryGeneration)
+
+                let prepared = PreparedPlayback(
+                    watchDetail: watchDetail,
+                    selectedVersion: selectedVersion,
+                    session: session,
+                    activeQualityId: self.activeQualityId,
+                    protocolV3: protocolV3
+                )
+                let streamRequest: StreamRequest
+                if let refreshedStreamRequest {
+                    streamRequest = refreshedStreamRequest
+                } else {
+                    guard let resolved = await self.makeStreamRequest(
+                        session: session,
+                        additionalHeaders: protocolV3.plan.stream.headers,
+                        requiresHeaderAuthenticatedMedia: true,
+                        allowsAuthorizedMediaOrigins:
+                            protocolV3.negotiatedAuthorizedMediaOrigins
+                    ) else {
+                        throw AetherLoadSpec.ValidationError.invalidStreamURL(session.streamUrl)
+                    }
+                    streamRequest = resolved
+                }
+                try self.requireCurrentStreamLoad(recoveryGeneration)
+                guard AetherAuthenticationRecoveryPolicy.shouldReload(
+                    failedHeaders: failedHeaders,
+                    refreshedHeaders: streamRequest.headers
+                ) else {
+                    Self.logger.warning(
+                        "Protocol V3 media credential did not change; using bounded route recovery"
+                    )
+                    return
+                }
+
+                // A local in-window seek can finish while the refresh request
+                // is suspended. Sample the source-axis position again at the
+                // last synchronous point before beginLoad replaces the epoch,
+                // so credential recovery never jumps back over that seek.
+                let reloadPosition = self.currentTime.isFinite
+                    ? max(0, self.currentTime)
+                    : resumePosition
+                let shouldPlayWhenReady = !self.isWatchPartyPlayback && self.aetherPlaybackController.shouldPlayWhenReady
+                self.resolvedServerUrl = streamRequest.serverUrl
+                try await self.loadAether(
+                    prepared: prepared,
+                    streamRequest: streamRequest,
+                    expectedStreamLoadGeneration: recoveryGeneration,
+                    resumeSourcePosition: reloadPosition,
+                    reselectsPlanSubtitle: true,
+                    shouldPlayWhenReady: shouldPlayWhenReady
+                )
+                try self.requireCurrentStreamLoad(recoveryGeneration)
+                guard self.activePlaybackSessionId == sessionId,
+                      self.activePreparedProtocolV3?.plan.planId == planId else {
+                    throw CancellationError()
+                }
+                self.markProtocolV3AetherLoadCommitted()
+                // The same plan on a new transport: its start is a reload.
+                self.bufferingReloadEpoch = self.activeAetherLoadEpoch
+                shouldFallbackToReplan = false
+                Self.logger.info(
+                    "Protocol V3 media credential reload succeeded for plan \(planId, privacy: .public)"
+                )
+            } catch is CancellationError {
+                shouldFallbackToReplan = false
+            } catch {
+                Self.logger.error(
+                    "Protocol V3 media credential reload failed; using bounded route recovery: \(MediaLogRedactor.sanitize(error), privacy: .public)"
+                )
+            }
+        }
+        syncBufferingQualitySignals()
+        return true
+    }
+
+    /// The track a queued change is actually asking for. `.subtitle(nil)` is
+    /// "turn subtitles off", which is why this is an enum and not two optional
+    /// ids.
+    ///
+    /// Each case carries both the Aether `trackId` the user tapped and the
+    /// server-side identity the deferred replan will actually be resolved from
+    /// — the audio selection ordinal (`srcId ?? ffIndex`) and the subtitle
+    /// combined index. The interim replan can repackage streams, so an Aether
+    /// id recorded before it can vanish or land on a different stream by drain
+    /// time; the server identity is what `resolvedAudioTrackIndexForResume` /
+    /// `resolvedProtocolV3SubtitleIndexForResume` send, and it survives that.
+    private enum QueuedProtocolV3TrackTarget {
+        case audio(trackId: Int64, selectionIndex: Int?)
+        case subtitle(trackId: Int64?, combinedIndex: Int?)
+    }
+
+    /// Server-side ordinal a queued audio pick must resolve back to.
+    private func queuedTrackTarget(forAudio track: PlayerTrack) -> QueuedProtocolV3TrackTarget {
+        .audio(trackId: track.trackId, selectionIndex: audioSelectionIndex(for: track))
+    }
+
+    /// Server-side combined subtitle index a queued subtitle pick must resolve
+    /// back to. Nil for live AI tracks and anything the current plan cannot
+    /// place, which simply leaves the id as the only matcher.
+    private func queuedTrackTarget(
+        forSubtitle track: PlayerTrack
+    ) -> QueuedProtocolV3TrackTarget {
+        .subtitle(
+            trackId: track.trackId,
+            combinedIndex: serverCombinedSubtitleIndex(for: track)
+        )
+    }
+
+    private func serverCombinedSubtitleIndex(for track: PlayerTrack) -> Int? {
+        guard !SubtitleTrackIdSpace.isAILive(track.trackId),
+              let version = currentSelectedVersion else { return nil }
+        return ApplePlaybackV3PlanAdapter.serverCombinedSubtitleIndex(
+            for: track,
+            in: version,
+            inventory: activePreparedProtocolV3?.plan.subtitle.inventory ?? []
+        )
+    }
+
+    /// A track change deferred until the in-flight replan settles. Position
+    /// is deliberately absent: it is re-read when the queue drains, because
+    /// playback keeps moving while the earlier replan completes.
+    ///
+    /// The target, unlike the position, is *not* re-read. The in-flight replan
+    /// publishes its own plan's inventory on the way through, and
+    /// `adoptAetherInventory` republishes `selectedAudioId`/`selectedSubtitleId`
+    /// from the engine as it does — so by drain time the optimistic selection
+    /// the user's tap wrote has been overwritten by the interim plan's. A
+    /// deferred replan that re-read the selection would therefore ask the
+    /// server for the track the user was already on and silently drop the tap.
+    private struct QueuedProtocolV3TrackChange {
+        let classification: String
+        let message: String
+        let target: QueuedProtocolV3TrackTarget?
+    }
+
+    /// Re-publishes a queued track pick just before the deferred replan reads
+    /// the selection back, undoing any interim `adoptAetherInventory`.
+    ///
+    /// The recorded Aether id is tried first; if the interim plan repackaged
+    /// the streams and that id is gone, the pick is re-found by the server
+    /// identity captured at queue time — the same ordinal the replan would
+    /// have sent — so a renumbered stream still restores the user's tap.
+    ///
+    /// A target that resolves to neither is dropped rather than forced: the
+    /// interim plan may not carry that track at all, and a selection pointing
+    /// at nothing resolves to no index, which is a worse answer than the one
+    /// the engine is actually rendering.
+    private func restoreQueuedProtocolV3TrackSelection(
+        _ target: QueuedProtocolV3TrackTarget
+    ) {
+        switch target {
+        case .audio(let trackId, let selectionIndex):
+            let resolved = audioTracks.first { $0.trackId == trackId }
+                ?? selectionIndex.flatMap { wanted in
+                    audioTracks.first { audioSelectionIndex(for: $0) == wanted }
+                }
+            guard let resolved, selectedAudioId != resolved.trackId else { return }
+            pendingAudioFfIndex = nil
+            selectedAudioId = resolved.trackId
+            reapplySystemSubtitlePolicy()
+        case .subtitle(let trackId, let combinedIndex):
+            guard let trackId else {
+                guard selectedSubtitleId != nil else { return }
+                pendingSubtitleFfIndex = nil
+                hasExplicitSubtitleChoice = true
+                selectedSubtitleId = nil
+                return
+            }
+            let resolved = subtitleTracks.first { $0.trackId == trackId }
+                ?? combinedIndex.flatMap { wanted in
+                    subtitleTracks.first { serverCombinedSubtitleIndex(for: $0) == wanted }
+                }
+            guard let resolved, selectedSubtitleId != resolved.trackId else { return }
+            pendingSubtitleFfIndex = nil
+            hasExplicitSubtitleChoice = true
+            selectedSubtitleId = resolved.trackId
+        }
+    }
+
+    @discardableResult
+    private func attemptProtocolV3Replan(
+        position: Double,
+        classification: String,
+        message: String,
+        operation: String? = nil,
+        qualityPreference: String? = nil,
+        autoBandwidthCapKbps: Int? = nil,
+        qualityAxes: AppleQualityAxes? = nil,
+        // Set when this replan completes the viewer's quality switch: the
+        // side of the connection its request was built for.
+        qualitySwitchOnMeteredNetwork: Bool? = nil,
+        requeueWhenBusy: Bool = false,
+        trackTarget: QueuedProtocolV3TrackTarget? = nil,
+        outputRouteSnapshot: ApplePlaybackV3CapabilitySnapshot? = nil,
+        bandwidthEstimateKbps: Int? = nil,
+        bandwidthEstimateSource: String? = nil,
+        learnedLimit: String? = nil,
+        observedThroughputKbps: Int? = nil,
+        // The buffering controller's replan, which hears when it fails.
+        issuedByBufferingQuality: Bool = false,
+        // The viewer's quality change: pending from the send until its plan
+        // is adopted, refused if it never is.
+        viewerQualityChange: Bool = false
+    ) -> Bool {
+        // One classification of the user's target. A track change must have a
+        // stable server ordinal before it is queued or issued: falling back to
+        // the currently published engine selection would turn an unmappable tap
+        // into a successful replan for the track that was already playing.
+        //
+        // The dimension the user did not touch stays `nil` here and is read
+        // back from the player below, after any queued pick is re-published.
+        let explicitAudioTrackIndex: Int?
+        let explicitSubtitleTrackIndex: Int?
+        let targetsSubtitle: Bool
+        switch trackTarget {
+        case .audio(_, nil), .subtitle(.some, nil):
+            return false
+        case .audio(_, let selectionIndex):
+            explicitAudioTrackIndex = selectionIndex
+            explicitSubtitleTrackIndex = nil
+            targetsSubtitle = false
+        case .subtitle(let trackId, let combinedIndex):
+            explicitAudioTrackIndex = nil
+            // Nil subtitle with a nil track id is explicit Off.
+            explicitSubtitleTrackIndex = trackId == nil ? nil : combinedIndex
+            targetsSubtitle = true
+        case nil:
+            explicitAudioTrackIndex = nil
+            explicitSubtitleTrackIndex = nil
+            targetsSubtitle = false
+        }
+        if protocolV3ReplanTask != nil {
+            if operation == PlaybackProtocolV3.ReplanOperation.seekReanchor {
+                // Rapid windowed seeks are latest-wins. Re-issue the newest
+                // target after the in-flight route transition settles.
+                pendingProtocolV3SeekReanchorPosition = position
+                return true
+            }
+            if requeueWhenBusy {
+                // A user track change. The UI already shows the new
+                // selection, so dropping the switch here would leave the
+                // player permanently disagreeing with itself. Latest-wins,
+                // same as a seek: re-issued when the in-flight replan
+                // settles, at whatever position playback has reached by then.
+                pendingProtocolV3TrackChange = QueuedProtocolV3TrackChange(
+                    classification: classification,
+                    message: message,
+                    target: trackTarget
+                )
+                return true
+            }
+            if qualitySwitchOnMeteredNetwork != nil { isQualitySwitching = false }
+            return false
+        }
+        guard let watchDetail = currentWatchDetail else {
+            if qualitySwitchOnMeteredNetwork != nil { isQualitySwitching = false }
+            return false
+        }
+        // This replan is about to read the current selection back. On the
+        // deferred path that selection may have been republished from the
+        // interim plan's inventory while the user's pick waited, so reassert
+        // the pick first. On the direct path the pick is already published and
+        // this is a no-op.
+        if let trackTarget {
+            restoreQueuedProtocolV3TrackSelection(trackTarget)
+        }
+        let selectedSubtitleSnapshot = selectedSubtitleId
+        // The user-facing selection can be republished from Aether while the
+        // async replan task is waiting to start (inventory/store discovery is
+        // still active after a replacement load). A user track change already
+        // carries the stable server identity captured at tap time; freeze the
+        // request indices here instead of re-reading mutable player state from
+        // inside the task.
+        let requestedAudioTrackIndex = explicitAudioTrackIndex
+            ?? resolvedAudioTrackIndexForResume()
+        let requestedSubtitleTrackIndex = targetsSubtitle
+            ? explicitSubtitleTrackIndex
+            : resolvedProtocolV3SubtitleIndexForResume()
+        if targetsSubtitle {
+            cmpLog(
+                "[CMP-SUB] phase=replan_request requested_index="
+                    + (requestedSubtitleTrackIndex.map(String.init) ?? "off")
+            )
+        }
+        // A recovery or seek replan that cannot reach the server after the
+        // viewing played is a lost connection, not a failed route (§6.2). The
+        // viewer's play intent is the one at the time of the request: a
+        // failed transport is torn down, and that pause is not theirs.
+        let resolvedOperation = operation
+            ?? PlaybackSessionBridge.replanOperation(forClassification: classification)
+        // A displaced Restore's clear rides on this replan, once.
+        let learnedLimit = learnedLimit ?? takeOwedBufferingLearnedLimitClear()
+        if learnedLimit == PlaybackProtocolV3.LearnedLimit.clear { owesBufferingLearnedLimitClear = false }
+        let keptEstimateKbps = bandwidthEstimateKbps == nil
+            ? Self.keptReplanEstimateKbps(
+                operation: resolvedOperation, issuedByBufferingQuality: issuedByBufferingQuality,
+                controller: bufferingQuality
+            )
+            : nil
+        if let keptEstimateKbps {
+            Self.logger.info(
+                "[CMP-BUFFERING] \(resolvedOperation, privacy: .public) replan repeats kept estimate=\(keptEstimateKbps, privacy: .public)"
+            )
+        }
+        let requestedEstimateKbps = bandwidthEstimateKbps ?? keptEstimateKbps
+        let joinsReconnectWhenUnanswered = classification != "output_route_changed"
+            && (resolvedOperation == PlaybackProtocolV3.ReplanOperation.failureRecovery
+                || resolvedOperation == PlaybackProtocolV3.ReplanOperation.seekReanchor)
+        let playIntentAtRequest = aetherPlaybackController.shouldPlayWhenReady
+        // A quality, track or seek replan is a fresh look at the stream; only
+        // the reconnect's own replan keeps where the last one resumed.
+        if classification != PlaybackReconnectPolicy.classification {
+            lastEndReconnect = nil
+        }
+        progressTask?.cancel()
+        isLoading = true
+        isBuffering = false
+        isLoadingSubtitles = false
+        bufferingProgress = nil
+        // The replan is prepared before any engine event; hold the intro
+        // pill's timer through it like any other stall.
+        syncIntroSkipPrompt()
+        streamLoadGeneration &+= 1
+        let currentStreamLoadGeneration = streamLoadGeneration
+        let qualityChange = viewerQualityChange ? sendViewerQualityChange() : nil
+        protocolV3ReplanTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            let priorActivePlaybackSessionId = self.activePlaybackSessionId
+            let priorAetherLoadEpoch = self.activeAetherLoadEpoch
+            let priorWatchDetail = self.currentWatchDetail
+            let priorSelectedVersion = self.currentSelectedVersion
+            let priorPreparedProtocolV3 = self.activePreparedProtocolV3
+            let priorLocalSubtitleSelection = self.localProtocolV3SubtitleSelection
+            let priorLastLoadRequest = self.lastLoadRequest
+            let priorPendingAudioFfIndex = self.pendingAudioFfIndex
+            let priorPendingSubtitleFfIndex = self.pendingSubtitleFfIndex
+            let priorPendingSidecarSubtitleTrackId = self.pendingSidecarSubtitleTrackId
+            let priorPendingServerRenderedSubtitleTrackId = self.pendingServerRenderedSubtitleTrackId
+            let priorPendingExternalSubtitles = self.pendingExternalSubtitles
+            let priorKnownExternalSubtitles = self.knownExternalSubtitles
+            let priorDuration = self.duration
+            let priorCurrentTime = self.currentTime
+            let priorActiveQualityId = self.activeQualityId
+            let priorQualityOptions = self.qualityOptions
+            let priorResolvedServerUrl = self.resolvedServerUrl
+            let priorPrefsForCurrentItem = self.prefsForCurrentItem
+            let priorPrefsResolvedForCurrentItem = self.prefsResolvedForCurrentItem
+            let priorDeferredAutoSubtitlePick = self.deferredAutoSubtitlePick
+            // Captured when the replan replaces them, not here: a
+            // markers_updated event can land while the replan is in flight.
+            var replacedMarkers: ReplacedMarkerRanges?
+            /// Puts back the state this replan overwrote when it fails or is
+            /// abandoned before committing.
+            @MainActor func restorePriorReplanState() {
+                self.activePlaybackSessionId = priorActivePlaybackSessionId
+                self.currentWatchDetail = priorWatchDetail
+                self.currentSelectedVersion = priorSelectedVersion
+                if let replacedMarkers {
+                    self.introRange = replacedMarkers.intro
+                    self.creditsRange = replacedMarkers.credits
+                    self.recapRange = replacedMarkers.recap
+                }
+                self.activePreparedProtocolV3 = priorPreparedProtocolV3
+                self.localProtocolV3SubtitleSelection = priorLocalSubtitleSelection
+                self.lastLoadRequest = priorLastLoadRequest
+                self.pendingAudioFfIndex = priorPendingAudioFfIndex
+                self.pendingSubtitleFfIndex = priorPendingSubtitleFfIndex
+                self.pendingSidecarSubtitleTrackId = priorPendingSidecarSubtitleTrackId
+                self.pendingServerRenderedSubtitleTrackId = priorPendingServerRenderedSubtitleTrackId
+                self.pendingExternalSubtitles = priorPendingExternalSubtitles
+                self.knownExternalSubtitles = priorKnownExternalSubtitles
+                self.duration = priorDuration
+                self.currentTime = priorCurrentTime
+                self.activeQualityId = priorActiveQualityId
+                self.qualityOptions = priorQualityOptions
+                self.resolvedServerUrl = priorResolvedServerUrl
+                self.prefsForCurrentItem = priorPrefsForCurrentItem
+                self.prefsResolvedForCurrentItem = priorPrefsResolvedForCurrentItem
+                // A pick held for this replan was resolved against its plan
+                // and audio, which no longer apply.
+                self.deferredAutoSubtitlePick = priorDeferredAutoSubtitlePick
+            }
+            var uncommittedPrepared: PreparedPlayback?
+            var chainedLoadFailureRecovery: (position: Double, classification: String, message: String)?
+            // A lowering that failed before the engine left the current plan:
+            // that plan keeps playing, as the spec requires.
+            var keepsCurrentPlan = false
+            var adoptedBufferingPlan = false
+            defer {
+                self.protocolV3ReplanTask = nil
+                if keepsCurrentPlan {
+                    // Undo what the request set up: the old load still plays.
+                    self.isLoading = self.currentPhaseIsLoading()
+                    self.startProgressReporting()
+                }
+                if issuedByBufferingQuality, !adoptedBufferingPlan {
+                    Self.logger.info("[CMP-BUFFERING] replan failed or was not adopted")
+                    self.bufferingQuality.replanFailed()
+                }
+                // Settled already if it owns the session; otherwise refused.
+                self.settleViewerQualityChange(qualityChange, adopted: false)
+                self.syncBufferingQualitySignals()
+                defer { self.publishWatchPartySnapshot() }
+                if qualitySwitchOnMeteredNetwork != nil { self.isQualitySwitching = false }
+                // A handoff this replan began but never installed: the
+                // viewer's last seek still applies to whatever plays next.
+                if let seekTarget = self.reconnectCycle.finishHandoff() {
+                    self.pendingProtocolV3SeekReanchorPosition = seekTarget
+                }
+                // A start-deadline lowering that left the failed load
+                // installed hands that load's failure to the usual recovery.
+                let heldRecovery = issuedByBufferingQuality ? self.takeHeldStartDeadlineRecovery() : nil
+                if let recovery = chainedLoadFailureRecovery ?? heldRecovery {
+                    self.attemptProtocolV3Replan(
+                        position: recovery.position,
+                        classification: recovery.classification,
+                        message: recovery.message
+                    )
+                } else if let restore = self.deferredBufferingRestore {
+                    self.deferredBufferingRestore = nil
+                    self.issueBufferingReplan(restore)
+                } else if let queuedTrackChange = self.pendingProtocolV3TrackChange {
+                    // Drained before the queued seek: this replan will pick
+                    // up any still-pending reanchor in its own defer, so both
+                    // user intents survive and the seek lands last.
+                    self.pendingProtocolV3TrackChange = nil
+                    if !self.isDisposed, self.activePreparedProtocolV3 != nil {
+                        self.attemptProtocolV3Replan(
+                            position: self.currentTime,
+                            classification: queuedTrackChange.classification,
+                            message: queuedTrackChange.message,
+                            requeueWhenBusy: true,
+                            trackTarget: queuedTrackChange.target
+                        )
+                    }
+                } else if let queuedTarget = self.pendingProtocolV3SeekReanchorPosition {
+                    self.pendingProtocolV3SeekReanchorPosition = nil
+                    if !self.isDisposed, self.activePreparedProtocolV3 != nil {
+                        self.commitSeek(to: queuedTarget, source: "queuedReanchor", roomCommand: self.isWatchPartyPlayback)
+                    }
+                } else if currentStreamLoadGeneration == self.streamLoadGeneration {
+                    // Runs only once this task handle is cleared, so a policy
+                    // replan it issues is accepted rather than rejected as busy.
+                    self.reapplyDeferredAutoSubtitlePolicyIfNeeded()
+                }
+            }
+            do {
+                guard let prepared = try await self.sessionBridge.replanProtocolV3(
+                    watchDetail: watchDetail,
+                    position: position,
+                    classification: classification,
+                    message: message,
+                    operation: operation,
+                    qualityPreference: qualityPreference,
+                    autoBandwidthCapKbps: autoBandwidthCapKbps,
+                    qualityAxes: qualityAxes,
+                    audioTrackIndex: requestedAudioTrackIndex,
+                    subtitleTrackIndex: requestedSubtitleTrackIndex,
+                    outputRouteSnapshot: outputRouteSnapshot,
+                    bufferingQualityMode: self.settings.bufferingQualityMode,
+                    bandwidthEstimateKbps: requestedEstimateKbps,
+                    bandwidthEstimateSource: bandwidthEstimateSource,
+                    learnedLimit: learnedLimit,
+                    observedThroughputKbps: observedThroughputKbps
+                ) else {
+                    if self.reconnectCycle.isActive {
+                        // No session left to replan: start a new one.
+                        self.scheduleReconnectSessionStart()
+                        return
+                    }
+                    if issuedByBufferingQuality {
+                        keepsCurrentPlan = true
+                        return
+                    }
+                    self.finalizeTerminalPlaybackError(message)
+                    return
+                }
+                if targetsSubtitle {
+                    cmpLog(
+                        "[CMP-SUB] phase=replan_response selected_index="
+                            + (prepared.protocolV3?.plan.selectedTracks.subtitle?.index.map(String.init) ?? "off")
+                            + " mode="
+                            + (prepared.protocolV3?.plan.subtitle.mode ?? "unknown")
+                    )
+                }
+                uncommittedPrepared = prepared
+                guard !Task.isCancelled,
+                      !self.isDisposed,
+                      currentStreamLoadGeneration == self.streamLoadGeneration else {
+                    throw CancellationError()
+                }
+                // The server answered with a plan: any reconnect ends here,
+                // and the new transport plays only if the viewer was playing.
+                // Seeks keep landing on the reconnect until that transport
+                // is installed.
+                let reconnectResume = self.adoptPlanEndingReconnect(requestedPosition: position)
+
+                let previousSessionId = self.activePlaybackSessionId
+                self.activePlaybackSessionId = prepared.session.sessionId
+                self.currentWatchDetail = prepared.watchDetail
+                replacedMarkers = self.adoptReplannedVersion(prepared.selectedVersion)
+                self.activePreparedProtocolV3 = prepared.protocolV3
+                if targetsSubtitle || classification == "subtitle_track_changed" {
+                    self.localProtocolV3SubtitleSelection = nil
+                } else if priorPreparedProtocolV3?.plan.effectiveMediaFileId != prepared.protocolV3?.plan.effectiveMediaFileId,
+                          case .track? = self.localProtocolV3SubtitleSelection {
+                    // A non-seek replan can choose another edition. The server
+                    // remaps the requested track onto that edition's inventory.
+                    self.localProtocolV3SubtitleSelection = nil
+                }
+                // A viewer's switch is part of the candidate's recovery intent
+                // before it loads: a failed load promoted to recovery keeps
+                // the new quality, so a later renewal or retry asks for it
+                // too. A rejected candidate restores the prior request.
+                self.adoptProtocolV3RenewalIntent(
+                    from: prepared,
+                    viewerQualityId: qualitySwitchOnMeteredNetwork == nil ? nil : prepared.activeQualityId
+                )
+                if classification == "audio_track_changed" {
+                    self.reopenAutoSubtitlePolicyForAudioChange()
+                }
+                switch Self.protocolV3SidecarRestoreIntent(
+                    snapshot: selectedSubtitleSnapshot,
+                    selectedSubtitleIndex: prepared.protocolV3?.plan.selectedTracks.subtitle?.index,
+                    subtitleMode: prepared.protocolV3?.plan.subtitle.mode,
+                    isEmbedded: prepared.protocolV3?.plan.subtitle.embedded != nil
+                ) {
+                case .renderLocally(let trackId):
+                    self.pendingSidecarSubtitleTrackId = trackId
+                    self.pendingServerRenderedSubtitleTrackId = nil
+                case .serverRendered(let trackId):
+                    self.pendingSidecarSubtitleTrackId = nil
+                    self.pendingServerRenderedSubtitleTrackId = trackId
+                case nil:
+                    break
+                }
+                self.pendingExternalSubtitles = prepared.session.subtitleUrls ?? []
+                self.knownExternalSubtitles = self.pendingExternalSubtitles
+                self.duration = prepared.session.durationSeconds ?? prepared.selectedVersion.duration ?? self.duration
+                self.currentTime = self.movieTime(for: prepared.session)
+                self.activeQualityId = prepared.activeQualityId
+                self.qualityOptions = ApplePlaybackQuality.playbackOptions(
+                    serverQualities: prepared.protocolV3?.plan.availableQualities ?? [],
+                    bandwidthLimit: prepared.protocolV3?.plan.bandwidthLimit
+                )
+
+                try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                guard let streamRequest = await self.makeStreamRequest(
+                    session: prepared.session,
+                    additionalHeaders: prepared.protocolV3?.plan.stream.headers ?? [:],
+                    requiresHeaderAuthenticatedMedia: prepared.protocolV3?.serverFeatures.contains(
+                        PlaybackProtocolV3.headerAuthenticatedMediaFeature
+                    ) == true,
+                    allowsAuthorizedMediaOrigins:
+                        prepared.protocolV3?.negotiatedAuthorizedMediaOrigins == true
+                ) else {
+                    throw AetherLoadSpec.ValidationError.invalidStreamURL(prepared.session.streamUrl)
+                }
+                try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                self.resolvedServerUrl = streamRequest.serverUrl
+                let shouldPlayWhenReady = !self.isWatchPartyPlayback
+                    && (reconnectResume ?? self.aetherPlaybackController.shouldPlayWhenReady)
+                try await self.loadAether(
+                    prepared: prepared,
+                    streamRequest: streamRequest,
+                    expectedStreamLoadGeneration: currentStreamLoadGeneration,
+                    shouldPlayWhenReady: shouldPlayWhenReady
+                )
+                // A seek made while the reconnect's request was out, or while
+                // this transport loaded, is queued for it; this task's exit
+                // issues it.
+                if let seekTarget = self.reconnectCycle.finishHandoff() {
+                    self.pendingProtocolV3SeekReanchorPosition = seekTarget
+                }
+                guard await self.sessionBridge.commitPendingProtocolV3Transition(prepared) else {
+                    throw CancellationError()
+                }
+                self.markProtocolV3AetherLoadCommitted()
+                uncommittedPrepared = nil
+                self.settleViewerQualityChange(qualityChange, adopted: true)
+                self.adoptBufferingPlan(
+                    prepared,
+                    requestedEstimateKbps: requestedEstimateKbps,
+                    controllerInitiated: issuedByBufferingQuality
+                )
+                adoptedBufferingPlan = true
+                self.heldStartDeadlineFailure = nil
+                if let onMeteredNetwork = qualitySwitchOnMeteredNetwork {
+                    self.recordViewerQualityPick(
+                        prepared.activeQualityId,
+                        forContentId: self.lastLoadRequest?.contentId,
+                        onMeteredNetwork: onMeteredNetwork
+                    )
+                }
+                if previousSessionId != prepared.session.sessionId {
+                    await self.realtimeClient.unbind()
+                    await self.bindRealtimeControl(sessionId: prepared.session.sessionId)
+                }
+            } catch is CancellationError {
+                // Same rule as the fresh-load arm: an abandoned replan load
+                // must not leave the engine reading a retired session. Only
+                // once `loadAether` moved the epoch does the engine hold the
+                // candidate source; before that the prior source still plays.
+                if currentStreamLoadGeneration == self.streamLoadGeneration,
+                   self.activeAetherLoadEpoch != priorAetherLoadEpoch {
+                    _ = self.disposeAetherPlayback()
+                }
+                if let uncommittedPrepared {
+                    await self.sessionBridge.rollbackPendingProtocolV3Transition(uncommittedPrepared)
+                }
+                if currentStreamLoadGeneration == self.streamLoadGeneration {
+                    restorePriorReplanState()
+                    // A reconnect replan the bridge abandoned (its session
+                    // moved on) must not leave the reconnect waiting forever.
+                    // Leaving the player or a new load cancels the task and
+                    // the reconnect with it.
+                    if !Task.isCancelled, !self.isDisposed, self.reconnectCycle.isActive {
+                        self.continueReconnect(after: CancellationError(), step: .replan)
+                    }
+                }
+                return
+            } catch {
+                let loadFailure = self.protocolV3LoadFailureRecovery(error)
+                if let refusal = error as? PlaybackV3TerminalFailure {
+                    self.watchPartyAdapter?.onFailure?(refusal.reason, refusal.message)
+                }
+                if let uncommittedPrepared {
+                    if loadFailure.shouldAdvanceRoute {
+                        // Aether rejected the replacement before it could
+                        // commit. Preserve that exact failed plan as the V3
+                        // attempt being reported, then advance the bounded
+                        // route ladder. No realtime/first-frame/success event
+                        // is published.
+                        if await self.sessionBridge.promotePendingProtocolV3TransitionForRecovery(
+                            uncommittedPrepared
+                        ) {
+                            // Another load may have started while the bridge
+                            // promoted this one. This replan is then stale: its
+                            // pick and its recovery belong to a title that is
+                            // no longer playing.
+                            guard !Task.isCancelled,
+                                  !self.isDisposed,
+                                  currentStreamLoadGeneration == self.streamLoadGeneration else {
+                                return
+                            }
+                            // The new quality now owns the session, so a
+                            // viewer's switch counts as their pick.
+                            self.settleViewerQualityChange(qualityChange, adopted: true)
+                            if let onMeteredNetwork = qualitySwitchOnMeteredNetwork {
+                                self.recordViewerQualityPick(
+                                    uncommittedPrepared.activeQualityId,
+                                    forContentId: self.lastLoadRequest?.contentId,
+                                    onMeteredNetwork: onMeteredNetwork
+                                )
+                            }
+                            chainedLoadFailureRecovery = (
+                                position,
+                                loadFailure.classification,
+                                loadFailure.message
+                            )
+                            return
+                        }
+                    }
+                    await self.sessionBridge.rollbackPendingProtocolV3Transition(uncommittedPrepared)
+                }
+                if currentStreamLoadGeneration == self.streamLoadGeneration {
+                    restorePriorReplanState()
+                }
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                Self.logger.error(
+                    "Protocol V3 replan failed: \(MediaLogRedactor.sanitize(error), privacy: .public)"
+                )
+                if PlaybackSessionBridge.isPlaybackSessionEnded(error) {
+                    self.leaveServerEndedSession()
+                    return
+                }
+                if self.reconnectCycle.isActive {
+                    // A replan sent while reconnecting got no plan back: the
+                    // reconnect decides whether to wait or start over.
+                    self.continueReconnect(after: error, step: .replan)
+                    return
+                }
+                if joinsReconnectWhenUnanswered,
+                   self.viewingHasPlayed,
+                   PlaybackReconnectPolicy.isUnanswered(error),
+                   self.beginReconnect(position: position, resume: playIntentAtRequest) {
+                    return
+                }
+                if PlaybackSessionBridge.isPlaybackSessionMissing(error),
+                   self.attemptStaleSessionRenewal(
+                       reason: "protocol_v3_replan_missing_session",
+                       observedPosition: position
+                   ) {
+                    return
+                }
+                if issuedByBufferingQuality, self.activeAetherLoadEpoch == priorAetherLoadEpoch {
+                    keepsCurrentPlan = true
+                    return
+                }
+                self.finalizeTerminalPlaybackError(
+                    error.localizedDescription,
+                    retryable: Self.isRetryablePlaybackFailure(error)
+                )
+            }
+        }
+        syncBufferingQualitySignals()
+        return true
+    }
+
+    private func protocolV3FailureClassification(_ message: String) -> String {
+        let value = message.lowercased()
+        if value.contains("decoder") || value.contains("videotoolbox") || value.contains("-129") {
+            return "decoder_error"
+        }
+        if value.contains("unsupported") || value.contains("cannot decode") {
+            return "unsupported_stream"
+        }
+        if value.contains("network") || value.contains("timed out") || value.contains("connection") {
+            return "network_degraded"
+        }
+        if value.contains("http 404") || value.contains("not found") || value.contains("source ended") {
+            return "source_unavailable"
+        }
+        return "playback_error"
+    }
+
+    private func protocolV3LoadFailureRecovery(
+        _ error: Error
+    ) -> (shouldAdvanceRoute: Bool, classification: String, message: String) {
+        if let error = error as? ApplePlaybackV3PlanError,
+           case .invalidEmbeddedSubtitle = error {
+            return (true, "subtitle_embedded_failed", error.localizedDescription)
+        }
+        if let failure = error as? AetherPlaybackController.EmbeddedSubtitleSelectionError {
+            return (true, "subtitle_embedded_failed", failure.localizedDescription)
+        }
+        if let loadFailure = error as? AetherPlaybackController.LoadFailure {
+            let failure = loadFailure.failure
+            // Aether defines rate limiting as a retry-later condition at the
+            // same origin, not evidence that another decode/remux rung is
+            // suitable. All other typed open failures are useful V3 ladder
+            // evidence and remain bounded by the bridge's attempt limit.
+            return (
+                failure.kind != .sourceRateLimited,
+                failure.kind.rawValue,
+                failure.message
+            )
+        }
+        let message = error.localizedDescription
+        return (true, protocolV3FailureClassification(message), message)
+    }
+
+    private func shouldTreatPlaybackErrorAsNaturalEnd() -> Bool {
+        guard duration.isFinite, duration > 0, currentTime.isFinite, currentTime > 0 else {
+            return false
+        }
+        let remaining = duration - currentTime
+        let progress = currentTime / duration
+        return remaining <= Self.nearEndPlaybackErrorThresholdSeconds || progress >= 0.985
+    }
+
+    private func loadNextUpCandidate(for detail: WatchDetail) {
+        guard !isWatchPartyPlayback else { return }
+        nextUpLookupTask?.cancel()
+        nextUpLookupTask = nil
+        nextUpEpisode = nil
+        nextUpLookupError = nil
+        isLoadingNextUpEpisode = false
+        nextUpAutoplayCancelled = false
+        nextUpPromptDismissed = false
+        cancelNextUpCountdown()
+
+        // A shuffle replaces the series order: the server picks what follows.
+        if shuffleState != nil {
+            publishShuffleNextUp()
+            refreshShufflePick()
+            return
+        }
+
+        guard detail.type == "episode",
+              let seriesId = detail.seriesId,
+              let seasonNumber = detail.seasonNumber,
+              let episodeNumber = detail.episodeNumber else {
+            offerOnDeckItemIfNothingNext()
+            return
+        }
+
+        isLoadingNextUpEpisode = true
+        nextUpLookupTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            defer {
+                if !Task.isCancelled {
+                    self.nextUpLookupTask = nil
+                }
+            }
+
+            do {
+                let episode = try await self.resolveNextUpEpisode(
+                    contentId: detail.contentId,
+                    seriesId: seriesId,
+                    seriesTitle: detail.seriesTitle,
+                    seasonNumber: seasonNumber,
+                    episodeNumber: episodeNumber
+                )
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                self.nextUpEpisode = episode
+                self.isLoadingNextUpEpisode = false
+                self.nextUpLookupError = nil
+                if episode == nil && self.offerOnDeckItemIfNothingNext() { return }
+                if self.showNextUpScreen {
+                    self.startNextUpCountdownIfNeeded()
+                } else {
+                    self.updateNextUpPresentation(for: self.currentTime)
+                }
+            } catch {
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                self.isLoadingNextUpEpisode = false
+                self.nextUpLookupError = (error as? LocalizedError)?.errorDescription
+                    ?? String(describing: error)
+                if self.showNextUpScreen {
+                    self.cancelNextUpCountdown()
+                }
+            }
+        }
+    }
+
+    private func loadNextUpOnDeckItems(for detail: WatchDetail) {
+        guard !isWatchPartyPlayback else { return }
+        nextUpOnDeckTask?.cancel()
+        nextUpOnDeckTask = nil
+        nextUpOnDeckItems = []
+        isLoadingNextUpOnDeck = true
+
+        nextUpOnDeckTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            defer {
+                if !Task.isCancelled {
+                    self.nextUpOnDeckTask = nil
+                }
+            }
+
+            do {
+                let read = try await SiloAPI.shared.homeSections()
+                let isCurrentOwner = await SiloAPI.shared.isCurrentOwner(read.auth)
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                guard isCurrentOwner else { throw HTTPError.requestIdentityChanged }
+                let response = read.response
+                let items = await self.resolveOnDeckItems(from: response, currentDetail: detail)
+                // A newer load cancels this task; its items would become that
+                // load's Up Next pick.
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                self.nextUpOnDeckItems = items
+                self.isLoadingNextUpOnDeck = false
+                if self.offerOnDeckItemIfNothingNext() { return }
+                self.updateNextUpPresentation(for: self.currentTime)
+            } catch {
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                self.nextUpOnDeckItems = []
+                self.isLoadingNextUpOnDeck = false
+            }
+        }
+    }
+
+    /// With no next episode, the first On Deck item is up next, so playback
+    /// carries on into what the profile is watching elsewhere instead of
+    /// stopping at the end. A failed episode lookup offers nothing: the
+    /// series may still have a next episode. Returns whether it offered one.
+    @discardableResult
+    private func offerOnDeckItemIfNothingNext() -> Bool {
+        #if os(macOS)
+        // macOS has no Up Next screen, so the pick would start another title
+        // with no countdown on screen and no way to cancel it.
+        return false
+        #else
+        guard !isWatchPartyPlayback,
+              shuffleState == nil,
+              nextUpEpisode == nil,
+              !isLoadingNextUpEpisode,
+              nextUpLookupError == nil,
+              !isStartingNextUp,
+              let item = nextUpCarouselItems.first else { return false }
+        nextUpEpisode = PlayerNextUpEpisode(onDeckItem: item)
+        if showNextUpScreen {
+            startNextUpCountdownIfNeeded()
+        } else {
+            updateNextUpPresentation(for: currentTime)
+        }
+        return true
+        #endif
+    }
+
+    private func resolveOnDeckItems(
+        from response: SectionsResponse,
+        currentDetail: WatchDetail
+    ) async -> [PlayerOnDeckItem] {
+        let allowedSectionTypes: Set<String> = ["continue_watching", "in_progress", "next_up"]
+        var seenContentIds: Set<String> = []
+        var sourceItems: [SectionItem] = []
+
+        for section in response.sections where allowedSectionTypes.contains(section.sectionType) {
+            for item in section.items {
+                guard item.contentId != currentDetail.contentId else { continue }
+                if let currentSeriesId = currentDetail.seriesId,
+                   item.seriesId == currentSeriesId {
+                    continue
+                }
+                guard seenContentIds.insert(item.contentId).inserted else { continue }
+                sourceItems.append(item)
+                if sourceItems.count >= 12 {
+                    return await makeOnDeckItems(from: sourceItems)
+                }
+            }
+        }
+
+        return await makeOnDeckItems(from: sourceItems)
+    }
+
+    private func makeOnDeckItems(from sourceItems: [SectionItem]) async -> [PlayerOnDeckItem] {
+        // Several items often share a season; fetch each episode list once.
+        let seasons = await Self.episodeLists(for: sourceItems)
+        return await withTaskGroup(of: (Int, PlayerOnDeckItem)?.self) { group in
+            for (index, item) in sourceItems.enumerated() {
+                group.addTask {
+                    guard let artwork = await Self.horizontalArtwork(for: item, seasons: seasons) else {
+                        return nil
+                    }
+                    return (
+                        index,
+                        PlayerOnDeckItem(
+                            item: item,
+                            artworkUrl: artwork.url,
+                            artworkThumbhash: artwork.thumbhash
+                        )
+                    )
+                }
+            }
+
+            var indexedItems: [(Int, PlayerOnDeckItem)] = []
+            for await result in group {
+                if let result {
+                    indexedItems.append(result)
+                }
+            }
+            return indexedItems
+                .sorted { $0.0 < $1.0 }
+                .map(\.1)
+        }
+    }
+
+    private struct SeasonKey: Hashable {
+        let seriesId: String
+        let seasonNumber: Int
+
+        init?(_ item: SectionItem) {
+            guard let seriesId = PlayerViewModel.nonEmpty(item.seriesId),
+                  let seasonNumber = item.seasonNumber else { return nil }
+            self.seriesId = seriesId
+            self.seasonNumber = seasonNumber
+        }
+    }
+
+    /// Episode lists for the distinct seasons among `items`. A failed fetch
+    /// leaves its season out; artwork should never block playback choices.
+    private static func episodeLists(for items: [SectionItem]) async -> [SeasonKey: [EpisodeListItem]] {
+        let keys = Set(items.compactMap(SeasonKey.init))
+        return await withTaskGroup(of: (SeasonKey, [EpisodeListItem])?.self) { group in
+            for key in keys {
+                group.addTask {
+                    guard let response = try? await SiloAPI.shared.episodes(
+                        seriesId: key.seriesId,
+                        seasonNumber: key.seasonNumber
+                    ) else { return nil }
+                    return (key, response.episodes)
+                }
+            }
+            var lists: [SeasonKey: [EpisodeListItem]] = [:]
+            for await result in group {
+                if let result {
+                    lists[result.0] = result.1
+                }
+            }
+            return lists
+        }
+    }
+
+    private static func horizontalArtwork(
+        for item: SectionItem,
+        seasons: [SeasonKey: [EpisodeListItem]]
+    ) async -> (url: String, thumbhash: String?)? {
+        // Episode items: prefer the per-episode still (genuine 16:9 scene art)
+        // over item.backdropUrl, which usually points at the show-level keyart.
+        if let key = SeasonKey(item),
+           let episode = seasons[key]?.first(where: {
+               $0.contentId == item.contentId || $0.episodeNumber == item.episodeNumber
+           }),
+           let stillUrl = nonEmpty(episode.stillUrl) {
+            return (stillUrl, episode.stillThumbhash)
+        }
+
+        if let backdropUrl = nonEmpty(item.backdropUrl) {
+            return (backdropUrl, item.backdropThumbhash)
+        }
+
+        do {
+            let detail = try await SiloAPI.shared.itemDetail(contentId: item.contentId)
+            if let backdropUrl = nonEmpty(detail.backdropUrl) {
+                return (backdropUrl, detail.backdropThumbhash)
+            }
+        } catch {
+            // No horizontal source — caller drops the item rather than stretching a poster.
+        }
+
+        return nil
+    }
+
+    private nonisolated static func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    func resolveNextUpEpisode(
+        contentId: String,
+        seriesId: String,
+        seriesTitle: String?,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        api: SiloAPI = .shared
+    ) async throws -> PlayerNextUpEpisode? {
+        let libraryId = self.libraryId
+        async let seasonsTask = api.seasons(seriesId: seriesId, libraryId: libraryId)
+        async let currentEpisodesTask = api.episodes(
+            seriesId: seriesId,
+            seasonNumber: seasonNumber,
+            libraryId: libraryId
+        )
+
+        let seasonsResponse = try await seasonsTask
+        let currentEpisodesResponse = try await currentEpisodesTask
+        let seasons = seasonsResponse.seasons.sortedForDisplay()
+        var episodes = currentEpisodesResponse.episodes
+
+        let nextSeason = seasons.first { season in
+            !(season.isSpecials ?? false) && season.seasonNumber > seasonNumber
+        }
+        if let nextSeason {
+            let nextSeasonEpisodes = try await api.episodes(
+                seriesId: seriesId,
+                seasonNumber: nextSeason.seasonNumber,
+                libraryId: libraryId
+            )
+            episodes.append(contentsOf: nextSeasonEpisodes.episodes)
+        }
+
+        let orderedEpisodes = episodes.sorted { lhs, rhs in
+            if lhs.seasonNumber != rhs.seasonNumber {
+                return lhs.seasonNumber < rhs.seasonNumber
+            }
+            if lhs.episodeNumber != rhs.episodeNumber {
+                return lhs.episodeNumber < rhs.episodeNumber
+            }
+            return lhs.contentId < rhs.contentId
+        }
+
+        let currentIndex = orderedEpisodes.firstIndex { $0.contentId == contentId }
+            ?? orderedEpisodes.firstIndex {
+                $0.seasonNumber == seasonNumber && $0.episodeNumber == episodeNumber
+            }
+        guard let currentIndex, currentIndex < orderedEpisodes.index(before: orderedEpisodes.endIndex) else {
+            return nil
+        }
+
+        return PlayerNextUpEpisode(
+            episode: orderedEpisodes[orderedEpisodes.index(after: currentIndex)],
+            seriesId: seriesId,
+            seriesTitle: seriesTitle
+        )
+    }
+
+    private func updateNextUpPresentation(for movieTime: Double) {
+        guard !isWatchPartyPlayback else { return }
+        // A retained native host must not reopen the outgoing episode's
+        // postroll before the successor has presented its own first frame.
+        guard !hasReachedEndOfFile,
+              let epoch = activeAetherLoadEpoch,
+              startedAetherLoadEpoch == epoch else { return }
+        if showNextUpScreen {
+            updateNextUpCountdownForActivePlayback(at: movieTime)
+            return
+        }
+        guard shouldShowNextUpBeforeEnd(at: movieTime) else {
+            nextUpPromptDismissed = false
+            return
+        }
+        guard !nextUpPromptDismissed else { return }
+        beginNextUpPostroll(videoEnded: false, source: .automatic)
+    }
+
+    private func shouldShowNextUpBeforeEnd(at movieTime: Double) -> Bool {
+        canShowNextUpScreen
+            && nextShufflePart == nil
+            && PlayerNextUpCompletionPolicy.isInPromptWindow(
+                currentTime: movieTime,
+                duration: duration,
+                promptSeconds: settings.nextUpPromptSeconds
+            )
+    }
+
+    func showNextUpNow() {
+        guard !isWatchPartyPlayback else { return }
+        guard canShowNextUpScreen else { return }
+        beginNextUpPostroll(videoEnded: false, source: .hud)
+    }
+
+    private func beginNextUpPostroll(
+        videoEnded: Bool,
+        source: NextUpPresentationSource = .automatic
+    ) {
+        guard !isWatchPartyPlayback else { return }
+        let wasAlreadyShowing = showNextUpScreen
+        let wasShowingBeforeEnd = showNextUpScreen && !nextUpScreenVideoEnded
+        if !wasAlreadyShowing {
+            nextUpPresentationSource = source
+            // The announced pick may no longer play; the read replaces it.
+            if shuffleState != nil { refreshShufflePick() }
+        }
+        showNextUpScreen = true
+        nextUpScreenVideoEnded = videoEnded
+        showControls = false
+        activeNotice = nil
+        isHUDPresented = false
+        if !wasShowingBeforeEnd && !videoEnded {
+            nextUpAutoplayCancelled = false
+        }
+        if videoEnded,
+           wasShowingBeforeEnd,
+           settings.autoPlayNextEpisode,
+           nextUpEpisode != nil,
+           !isPickingAnotherShufflePick,
+           !nextUpAutoplayCancelled {
+            playNextEpisodeNow()
+            return
+        }
+        startNextUpCountdownIfNeeded()
+    }
+
+    private func startNextUpCountdownIfNeeded() {
+        cancelNextUpCountdown()
+        guard showNextUpScreen,
+              !isStartingNextUp,
+              !isPickingAnotherShufflePick,
+              settings.autoPlayNextEpisode,
+              nextUpEpisode != nil,
+              !nextUpAutoplayCancelled else {
+            return
+        }
+
+        if !nextUpScreenVideoEnded && nextUpPresentationSource != .credits {
+            updateNextUpCountdownForActivePlayback(at: currentTime)
+            return
+        }
+
+        nextUpCountdownTotalSeconds = Self.nextUpCountdownDefaultSeconds
+        nextUpCountdownSeconds = Self.nextUpCountdownDefaultSeconds
+        nextUpCountdownTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var remaining = Self.nextUpCountdownDefaultSeconds
+            while remaining > 0 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                remaining -= 1
+                self.nextUpCountdownSeconds = remaining
+            }
+            guard !Task.isCancelled, !self.isDisposed else { return }
+            self.playNextEpisodeNow()
+        }
+    }
+
+    private func updateNextUpCountdownForActivePlayback(at movieTime: Double) {
+        // A pending Pick Another replaces the pick this would start; its
+        // answer restarts the countdown.
+        guard showNextUpScreen,
+              !isNextUpTransitioning,
+              !isPickingAnotherShufflePick,
+              !nextUpScreenVideoEnded,
+              nextUpPresentationSource != .credits,
+              settings.autoPlayNextEpisode,
+              nextUpEpisode != nil,
+              !nextUpAutoplayCancelled,
+              duration.isFinite,
+              duration > 0,
+              movieTime.isFinite else {
+            return
+        }
+
+        let remaining = max(0, duration - movieTime)
+        if nextUpPresentationSource == .hud,
+           remaining >= Self.nextUpHUDCountdownThresholdSeconds {
+            nextUpCountdownSeconds = nil
+            nextUpCountdownTotalSeconds = Int(Self.nextUpHUDCountdownThresholdSeconds)
+            return
+        }
+        nextUpCountdownTotalSeconds = nextUpPresentationSource == .hud
+            ? Int(Self.nextUpHUDCountdownThresholdSeconds)
+            : max(1, settings.nextUpPromptSeconds)
+        nextUpCountdownSeconds = max(0, Int(ceil(remaining)))
+        if remaining <= 0.35 {
+            playNextEpisodeNow()
+        }
+    }
+
+    private func cancelNextUpCountdown() {
+        nextUpCountdownTask?.cancel()
+        nextUpCountdownTask = nil
+        nextUpCountdownSeconds = nil
+        nextUpCountdownTotalSeconds = Self.nextUpCountdownDefaultSeconds
+    }
+
+    private func cancelNextUpFlow() {
+        nextUpLookupTask?.cancel()
+        nextUpLookupTask = nil
+        nextUpOnDeckTask?.cancel()
+        nextUpOnDeckTask = nil
+        cancelNextUpCountdown()
+    }
+
+    func cancelNextUpAutoPlay() {
+        nextUpAutoplayCancelled = true
+        cancelNextUpCountdown()
+    }
+
+    @discardableResult
+    func keepWatchingCurrentEpisode() -> Bool {
+        guard !isWatchPartyPlayback else { return false }
+        // Staying on this item wins over a shuffle advance still in flight;
+        // its late answer must not switch playback. If the server already
+        // moved on, the next Play Now replays that pick.
+        if isAdvancingShuffle { cancelShuffleOperations() }
+        // An autoplay load failure may restore the postroll after disposing
+        // the old playback pipeline. There is no current episode to resume in
+        // that state, so let the shell fall back to closing the player.
+        guard hasActiveAetherSession, !isNextUpTransitioning else { return false }
+
+        let shouldResumeAfterEnd = nextUpScreenVideoEnded || hasReachedEndOfFile
+        nextUpAutoplayCancelled = true
+        nextUpPromptDismissed = true
+        showNextUpScreen = false
+        nextUpScreenVideoEnded = false
+        cancelNextUpCountdown()
+
+        if shouldResumeAfterEnd,
+           duration.isFinite,
+           duration > 0,
+           hasActiveAetherSession {
+            // Returning from the terminal postroll needs a real playable
+            // position; resuming at exact EOF would immediately present the
+            // postroll again. Replay a short tail of the current episode.
+            hasReachedEndOfFile = false
+            let target = max(0, duration - 10)
+            let reloadsPlaybackPipeline = commitSeek(to: target, source: "nextUpBack")
+            if !reloadsPlaybackPipeline {
+                aetherPlaybackController.play()
+            }
+        } else if !isPlaying {
+            aetherPlaybackController.play()
+        }
+        scheduleHideControls()
+        return true
+    }
+
+    func setNextUpAutoPlayEnabled(_ enabled: Bool) {
+        settings.setAutoPlayNextEpisode(enabled)
+        if enabled {
+            nextUpAutoplayCancelled = false
+            startNextUpCountdownIfNeeded()
+        } else {
+            cancelNextUpAutoPlay()
+        }
+    }
+
+    func playNextEpisodeNow() {
+        guard !isWatchPartyPlayback else { return }
+        if shuffleState != nil {
+            playNextShufflePick()
+            return
+        }
+        let contentId: String
+        switch PlayerNextUpPlaybackAction.resolve(
+            candidateId: nextUpEpisode?.contentId,
+            currentId: lastLoadRequest?.contentId,
+            awaitingPicture: isNextUpTransitioning
+        ) {
+        case .unavailable, .waitForPicture:
+            return
+        case .expand:
+            // Presentation only: no prepare, load, seek, or play command.
+            // Preserve a preview that is already playing, paused or buffering.
+            cancelNextUpCountdown()
+            nextUpAutoplayCancelled = true
+            nextUpPromptDismissed = true
+            nextUpScreenVideoEnded = false
+            showNextUpScreen = false
+            return
+        case .load(let id):
+            contentId = id
+        }
+        var request = LoadRequest(
+            contentId: contentId,
+            preferredFileId: nil,
+            preferredAudioTrackIndex: nil,
+            preferredSubtitleTrackIndex: nil,
+            preferredSidecarSubtitleTrackId: nil,
+            startFromBeginning: false
+        )
+        // No quality override: the next title starts on the saved settings
+        // for the connection, since an in-player pick applies only to the
+        // title it was made on. An On Deck pick is another title, often in
+        // another library; it starts like a tap on its card.
+        if nextUpEpisode?.isFromOnDeck != true {
+            request.libraryId = libraryId
+        }
+        beginFreshLoad(
+            request: request,
+            progressPosition: completionProgressPositionForCurrentItem(),
+            finalizeCurrentSession: true,
+            origin: .autoplay
+        )
+    }
+
+    /// A quality the viewer picked in the player (or SiloRemote picked for
+    /// them) took effect. A fixed rung holds over the connection's saved pair
+    /// for the rest of this title, reloads included, and never carries to the
+    /// next episode. Auto is not such a pick: it follows the saved settings
+    /// for the connection, so connection changes keep replanning.
+    /// `onMeteredNetwork` is the side of the connection the pick's request
+    /// was built for, not the live one: a change while it was in flight
+    /// must still read as a change. Internal for tests.
+    func recordViewerQualityPick(_ qualityId: String, forContentId contentId: String?, onMeteredNetwork: Bool) {
+        if ApplePlaybackQuality.protocolV3QualityId(qualityId) == ApplePlaybackQuality.autoId {
+            explicitQualityPick = nil
+            networkQuality?.viewerDidPickAuto(onMeteredNetwork: onMeteredNetwork)
+        } else {
+            explicitQualityPick = (contentId, qualityId)
+            networkQuality?.viewerDidPickQuality()
+        }
+    }
+
+    /// Whether the viewer's fixed pick applies to a start of `contentId`:
+    /// a reload of the title it was made on. Internal for tests.
+    func viewerQualityPickApplies(toContentId contentId: String) -> Bool {
+        explicitQualityPick.map { $0.contentId == contentId } ?? false
+    }
+
+    /// The in-player menu row to light; see
+    /// `ApplePlaybackQuality.highlightedOptionId`.
+    var highlightedQualityOptionId: String? {
+        ApplePlaybackQuality.highlightedOptionId(
+            sessionQualityId: activeQualityId,
+            viewerPickId: explicitQualityPick?.qualityId,
+            planActiveQuality: activePreparedProtocolV3?.plan.activeQuality,
+            planReportsActiveQuality: activePreparedProtocolV3?.serverFeatures
+                .contains(PlaybackProtocolV3.planActiveQualityFeature) ?? false,
+            options: qualityOptions
+        )
+    }
+
+    /// The lit menu row, which names the quality the pill and labels show.
+    /// Without one they fall back to the session's own preference.
+    var activeQualityOption: ApplePlaybackQualityOption? {
+        highlightedQualityOptionId.flatMap { id in qualityOptions.first { $0.id == id } }
+    }
+
+    /// The quality SiloRemote checks and reads out: the lit row, or with none
+    /// the session's resolution. The remote checks whichever row matches, so
+    /// a resolution a row is named after (or a server rung id Settings can't
+    /// split) goes as its display name instead.
+    private var remoteActiveQualityId: String {
+        if let lit = highlightedQualityOptionId { return lit }
+        let resolution = AppleQualityAxes.split(activeQualityId).resolution
+        guard resolution != ApplePlaybackQuality.autoId,
+              !qualityOptions.contains(where: { $0.id == resolution }) else {
+            return ApplePlaybackQuality.displayName(for: activeQualityId)
+        }
+        return resolution
+    }
+
+    func playOnDeckItemNow(_ item: PlayerOnDeckItem) {
+        guard !isWatchPartyPlayback else { return }
+        // Choosing another title leaves the shuffle; it is not stopped, so
+        // like an abandoned one the server cleans it up.
+        leaveShuffle()
+        let request = LoadRequest(
+            contentId: item.contentId,
+            preferredFileId: nil,
+            preferredAudioTrackIndex: nil,
+            preferredSubtitleTrackIndex: nil,
+            preferredSidecarSubtitleTrackId: nil,
+            startFromBeginning: false
+        )
+        beginFreshLoad(
+            request: request,
+            progressPosition: completionProgressPositionForCurrentItem(),
+            finalizeCurrentSession: true
+        )
+    }
+
+    // MARK: - Shuffle
+
+    /// Offers the shuffle's pick on the up-next screen. A different pick gets
+    /// a full countdown rather than what was left of the previous one.
+    private func publishShuffleNextUp() {
+        guard let shuffleState else { return }
+        let pick = shuffleState.upNext.map(PlayerNextUpEpisode.init(shufflePick:))
+        guard pick != nextUpEpisode else { return }
+        let pickChanged = pick?.contentId != nextUpEpisode?.contentId
+        nextUpEpisode = pick
+        if showNextUpScreen {
+            if pick == nil {
+                cancelNextUpCountdown()
+            } else if pickChanged {
+                startNextUpCountdownIfNeeded()
+            }
+        } else {
+            updateNextUpPresentation(for: currentTime)
+        }
+    }
+
+    /// Re-reads the shuffle. The server replaces a pick that can no longer
+    /// play; `409` means nothing can, which shows the finished state. Any
+    /// other failure keeps the last pick.
+    private func refreshShufflePick() {
+        guard let shuffleId = shuffleState?.id else { return }
+        shuffleRefreshTask?.cancel()
+        shuffleRefreshTask = Task { @MainActor [weak self] in
+            let result: Result<APIv2Shuffle, Error>
+            do {
+                result = .success(try await SiloAPI.shared.shuffle(id: shuffleId))
+            } catch {
+                result = .failure(error)
+            }
+            // An advance or Pick Another answer is newer than this read.
+            guard let self, !Task.isCancelled, !self.isDisposed,
+                  self.shuffleState?.id == shuffleId,
+                  !self.isAdvancingShuffle, !self.isPickingAnotherShufflePick else { return }
+            switch result {
+            case .success(let latest): self.shuffleState?.apply(latest)
+            case .failure(let error): self.shuffleState?.applyRefreshFailure(error)
+            }
+            self.publishShuffleNextUp()
+        }
+    }
+
+    /// Moves the shuffle past the item that played and plays the new current
+    /// item from its beginning. Advancing names the played item, so a repeat
+    /// press or a retry after a lost answer plays the same pick.
+    private func playNextShufflePick() {
+        guard let shuffleState, shuffleState.upNext != nil,
+              !isStartingNextUp else { return }
+        let shuffleId = shuffleState.id
+        let playedContentId = shuffleState.advanceFromContentId
+        cancelShuffleOperations()
+        cancelNextUpCountdown()
+        isAdvancingShuffle = true
+        shuffleActionError = nil
+        shuffleTask = Task { @MainActor [weak self] in
+            let result: Result<APIv2Shuffle, Error>
+            do {
+                result = .success(try await SiloAPI.shared.advanceShuffle(id: shuffleId, fromContentId: playedContentId))
+            } catch {
+                result = .failure(error)
+            }
+            guard let self, !Task.isCancelled, !self.isDisposed,
+                  self.shuffleState?.id == shuffleId else { return }
+            self.isAdvancingShuffle = false
+            switch result {
+            case .success(let advanced):
+                self.shuffleState?.apply(advanced)
+                self.loadShufflePick(advanced.current.contentId)
+            case .failure(let error):
+                // Stop the countdown from retrying on its own; Play Now
+                // stays available.
+                self.nextUpAutoplayCancelled = true
+                self.shuffleState?.applyRefreshFailure(error)
+                self.shuffleActionError = ShuffleError.classify(error) == .nothingToPlay
+                    ? nil
+                    : "Couldn't continue the shuffle."
+                self.publishShuffleNextUp()
+            }
+        }
+    }
+
+    private func loadShufflePick(_ contentId: String) {
+        var request = LoadRequest(
+            contentId: contentId,
+            preferredFileId: nil,
+            preferredAudioTrackIndex: nil,
+            preferredSubtitleTrackIndex: nil,
+            preferredSidecarSubtitleTrackId: nil,
+            // Every pick plays from the beginning, not from saved progress.
+            startFromBeginning: true
+        )
+        request.startsAtFirstPart = true
+        beginFreshLoad(
+            request: request,
+            progressPosition: completionProgressPositionForCurrentItem(),
+            finalizeCurrentSession: true,
+            origin: .autoplay
+        )
+    }
+
+    /// Pick Another: the server replaces the announced next item.
+    func pickAnotherShufflePick() {
+        guard let shuffleState, canPickAnotherShufflePick,
+              !isPickingAnotherShufflePick else { return }
+        let shuffleId = shuffleState.id
+        let nextContentId = shuffleState.shuffle.next.contentId
+        cancelShuffleOperations()
+        cancelNextUpCountdown()
+        isPickingAnotherShufflePick = true
+        shuffleActionError = nil
+        shuffleTask = Task { @MainActor [weak self] in
+            let result: Result<APIv2Shuffle, Error>
+            do {
+                result = .success(try await SiloAPI.shared.skipShuffleItem(id: shuffleId, nextContentId: nextContentId))
+            } catch {
+                result = .failure(error)
+            }
+            guard let self, !Task.isCancelled, !self.isDisposed,
+                  self.shuffleState?.id == shuffleId else { return }
+            self.isPickingAnotherShufflePick = false
+            switch result {
+            case .success(let skipped):
+                let previous = self.nextUpEpisode?.contentId
+                self.shuffleState?.apply(skipped)
+                self.publishShuffleNextUp()
+                // The server keeps the same pick when it is the only one
+                // left; the countdown still starts over.
+                if self.nextUpEpisode?.contentId == previous {
+                    self.startNextUpCountdownIfNeeded()
+                }
+            case .failure(let error):
+                self.shuffleState?.applyRefreshFailure(error)
+                self.shuffleActionError = ShuffleError.classify(error) == .nothingToPlay
+                    ? nil
+                    : "Couldn't pick another."
+                self.publishShuffleNextUp()
+                self.startNextUpCountdownIfNeeded()
+            }
+        }
+    }
+
+    /// Stop shuffling. The caller closes the player; the delete is not
+    /// awaited, and a failed one leaves a shuffle the server cleans up.
+    func stopShuffling() {
+        guard let shuffleId = shuffleState?.id else { return }
+        nextUpAutoplayCancelled = true
+        cancelNextUpCountdown()
+        leaveShuffle()
+        stoppedShuffling = true
+        Task { try? await SiloAPI.shared.deleteShuffle(id: shuffleId) }
+    }
+
+    private func leaveShuffle() {
+        guard shuffleState != nil else { return }
+        cancelShuffleOperations()
+        shuffleState = nil
+        shuffleActionError = nil
+    }
+
+    private func cancelShuffleOperations() {
+        shuffleTask?.cancel()
+        shuffleTask = nil
+        shuffleRefreshTask?.cancel()
+        shuffleRefreshTask = nil
+        isAdvancingShuffle = false
+        isPickingAnotherShufflePick = false
+    }
+
+    /// During a shuffle, the part of a multi-part item that plays after the
+    /// one on screen.
+    private var nextShufflePart: FileVersion? {
+        guard shuffleState != nil,
+              let current = currentSelectedVersion,
+              let versions = currentWatchDetail?.versions else { return nil }
+        return PlayerMultipartPolicy.nextPart(after: current, in: versions)
+    }
+
+    private func playShufflePart(_ part: FileVersion) {
+        guard let contentId = lastLoadRequest?.contentId else { return }
+        var request = LoadRequest(
+            contentId: contentId,
+            preferredFileId: part.fileId,
+            preferredAudioTrackIndex: nil,
+            preferredSubtitleTrackIndex: nil,
+            preferredSidecarSubtitleTrackId: nil,
+            startFromBeginning: true
+        )
+        request.libraryId = libraryId
+        // An automatic hand-off like the next pick: bounded by the autoplay
+        // timeout, and a failure returns to the up-next screen instead of a
+        // full-screen error.
+        beginFreshLoad(
+            request: request,
+            progressPosition: currentTime,
+            finalizeCurrentSession: true,
+            origin: .autoplay
+        )
+    }
+
+    private func completionProgressPositionForCurrentItem() -> Double {
+        PlayerNextUpCompletionPolicy.progressPosition(
+            isNextUpPresented: showNextUpScreen,
+            hasReachedEndOfFile: finishedAtEndOfFile,
+            currentTime: progressReportPosition,
+            duration: duration,
+            promptSeconds: settings.nextUpPromptSeconds,
+            skippedCredits: skippedCreditsToEnd
+        )
+    }
+
+    /// Snapshot every detail surface affected by the current playback item
+    /// before a replacement load or teardown clears `currentWatchDetail`.
+    /// Series and synthetic season ids are included because tvOS keeps the
+    /// combined Series page resident while its episode player is pushed.
+    private func recordCurrentPlaybackMutation() {
+        let currentContentId = currentWatchDetail?.contentId ?? lastLoadRequest?.contentId
+        if let currentContentId, !currentContentId.isEmpty {
+            contentIdsNeedingDetailRefresh.insert(currentContentId)
+        }
+
+        guard let detail = currentWatchDetail,
+              let rawSeriesId = detail.seriesId else { return }
+        let seriesId = rawSeriesId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !seriesId.isEmpty else { return }
+        lastSeriesPlayback = (seriesId, detail.seasonNumber)
+        contentIdsNeedingDetailRefresh.insert(seriesId)
+        if let seasonNumber = detail.seasonNumber {
+            contentIdsNeedingDetailRefresh.insert("\(seriesId)-S\(seasonNumber)")
+        }
+    }
+
+    /// The Series episode on screen as the player closes, so its Series page
+    /// can land on it or on the episode after it. See `SeriesPlaybackReturn`.
+    private func seriesPlaybackReturn(completed: Bool) -> SeriesPlaybackReturn? {
+        // A shuffle returns to the page it started from, not to the series of
+        // whichever episode played last.
+        guard shuffleState == nil, !stoppedShuffling else { return nil }
+        if let detail = currentWatchDetail {
+            guard let seriesId = detail.seriesId?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !seriesId.isEmpty else { return nil }
+            return SeriesPlaybackReturn(
+                episodeContentId: detail.contentId,
+                seriesContentId: seriesId,
+                seasonNumber: detail.seasonNumber,
+                completed: completed
+            )
+        }
+        // The player closed while the next episode was still loading. Autoplay
+        // keeps that episode's season in `nextUpEpisode`; otherwise assume the
+        // previous episode's season. An On Deck pick belongs to its own
+        // series, or to none, not to the one that just finished.
+        guard let loadingId = lastLoadRequest?.contentId else { return nil }
+        let queued = nextUpEpisode?.contentId == loadingId ? nextUpEpisode : nil
+        let seriesId = queued?.isFromOnDeck == true ? queued?.seriesId : lastSeriesPlayback?.seriesId
+        guard let seriesId = Self.nonEmpty(seriesId) else { return nil }
+        return SeriesPlaybackReturn(
+            episodeContentId: loadingId,
+            seriesContentId: seriesId,
+            seasonNumber: queued?.seasonNumber ?? lastSeriesPlayback?.seasonNumber,
+            completed: false
+        )
+    }
+
+    /// Loads `prepared` into the engine. A load on the local route that could
+    /// not reach its source drops the route and opens the same plan once more
+    /// from the saved address, before the failure counts against the plan.
+    private func loadAether(
+        prepared: PreparedPlayback,
+        streamRequest: StreamRequest,
+        expectedStreamLoadGeneration: UInt64,
+        resumeSourcePosition: Double? = nil,
+        reselectsPlanSubtitle: Bool = false,
+        shouldPlayWhenReady: Bool
+    ) async throws {
+        // From here the outgoing plan's source is being replaced: its waits
+        // are a source reload, not stalls.
+        bufferingSourceSwapGeneration = expectedStreamLoadGeneration
+        do {
+            try await loadAetherSource(
+                prepared: prepared, streamRequest: streamRequest,
+                expectedStreamLoadGeneration: expectedStreamLoadGeneration,
+                resumeSourcePosition: resumeSourcePosition, reselectsPlanSubtitle: reselectsPlanSubtitle,
+                shouldPlayWhenReady: shouldPlayWhenReady, takesLocalRoute: true)
+        } catch {
+            guard let route = streamLocalRoute, !Task.isCancelled, Self.isLocalRouteLoadFailure(error) else { throw error }
+            LocalRouteController.reportFailure(of: route)
+            try await loadAetherSource(
+                prepared: prepared, streamRequest: streamRequest,
+                expectedStreamLoadGeneration: expectedStreamLoadGeneration,
+                resumeSourcePosition: resumeSourcePosition, reselectsPlanSubtitle: reselectsPlanSubtitle,
+                shouldPlayWhenReady: abandonedLoadPlayIntent ?? shouldPlayWhenReady, takesLocalRoute: false)
+        }
+    }
+
+    /// Whether a load failed to reach its source, as one over a local route
+    /// that stopped working does: the connection failed, or the source
+    /// presented a key the pin refused. A failure about what the source sent,
+    /// such as an HTTP status or unreadable media, leaves the route alone.
+    static func isLocalRouteLoadFailure(_ error: Error) -> Bool {
+        guard let load = error as? AetherPlaybackController.LoadFailure else {
+            return LocalRoute.isRouteFailure(error)
+        }
+        return load.failure.kind == .sourceCertificateRejected
+            || PlaybackReconnectPolicy.isConnectionLoss(load.failure, serverUnreachable: false)
+    }
+
+    private func loadAetherSource(
+        prepared: PreparedPlayback,
+        streamRequest: StreamRequest,
+        expectedStreamLoadGeneration: UInt64,
+        resumeSourcePosition: Double?,
+        reselectsPlanSubtitle: Bool,
+        shouldPlayWhenReady: Bool,
+        takesLocalRoute: Bool
+    ) async throws {
+        try requireCurrentStreamLoad(expectedStreamLoadGeneration)
+        streamLocalRoute = nil
+        abandonedLoadPlayIntent = nil
+        let preferredSubtitles = subtitleOrderingLanguage.map { [$0] } ?? []
+        let preferredAudio = AetherInitialAudioPreference.languages(
+            selectedOrdinal: prepared.protocolV3?.plan.selectedTracks.audio?.index,
+            tracks: prepared.selectedVersion.audioTracks ?? [],
+            fallbackLanguage: settings.audioLanguage
+        )
+        // The explicit Buffer Ahead choice wins; `automatic` has no count of
+        // its own and keeps the historical mapping from the synced Seek Cache
+        // toggle, so a device that never touches this picker behaves exactly as
+        // before.
+        let forwardBufferSegments = settings.bufferAhead.forwardBufferSegments
+            ?? (settings.seekCacheEnabled ? Int.max : 4)
+        let audioBridgeMode: AudioBridgeMode = settings.losslessAudioEnabled
+            ? .lossless
+            : .surroundCompat
+        // TrueHD Atmos and DTS:X keep their heights when the setting is on; Aether applies it to those
+        // tracks alone and keeps `audioBridgeMode` for the rest.
+        #if os(tvOS)
+        let renderingMode = AVAudioSession.sharedInstance().renderingMode
+        let renderingModeField = " renderingMode=\(AetherObjectAudioPolicy.renderingModeName(renderingMode))"
+        #else
+        let renderingModeField = ""
+        #endif
+        let trueHDAtmosEnabled = settings.trueHDAtmosEnabled
+        let objectAudioRendering = AetherObjectAudioPolicy.rendering(enabled: trueHDAtmosEnabled)
+        // Essential tier, so a report without Debug Logging says which path
+        // TrueHD Atmos was offered; the engine logs what it then built.
+        cmpLog(
+            "[CMP-ATMOS] setting=\(trueHDAtmosEnabled)\(renderingModeField) "
+                + "rendering=\(AetherObjectAudioPolicy.diagnosticName(objectAudioRendering))"
+        )
+        let deinterlaceMode: DeinterlaceMode = settings.deinterlaceMode == .software
+            ? .software
+            : .auto
+        let deinterlaceFieldRate: DeinterlaceFieldRate = settings.deinterlaceFieldRate == .film
+            ? .frame
+            : .field
+        let dolbyVisionHandling = AetherLoadSpec.dolbyVisionHandling(
+            hdrEnabled: settings.hdrEnabled,
+            dolbyVisionEnabled: settings.dolbyVisionEnabled
+        )
+        let spec: AetherLoadSpec
+        if let v3 = prepared.protocolV3 {
+            let resolvesRequestCredentials = v3.serverFeatures.contains(PlaybackProtocolV3.headerAuthenticatedMediaFeature)
+                && AetherAuthenticationRecoveryPolicy.resolvesRequestCredentials(
+                    delivery: v3.plan.delivery,
+                    hasVideo: v3.plan.effectiveRecipe.videoCodec != nil
+                )
+            // The media takes the local route only where each request's
+            // credentials are refreshed and scoped to the origin it is on (the
+            // authorization below), which is also what lets the engine reach a
+            // pinned origin. A Watch Party stays on the saved address, which it
+            // can always remount from.
+            let streamRequest = takesLocalRoute && resolvesRequestCredentials && !isWatchPartyPlayback
+                ? streamRequest.routed(over: LocalRoute.active)
+                : streamRequest
+            streamLocalRoute = streamRequest.localRoute
+            let audioSourceStreamIndex: Int32?
+            let selectedAudioOrdinal = v3.plan.selectedTracks.audio?.index
+            let catalogAudioTracks = prepared.selectedVersion.audioTracks ?? []
+            if v3.plan.delivery == PlaybackProtocolV3.PlanDelivery.originalHTTP,
+               AetherInitialAudioPreference.requiresExactStreamProbe(
+                   selectedOrdinal: selectedAudioOrdinal,
+                   tracks: catalogAudioTracks
+               ),
+               let selectedAudioOrdinal {
+                // A V3 audio identity is a dense ordinal, but Aether's exact
+                // first-open override is an FFmpeg AVStream id. Resolve it
+                // with the same authenticated source and headers the real
+                // load will use. This extra open is limited to non-default
+                // original-file audio; without it, a same-language
+                // TrueHD/compatibility pair starts on the container default
+                // and depends on a fragile post-load pipeline rebuild.
+                let sourceURL = streamRequest.url
+                let sourceHeaders = streamRequest.headers
+                let probe = try await Task.detached(priority: .userInitiated) {
+                    try AetherEngine.probe(
+                        url: sourceURL,
+                        options: LoadOptions(httpHeaders: sourceHeaders)
+                    )
+                }.value
+                try requireCurrentStreamLoad(expectedStreamLoadGeneration)
+                guard probe.audioTracks.indices.contains(selectedAudioOrdinal),
+                      let exactStreamIndex = Int32(exactly: probe.audioTracks[selectedAudioOrdinal].id) else {
+                    throw AetherLoadSpec.ValidationError.invalidAudioTrackIndex(selectedAudioOrdinal)
+                }
+                audioSourceStreamIndex = exactStreamIndex
+            } else {
+                audioSourceStreamIndex = nil
+            }
+            let requestAuthorization: HTTPRequestAuthorization?
+            let requestHeaderResolver: HTTPRequestAuthorization.Resolver?
+            let subtitleRequestAuthorization: HTTPRequestAuthorization?
+            if resolvesRequestCredentials {
+                guard let owner = streamRequest.capturedAuth else {
+                    throw HTTPError.requestIdentityChanged
+                }
+                let resolver = try PlaybackMediaAuthorization.makeResolver(
+                    sourceURL: streamRequest.url,
+                    serverURL: streamRequest.serverUrl,
+                    transportServerURL: streamRequest.localRoute?.localOrigin,
+                    sessionID: prepared.session.sessionId,
+                    expectedAuth: owner,
+                    baseHeaders: streamRequest.headers,
+                    http: SiloAPI.shared.http
+                )
+                requestHeaderResolver = resolver
+                requestAuthorization = HTTPRequestAuthorization(resolver: resolver)
+                subtitleRequestAuthorization = try PlaybackMediaAuthorization.makeSubtitleAuthorization(
+                    serverURL: streamRequest.serverUrl,
+                    sessionID: prepared.session.sessionId,
+                    expectedAuth: owner,
+                    baseHeaders: streamRequest.headers,
+                    http: SiloAPI.shared.http
+                )
+            } else {
+                requestAuthorization = nil
+                requestHeaderResolver = nil
+                subtitleRequestAuthorization = nil
+            }
+            spec = try AetherLoadSpec(
+                validating: v3.plan,
+                sessionID: prepared.session.sessionId,
+                matchContentEnabled: settings.hdrEnabled && AetherDisplayContext.matchContentEnabled,
+                sourceURLOverride: streamRequest.url,
+                requestHeaders: streamRequest.headers,
+                requestAuthorization: requestAuthorization,
+                requestHeaderResolver: requestHeaderResolver,
+                subtitleRequestAuthorization: subtitleRequestAuthorization,
+                // Subtitle artifacts, inventory sidecars and font bundles stay
+                // relative API-origin routes even when the media itself moved
+                // to a proxy, so this resolver never accepts absolute URLs.
+                resolveURL: { raw in
+                    StreamRequest.resolve(
+                        rawURL: raw,
+                        serverURL: streamRequest.serverUrl,
+                        additionalHeaders: [:],
+                        accessToken: nil,
+                        requiresHeaderAuthenticatedMedia: true
+                    )?.url
+                },
+                apiOriginURL: URL(string: streamRequest.serverUrl),
+                audioSourceStreamIndex: audioSourceStreamIndex,
+                preferredAudioLanguages: preferredAudio,
+                forwardBufferSegments: forwardBufferSegments,
+                audioBridgeMode: audioBridgeMode,
+                objectAudioRendering: objectAudioRendering,
+                deinterlaceMode: deinterlaceMode,
+                deinterlaceFieldRate: deinterlaceFieldRate,
+                dolbyVisionHandling: dolbyVisionHandling,
+                resumeSourcePosition: resumeSourcePosition
+            )
+        } else if streamRequest.url.isFileURL {
+            let audioStreamIndex: Int32?
+            if let ordinal = prepared.session.audioTrackIndex {
+                let localURL = streamRequest.url
+                let probe = try await Task.detached(priority: .userInitiated) {
+                    try AetherEngine.probe(url: localURL)
+                }.value
+                try requireCurrentStreamLoad(expectedStreamLoadGeneration)
+                audioStreamIndex = AetherLoadSpec.offlineAudioStreamIndex(
+                    manifestOrdinal: ordinal,
+                    probedTrackIDs: probe.audioTracks.map(\.id)
+                )
+                if audioStreamIndex == nil {
+                    // A download has no server to replan against, so a stale
+                    // manifest ordinal must not fail playback outright.
+                    Self.logger.warning(
+                        "Offline audio ordinal \(ordinal, privacy: .public) is outside the file's \(probe.audioTracks.count, privacy: .public) audio tracks; using the file default"
+                    )
+                }
+            } else {
+                audioStreamIndex = nil
+            }
+            spec = try AetherLoadSpec(
+                offlineURL: streamRequest.url,
+                startPosition: prepared.session.position,
+                audioOnly: prepared.selectedVersion.codecVideo == nil,
+                audioSourceStreamIndex: audioStreamIndex,
+                sidecars: prepared.session.subtitleUrls ?? [],
+                preferredAudioLanguages: preferredAudio,
+                preferredSubtitleLanguages: preferredSubtitles,
+                forwardBufferSegments: forwardBufferSegments,
+                audioBridgeMode: audioBridgeMode,
+                objectAudioRendering: objectAudioRendering,
+                deinterlaceMode: deinterlaceMode,
+                deinterlaceFieldRate: deinterlaceFieldRate,
+                dolbyVisionHandling: dolbyVisionHandling
+            )
+        } else {
+            spec = try AetherLoadSpec(
+                directURL: streamRequest.url,
+                headers: streamRequest.headers,
+                startPosition: prepared.session.position,
+                audioOnly: prepared.selectedVersion.codecVideo == nil,
+                sidecars: prepared.session.subtitleUrls ?? [],
+                preferredAudioLanguages: preferredAudio,
+                preferredSubtitleLanguages: preferredSubtitles,
+                forwardBufferSegments: forwardBufferSegments,
+                audioBridgeMode: audioBridgeMode,
+                objectAudioRendering: objectAudioRendering,
+                deinterlaceMode: deinterlaceMode,
+                deinterlaceFieldRate: deinterlaceFieldRate,
+                dolbyVisionHandling: dolbyVisionHandling
+            )
+        }
+
+        try requireCurrentStreamLoad(expectedStreamLoadGeneration)
+        // Armed after the probe's await: an inventory pass from the outgoing
+        // source, which still renders the same stream, would otherwise spend
+        // the pick on the old engine before the new one opens.
+        if reselectsPlanSubtitle,
+           let v3 = prepared.protocolV3,
+           let request = lastLoadRequest?.adoptingProtocolV3Intent(
+               plan: v3.plan,
+               selectedVersion: prepared.selectedVersion
+           ) {
+            armProtocolV3SubtitleIntentForSamePlanReload(plan: v3.plan, request: request)
+        }
+        isLoading = true
+        isBuffering = false
+        isLoadingSubtitles = false
+        bufferingProgress = nil
+        scrubPreviewProvider.endSession()
+        let loadEpoch = aetherPlaybackController.beginLoad(
+            spec,
+            shouldPlayWhenReady: shouldPlayWhenReady
+        )
+        activeAetherLoadEpoch = loadEpoch
+        // Aether keeps a speed only across a reload of the same source, so a
+        // party member's rate is handed over again once this load plays.
+        watchPartyAppliedRate = nil
+        // A progressive remux opens at its stream origin, behind the position
+        // the caller just published. Clock updates earlier than `currentTime`
+        // are dropped as stale, so move it back to where the engine starts or
+        // the scrubber and progress stay frozen until playback catches up.
+        if spec.delivery == PlaybackProtocolV3.PlanDelivery.remuxProgressive {
+            currentTime = min(currentTime, spec.timeline.sourcePosition(forPlayerTime: spec.aetherStartPosition))
+        }
+        // A new transport starts at its own position with its own reader.
+        sourceWatch = PlaybackSourceWatch()
+        establishedAetherLoadEpoch = nil
+        lastAetherAudioTrackSwitchFailure = nil
+        committedProtocolV3LoadEpoch = nil
+        pendingProtocolV3FirstFrameEpoch = nil
+        do {
+            try await aetherPlaybackController.finishLoad(loadEpoch)
+        } catch {
+            let resolved = resolveAbandonedAetherLoad(
+                error,
+                epoch: loadEpoch,
+                expectedStreamLoadGeneration: expectedStreamLoadGeneration
+            )
+            if activeAetherLoadEpoch == loadEpoch {
+                activeAetherLoadEpoch = nil
+                establishedAetherLoadEpoch = nil
+                committedProtocolV3LoadEpoch = nil
+                pendingProtocolV3FirstFrameEpoch = nil
+            }
+            if !(resolved is CancellationError),
+               aetherPlaybackController.activeLoadEpoch == loadEpoch {
+                // The engine, not the app, abandoned this load. Nobody else
+                // will tear the source down, and the load's own catch is about
+                // to retire its server session.
+                abandonedLoadPlayIntent = aetherPlaybackController.shouldPlayWhenReady
+                disposeAetherPlayback()
+            }
+            throw resolved
+        }
+        do {
+            try requireCurrentStreamLoad(expectedStreamLoadGeneration)
+            guard activeAetherLoadEpoch == loadEpoch,
+                  aetherPlaybackController.activeLoadEpoch == loadEpoch else {
+                throw CancellationError()
+            }
+            if let embedded = prepared.protocolV3?.plan.subtitle.embedded {
+                try aetherPlaybackController.validateEmbeddedSubtitleSelection(embedded.streamIndex)
+            }
+        } catch {
+            if aetherPlaybackController.activeLoadEpoch == loadEpoch {
+                disposeAetherPlayback()
+            }
+            throw error
+        }
+        // Startup ran to completion on this epoch, so the decode route is now
+        // settled and deferred track picks may drive the engine.
+        establishedAetherLoadEpoch = loadEpoch
+        scrubPreviewProvider.activate(spec)
+        loadServerTrickplay(for: prepared)
+        loadSeekrPreviews(for: prepared)
+        adoptAetherInventory()
+        reapplyAetherGain()
+
+        if aetherPlaybackController.shouldPlayWhenReady {
+            aetherPlaybackController.play()
+        } else {
+            aetherPlaybackController.pause()
+        }
+    }
+
+    /// Whether the engine may be driven off a deferred (not user-initiated)
+    /// track pick for the load that is currently active.
+    private var isAetherLoadEstablished: Bool {
+        activeAetherLoadEpoch != nil && establishedAetherLoadEpoch == activeAetherLoadEpoch
+    }
+
+    /// Distinguishes "the app abandoned this load" from "the engine abandoned
+    /// it under us".
+    ///
+    /// `AetherEngine.load` unwinds as a cancellation whenever a newer engine
+    /// generation supersedes it — including when the *engine itself* started
+    /// that newer generation, as an audio-track switch's pipeline rebuild does.
+    /// Treating that as an app-side abort is what leaves the player on an
+    /// endless spinner: the load task returns silently, no plan failure is
+    /// reported and no replan runs. If nothing on the app side asked for this
+    /// load to stop, the cancellation is a failure and has to be surfaced as
+    /// one so the V3 route ladder (and its server-transcode fallback) runs.
+    private func resolveAbandonedAetherLoad(
+        _ error: Error,
+        epoch: AetherPlaybackController.LoadEpoch,
+        expectedStreamLoadGeneration: UInt64
+    ) -> Error {
+        guard error is CancellationError,
+              !Task.isCancelled,
+              !isDisposed,
+              expectedStreamLoadGeneration == streamLoadGeneration,
+              activeAetherLoadEpoch == epoch else {
+            return error
+        }
+        let failure = lastAetherAudioTrackSwitchFailure
+            ?? aetherPlaybackController.engine.errorInfo
+            ?? PlaybackErrorInfo(
+                kind: .audioTrackSwitchFailed,
+                message: "Playback could not be set up with the selected audio track."
+            )
+        Self.logger.error(
+            "Aether abandoned an in-flight load (kind=\(failure.kind.rawValue, privacy: .public)); treating as a load failure"
+        )
+        return AetherPlaybackController.LoadFailure(
+            failure: failure,
+            underlying: error
+        )
+    }
+
+    private func requireCurrentStreamLoad(_ expectedGeneration: UInt64) throws {
+        guard !Task.isCancelled,
+              !isDisposed,
+              expectedGeneration == streamLoadGeneration else {
+            throw CancellationError()
+        }
+    }
+
+    private func adoptAetherInventory() {
+        let engine = aetherPlaybackController.engine
+        let existingLiveTracks = subtitleTracks.filter {
+            SubtitleTrackIdSpace.isAILive($0.trackId)
+        }
+        let aetherAudioTracks = engine.audioTracks.enumerated().map { ordinal, track in
+            PlayerTrack(
+                trackId: Int64(track.id),
+                kind: .audio,
+                title: track.name,
+                lang: track.language,
+                codec: track.codec,
+                audioChannelCount: track.channels > 0 ? track.channels : nil,
+                bitrate: track.bitrate > 0 ? track.bitrate : nil,
+                isDefault: track.isDefault,
+                isForced: track.isForced,
+                isHearingImpaired: track.isHearingImpaired,
+                isExternal: track.isExternal,
+                isSelected: engine.activeAudioTrackIndex == track.id,
+                ffIndex: track.id,
+                srcId: ordinal
+            )
+        }
+        let isServerPreparedFile = offlinePlaybackContext?.isServerPreparedFile == true
+        let serverOwnsAudio = ApplePlaybackV3PlanAdapter.serverOwnsAudioTracks(
+            activePreparedProtocolV3?.plan
+        )
+        let pickerAudioTracks = ApplePlaybackV3PlanAdapter.audioPickerTracks(
+            aetherTracks: aetherAudioTracks,
+            plan: activePreparedProtocolV3?.plan,
+            version: currentSelectedVersion
+        )
+        audioTracks = isServerPreparedFile
+            ? OfflinePreparedTrackInventory.audioTracks(
+                pickerAudioTracks,
+                manifestTracks: currentSelectedVersion?.audioTracks
+            )
+            : pickerAudioTracks
+        let probedSubtitleTracks = engine.subtitleTracks.map { track in
+            let appTrackID = aetherPlaybackController.appSubtitleID(forAetherID: track.id)
+            let sidecarIndex = track.isExternal
+                ? SubtitleTrackIdSpace.sidecarIndex(from: appTrackID)
+                : nil
+            let codec = track.isExternal
+                ? SubtitleCodecClassifier.externalTrackCodec(
+                    engineCodec: track.codec,
+                    declaredFormat: sidecarIndex.flatMap { index in
+                        knownExternalSubtitles.first { $0.index == index }?.codec
+                    }
+                )
+                : track.codec
+            return PlayerTrack(
+                trackId: appTrackID,
+                kind: .sub,
+                title: track.name,
+                lang: track.language,
+                codec: codec,
+                audioChannelCount: nil,
+                bitrate: nil,
+                isDefault: track.isDefault,
+                isForced: track.isForced,
+                isHearingImpaired: track.isHearingImpaired,
+                isExternal: track.isExternal,
+                isSelected: engine.activeSubtitleTrackIndex == track.id,
+                ffIndex: track.isExternal ? nil : track.id,
+                srcId: sidecarIndex
+            )
+        }
+        let aetherSubtitleTracks = isServerPreparedFile
+            ? OfflinePreparedTrackInventory.subtitleTracks(probedSubtitleTracks)
+            : probedSubtitleTracks
+        // V3 inventory is an authoritative menu, not a preload list. Aether
+        // receives only the current plan's artifact; presenting its probed
+        // embedded tracks alongside every server sidecar would create two
+        // identities (and two selectors) for the same subtitle rows.
+        let planSubtitleTracks = activePreparedProtocolV3.map { prepared in
+            ApplePlaybackV3PlanAdapter.subtitlePickerTracks(
+                plan: prepared.plan,
+                version: currentSelectedVersion,
+                localSelection: localProtocolV3SubtitleSelection
+            )
+        }
+        // …but a sidecar this session registered itself (a finished AI job or
+        // a downloaded subtitle) is real and selectable before any plan names
+        // it, so it is unioned in until the server publishes its ordinal.
+        let publishedSubtitleTracks = planSubtitleTracks.map { planTracks in
+            planTracks + locallyRegisteredSidecarSubtitleTracks.filter { local in
+                !planTracks.contains { $0.trackId == local.trackId }
+            }
+        } ?? aetherSubtitleTracks
+        subtitleTracks = publishedSubtitleTracks + existingLiveTracks.filter { liveTrack in
+            !publishedSubtitleTracks.contains { $0.trackId == liveTrack.trackId }
+        }
+        let mediaChapters = engine.mediaChapters.map { chapter in
+            PlayerChapterInfo(
+                index: chapter.id,
+                title: chapter.name,
+                time: chapter.startSeconds
+            )
+        }
+        chapters = mediaChapters.isEmpty ? serverProvidedChapters : mediaChapters
+
+        // On a server remux or transcode the engine's active id names the one
+        // stream the server mapped, not a picker row, so only the plan's
+        // ordinal selects one.
+        selectedAudioId = audioTracks.first(where: \.isSelected)?.trackId
+            ?? (serverOwnsAudio ? nil : engine.activeAudioTrackIndex.map(Int64.init))
+        // A locally-registered sidecar is selected client-side, so the plan —
+        // which predates the track — must not republish over it. Once the
+        // server publishes that ordinal the plan is authoritative again.
+        let holdsLocalSidecarSelection = selectedSubtitleId.map { id in
+            locallyRegisteredSidecarSubtitleTracks.contains { $0.trackId == id }
+                && planSubtitleTracks?.contains { $0.trackId == id } != true
+        } ?? false
+        if localProtocolV3SubtitleSelection == nil,
+           selectedSubtitleId.map(SubtitleTrackIdSpace.isAILive) != true,
+           !holdsLocalSidecarSelection {
+            if activePreparedProtocolV3 != nil {
+                selectedSubtitleId = publishedSubtitleTracks
+                    .first(where: \.isSelected)?.trackId
+            } else {
+                selectedSubtitleId = engine.activeSubtitleTrackIndex.map {
+                    aetherPlaybackController.appSubtitleID(forAetherID: $0)
+                }
+            }
+        }
+
+        // Inventory arrives mid-startup, so a deferred pick applied here would
+        // reach the engine before its decode route exists. Hold it until the
+        // load is established; `loadAether` re-enters this method at that point.
+        let loadIsEstablished = isAetherLoadEstablished
+
+        // Catalog fallback rows are picker state for server-owned replans; only
+        // a file track Aether actually published may drive its local selection
+        // API, which server HLS never has.
+        if let wantedIndex = pendingAudioFfIndex,
+           !serverOwnsAudio,
+           let match = aetherAudioTracks.first(where: {
+               audioSelectionIndex(for: $0) == wantedIndex
+           }) {
+            switch DeferredTrackSelectionGate.outcome(
+                isLoadEstablished: loadIsEstablished,
+                engineAlreadyMatches: engine.activeAudioTrackIndex.map(Int64.init) == match.trackId
+            ) {
+            case .deferUntilEstablished:
+                break
+            case .adoptWithoutEngineCall:
+                pendingAudioFfIndex = nil
+                selectedAudioId = match.trackId
+            case .applyToEngine:
+                pendingAudioFfIndex = nil
+                selectedAudioId = match.trackId
+                applyAudioTrackSelection(match.trackId, reason: "pending_audio_index")
+            }
+        }
+
+        if !restoreLocalProtocolV3SubtitleSelection() {
+            applyPendingSubtitleSelections(
+                aetherSubtitleTracks: aetherSubtitleTracks,
+                publishedSubtitleTracks: publishedSubtitleTracks,
+                loadIsEstablished: loadIsEstablished
+            )
+        }
+        applyAutoSubtitlePreferencesIfNeeded()
+    }
+
+    /// Reconcile deferred renderer choices after each inventory publication.
+    /// Burned-in subtitles retain a picker selection without a local renderer.
+    func applyPendingSubtitleSelections(
+        aetherSubtitleTracks: [PlayerTrack],
+        publishedSubtitleTracks: [PlayerTrack],
+        loadIsEstablished: Bool
+    ) {
+        let engine = aetherPlaybackController.engine
+        if let wantedIndex = pendingSubtitleFfIndex {
+            if wantedIndex < 0 {
+                switch DeferredTrackSelectionGate.outcome(
+                    isLoadEstablished: loadIsEstablished,
+                    engineAlreadyMatches: engine.activeSubtitleTrackIndex == nil
+                ) {
+                case .deferUntilEstablished:
+                    break
+                case .adoptWithoutEngineCall:
+                    pendingSubtitleFfIndex = nil
+                    selectedSubtitleId = nil
+                case .applyToEngine:
+                    pendingSubtitleFfIndex = nil
+                    selectedSubtitleId = nil
+                    applySubtitleTrackSelection(nil, reason: "pending_subtitle_off")
+                }
+            } else if let match = aetherSubtitleTracks.first(where: { $0.ffIndex == wantedIndex }) {
+                // The engine still selects an embedded stream by its raw id,
+                // but under V3 the *published* row for that stream lives in
+                // the plan's sidecar id space. Publishing the engine id would
+                // leave the picker showing nothing selected and resolve to no
+                // combined ordinal on the next replan.
+                let publishedTrackID = publishedSubtitleTracks
+                    .first { $0.ffIndex == wantedIndex }?
+                    .trackId ?? match.trackId
+                switch DeferredTrackSelectionGate.outcome(
+                    isLoadEstablished: loadIsEstablished,
+                    engineAlreadyMatches: engine.activeSubtitleTrackIndex == wantedIndex
+                ) {
+                case .deferUntilEstablished:
+                    break
+                case .adoptWithoutEngineCall:
+                    pendingSubtitleFfIndex = nil
+                    selectedSubtitleId = publishedTrackID
+                case .applyToEngine:
+                    pendingSubtitleFfIndex = nil
+                    selectedSubtitleId = publishedTrackID
+                    applySubtitleTrackSelection(match.trackId, reason: "pending_subtitle_index")
+                }
+            }
+        }
+
+        // Reassert even when Aether publishes the same synthetic id: V3 changed
+        // the resource behind that reused id, and the current plan's artifact
+        // URL — not id equality — is authoritative.
+        if let pendingTrackID = pendingSidecarSubtitleTrackId,
+           loadIsEstablished,
+           subtitleTracks.contains(where: { $0.trackId == pendingTrackID }) {
+            pendingSidecarSubtitleTrackId = nil
+            selectedSubtitleId = pendingTrackID
+            applySubtitleTrackSelection(pendingTrackID, reason: "restored_sidecar_selection")
+            performDeferredLiveSubtitleCloseIfNeeded()
+        }
+        if let pendingTrackID = pendingServerRenderedSubtitleTrackId,
+           loadIsEstablished,
+           subtitleTracks.contains(where: { $0.trackId == pendingTrackID }) {
+            // Consume this only after the deferred local-Off step above. An
+            // early inventory can arrive before that step is allowed to run;
+            // clearing the restore intent then leaves the next pass showing Off.
+            pendingServerRenderedSubtitleTrackId = nil
+            selectedSubtitleId = pendingTrackID
+        }
+    }
+
+    private func reapplyAetherGain() {
+        aetherPlaybackController.setVolume(userVolume)
+        aetherPlaybackController.setMuted(userMuted)
+        applySettingsToPlayer()
+    }
+
+    func applyUserVolume(_ volume: Float) {
+        userVolume = min(max(volume, 0), 1)
+        if userVolume > 0 { userMuted = false }
+        aetherPlaybackController.setMuted(userMuted)
+        aetherPlaybackController.setVolume(userVolume)
+    }
+
+    /// The local volume swipe moves the device volume, so a remote mute or
+    /// zero-volume command would leave it silent at any level. Undo those
+    /// before the swipe; a nonzero remote level stays.
+    func unmutePlayerGainForLocalVolume() {
+        guard userMuted || userVolume == 0 else { return }
+        applyUserVolume(userVolume == 0 ? 1 : userVolume)
+    }
+
+    func applyUserMuted(_ muted: Bool) {
+        userMuted = muted
+        aetherPlaybackController.setMuted(muted)
+    }
+
+    private func movieTime(for session: PlaybackSessionResponse) -> Double {
+        let playerTime = session.position.isFinite ? session.position : 0
+        let offset = session.timelineOffsetSeconds.isFinite ? session.timelineOffsetSeconds : 0
+        return max(0, playerTime + offset)
+    }
+
+    private func chapterInfoList(from version: FileVersion) -> [PlayerChapterInfo] {
+        (version.chapters ?? [])
+            .filter { chapter in
+                chapter.startSeconds.isFinite && chapter.startSeconds >= 0
+            }
+            .sorted { lhs, rhs in
+                if lhs.startSeconds == rhs.startSeconds {
+                    return lhs.index < rhs.index
+                }
+                return lhs.startSeconds < rhs.startSeconds
+            }
+            .map { chapter in
+                PlayerChapterInfo(
+                    index: chapter.index,
+                    title: chapter.title,
+                    time: chapter.startSeconds
+                )
+            }
+    }
+
+    func applySettingsToPlayer() {
+        // Aether starts a paused player on any rate; a party member's rate is
+        // the room's to set, and only while it plays.
+        // A held 2× keeps its rate; releasing the hold restores the speed.
+        if isWatchPartyPlayback {
+            syncWatchPartyRate()
+        } else if !isHoldFastForwarding {
+            aetherPlaybackController.setSpeed(effectivePlaybackSpeed)
+        }
+        aetherPlaybackController.engine.videoGravity = settings.videoGravity.avGravity
+    }
+
+    func refreshSettingsFromServer() async {
+        await settings.refreshFromServer()
+        applySettingsToPlayer()
+    }
+
+    func setSubtitleAppearance(_ appearance: SubtitleAppearance) async {
+        await settings.setSubtitleAppearance(appearance)
+    }
+
+    /// Applies `mutate` to the current subtitle appearance and saves the result.
+    func updateSubtitleAppearance(_ mutate: (inout SubtitleAppearance) -> Void) {
+        var next = settings.subtitleAppearance
+        mutate(&next)
+        Task { await setSubtitleAppearance(next) }
+    }
+
+    func setSubtitlePosition(_ position: SubtitlePositionPreset) {
+        var next = settings.subtitleAppearance
+        guard next.position != position else { return }
+        next.position = position
+        settings.stageSubtitleAppearance(next)
+        Task { [settings] in
+            await settings.flushPendingDeviceSettings()
+        }
+    }
+
+    func setSubtitleDeviceOverrideEnabled(_ enabled: Bool) async {
+        await settings.setSubtitleDeviceOverrideEnabled(enabled)
+    }
+
+    func setSubtitleMatchesSystemAppearance(_ enabled: Bool) {
+        settings.setSubtitleMatchesSystemAppearance(enabled)
+        subtitleOrderingLanguage = enabled
+            ? settings.subtitleSystemSelectionPreferences.preferredLanguages.first
+            : currentWatchDetail?.effectiveSubtitleLanguage
+        hasExplicitSubtitleChoice = false
+        prefsForCurrentItem = enabled
+            ? systemCaptionPrefsSnapshot()
+            : currentWatchDetail.map(serverSubtitlePrefsSnapshot)
+        prefsResolvedForCurrentItem = false
+        applyAutoSubtitlePreferencesIfNeeded(forceReevaluation: true)
+    }
+
+    func setPlaybackSpeed(_ rate: Double) {
+        guard !isWatchPartyPlayback else { return }
+        settings.setPlaybackSpeed(rate)
+        aetherPlaybackController.setSpeed(effectivePlaybackSpeed)
+        scheduleHideControls()
+    }
+
+    /// Touch-and-hold fast forward (iOS). Applies `rate` directly to the
+    /// backend without touching `settings.playbackSpeed`, so releasing the
+    /// hold restores whatever speed the user had configured. No-op while
+    /// paused — holding 2× on a paused player means nothing (both backends
+    /// only apply rates to an already-running clock, so this is UX, not
+    /// safety).
+    func beginHoldFastForward(rate: Double = 2.0) {
+        guard !isWatchPartyPlayback else { return }
+        guard !isHoldFastForwarding, isPlaying else { return }
+        isHoldFastForwarding = true
+        aetherPlaybackController.setSpeed(rate)
+    }
+
+    /// Always restores the configured speed, even if playback paused during
+    /// the hold: backends don't start a paused clock on `setSpeed`, and
+    /// leaving the hold rate behind would make the next play resume at 2×.
+    func endHoldFastForward() {
+        guard isHoldFastForwarding else { return }
+        isHoldFastForwarding = false
+        aetherPlaybackController.setSpeed(effectivePlaybackSpeed)
+    }
+
+    func setVideoGravity(_ gravity: VideoGravity) {
+        settings.setVideoGravity(gravity)
+        aetherPlaybackController.engine.videoGravity = settings.videoGravity.avGravity
+    }
+
+    func setSubtitleSyncMilliseconds(_ milliseconds: Int) {
+        settings.setSubtitleSyncMs(milliseconds)
+    }
+
+    /// Pushes the current item's poster into the Now Playing artwork field
+    /// so the lock-screen, Control Center, and Apple TV "What's Playing"
+    /// surface have a thumbnail. The poster URL is derived from the
+    /// content's library catalog entry rather than `WatchDetail`, which
+    /// doesn't expose image fields. The fetch runs in a background task on
+    /// the Aether video Now Playing coordinator and is best-effort: any
+    /// failure leaves the existing artwork (or none) unchanged.
+    private func pushNowPlayingArtwork(contentId: String) {
+        guard !contentId.isEmpty else { return }
+        // The presenter (e.g. ItemDetailView) already had the catalog
+        // item loaded — when it routed us through `applyArtworkURLHints`
+        // we can publish artwork without a second `/catalog/items/{id}`
+        // round-trip. Fall through to the fetch only when no hint was
+        // supplied.
+        if let candidate = preferredArtworkCandidate(),
+           let url = URL(string: candidate) {
+            nowPlaying.setArtworkURL(url)
+            return
+        }
+        Task { [weak self, libraryId] in
+            let detail: ItemDetail
+            do {
+                detail = try await SiloAPI.shared.itemDetail(contentId: contentId, libraryId: libraryId)
+            } catch {
+                Self.logger.warning(
+                    "NowPlaying artwork itemDetail fetch failed for \(contentId, privacy: .public): \(String(describing: error), privacy: .public)"
+                )
+                return
+            }
+            // Prefer poster; fall back to backdrop for items (notably some
+            // episodes) that don't surface a dedicated poster.
+            let posterCandidate = detail.posterUrl?.isEmpty == false ? detail.posterUrl : nil
+            let backdropCandidate = detail.backdropUrl?.isEmpty == false ? detail.backdropUrl : nil
+            guard let candidate = posterCandidate ?? backdropCandidate,
+                  let url = URL(string: candidate) else {
+                return
+            }
+            self?.nowPlaying.setArtworkURL(url)
+        }
+    }
+
+    private func preferredArtworkCandidate() -> String? {
+        if let poster = artworkPosterURLHint, !poster.isEmpty {
+            return poster
+        }
+        if let backdrop = artworkBackdropURLHint, !backdrop.isEmpty {
+            return backdrop
+        }
+        return nil
+    }
+
+    /// Caller-supplied artwork URLs piped through `PlayerView.onAppear`.
+    /// Used by `pushNowPlayingArtwork` to skip its own catalog item fetch.
+    func applyArtworkURLHints(posterURL: String?, backdropURL: String?) {
+        artworkPosterURLHint = posterURL
+        artworkBackdropURLHint = backdropURL
+    }
+
+    /// Push Now Playing at most every 2 seconds; the OS animates the
+    /// scrubber between updates using `playbackRate`.
+    private func pushNowPlayingIfDue() {
+        let now = Date()
+        guard now.timeIntervalSince(lastNowPlayingPush) > 2.0 else { return }
+        lastNowPlayingPush = now
+        pushNowPlayingSnapshot()
+    }
+
+    private func pushNowPlayingSnapshot() {
+        guard hasActiveAetherSession, !title.isEmpty else { return }
+        nowPlaying.update(
+            title: title,
+            duration: duration,
+            position: currentTime,
+            isPlaying: isPlaying,
+            playbackRate: effectivePlaybackSpeed
+        )
+    }
+
+    /// Called when the active backend reports natural EOF. Move the shell into
+    /// a paused end-state immediately so the player does not look frozen if
+    /// auto-play-next is unavailable. `sourceEnded` is false when the player
+    /// finishes the item itself, as a credits skip that runs to the end does:
+    /// nothing was lost, so it never reconnects.
+    func handleEndOfFile(sourceEnded: Bool = true) {
+        // Once per load. Two callers can land here for the same end — the
+        // `.ended` event and a near-end playback error reclassified as a
+        // natural finish — and running twice would raise the Next Up postroll
+        // twice. Latching the flag up-front makes the guard airtight; every
+        // intentional resume (`beginFreshLoad`, `keepWatchingCurrentEpisode`,
+        // `commitSeek`, `handleFileLoaded`) already clears it, so a genuine
+        // second end still reports.
+        guard !hasReachedEndOfFile else { return }
+        // The reconnect replaces this transport; its end says nothing about
+        // the item.
+        guard !reconnectCycle.isActive else { return }
+
+        // Aether reports a source that stopped delivering as an ordinary end
+        // of stream once its reader gives up, for example after a seek past
+        // the buffer while the server is down. A remux or transcode whose
+        // session the server lost (a restart) can end cleanly with no stall
+        // at all. Short of the end, either is a lost connection, not the item
+        // finishing (§6.2): reconnect at the position the stream last played
+        // from, and neither finish the item nor start the next one. The
+        // reconnect carries the viewer's pause and is bounded by its own
+        // attempt budget.
+        if sourceEnded,
+           currentTransportHasShownFrame,
+           let position = PlaybackReconnectPolicy.endOfStreamReconnectPosition(
+               playhead: sourcePlayhead,
+               duration: duration,
+               sourceStalled: sourceWatch.isStalled,
+               serverUnreachable: isServerUnreachable,
+               delivery: aetherPlaybackController.activeSpec?.delivery,
+               lastEndReconnect: lastEndReconnect
+           ),
+           beginReconnect(position: position, resume: aetherPlaybackController.shouldPlayWhenReady) {
+            Self.logger.warning(
+                "[CMP] handleEndOfFile: source ended short of the end at \(position, privacy: .public)/\(self.duration, privacy: .public) clock=\(self.currentTime, privacy: .public) route=\(self.activeRouteLabel, privacy: .public) stalled=\(self.sourceWatch.isStalled, privacy: .public); treating as a lost connection"
+            )
+            lastEndReconnect = position
+            currentTime = position
+            return
+        }
+
+        hasReachedEndOfFile = true
+
+        // Detect a premature EOF before the autoplay hand-off. FFmpeg's
+        // demuxer reports end-of-stream when the upstream HTTP connection is
+        // reset, even if the file's real duration is still seconds away. The
+        // player then drains its buffered packets cleanly and lands here, but
+        // treating that as a natural end would trigger autoplay against the
+        // same dead network that just dropped us.
+        // While the source was failing the clock may have run on without a
+        // frame; the position the stream last played from decides. A finish
+        // the player made itself ends at the clock it set.
+        let sourceFailing = sourceEnded && (sourceWatch.isStalled || isServerUnreachable)
+        let observedPosition = sourceFailing ? sourcePlayhead : currentTime
+        let safeDuration = duration
+        let isPremature = observedPosition > 0
+            && PlaybackReconnectPolicy.isBeforeNaturalEnd(position: observedPosition, duration: safeDuration)
+        reachedEndPrematurely = isPremature
+
+        // A Watch Party has no postroll to fall back on, and a member parked
+        // on a dead stream is one the room can no longer move. Remount at the
+        // position the connection dropped; the load mounts paused, and the
+        // room's attach and commands bring the member back in step.
+        if isPremature, isWatchPartyPlayback {
+            Self.logger.warning(
+                "[CMP] handleEndOfFile reloading Watch Party playback: premature EOF at \(observedPosition, privacy: .public)/\(safeDuration, privacy: .public)"
+            )
+            // Not a finish: the reload must not record the item as completed.
+            hasReachedEndOfFile = false
+            if remountWatchPartyPlayback(at: observedPosition) { return }
+            hasReachedEndOfFile = true
+        }
+
+        if isPremature {
+            Self.logger.warning(
+                "[CMP] handleEndOfFile suppressing autoplay: premature EOF at \(observedPosition, privacy: .public)/\(safeDuration, privacy: .public)"
+            )
+            // Cancel autoplay before we enter the postroll so the hand-off
+            // to the next episode short-circuits — `beginNextUpPostroll`
+            // checks `!nextUpAutoplayCancelled` before calling
+            // `playNextEpisodeNow()`. The user is left on a recoverable
+            // surface where they can retry via Play Now, pick from On Deck,
+            // or hit Back.
+            nextUpAutoplayCancelled = true
+            cancelNextUpCountdown()
+        }
+
+        #if os(iOS) || os(tvOS)
+        // Terminal outcome #2 of 2. A premature EOF is a failure the user
+        // sees as "it just stopped", so it must not be filed as a clean
+        // finish — the `reason` token is the only thing separating the two in
+        // a report, since both arrive on this same path.
+        DiagTrace.breadcrumb(
+            .essential,
+            level: isPremature ? .warning : .info,
+            category: .playback,
+            tag: "Player",
+            message: "playback reached end of stream",
+            attrs: [
+                "reason": .string(isPremature ? "premature_source_end" : "natural_end"),
+                "play_method": .string(activeRouteLabel),
+                "position_ms": .int(
+                    PlaybackSessionBridge.diagnosticsPositionMilliseconds(observedPosition)
+                ),
+            ]
+        )
+        #endif
+
+        hideControlsTask?.cancel()
+        hideControlsTask = nil
+        aetherPlaybackController.pause()
+        if isPremature {
+            // The periodic and final progress reports read `currentTime`; a
+            // premature end must not report the item as played to the end.
+            currentTime = observedPosition
+        } else if duration.isFinite, duration > 0 {
+            currentTime = duration
+        }
+        isLoading = false
+        isBuffering = false
+        isLoadingSubtitles = false
+        bufferingProgress = nil
+        isPlaying = false
+        showControls = true
+        nowPlaying.update(
+            title: title,
+            duration: duration,
+            position: currentTime,
+            isPlaying: false,
+            playbackRate: effectivePlaybackSpeed
+        )
+
+        if !isPremature {
+            recordCurrentPlaybackMutation()
+
+            // Aether has already delivered the native terminal event, so
+            // publish the terminal position now rather than waiting for the
+            // periodic reporter's next ten-second tick. Teardown still sends
+            // its authoritative final report; it awaits this task first so
+            // the two writes cannot race the same session lifecycle.
+            if offlinePlaybackContext == nil,
+               currentTime.isFinite,
+               currentTime >= 0 {
+                let priorNaturalEndProgressTask = naturalEndProgressTask
+                let endPosition = currentTime
+                #if os(iOS) || os(macOS)
+                let refreshHome = refreshHomeAfterPlaybackWrite
+                #endif
+                naturalEndProgressTask = Task { [sessionBridge] in
+                    await priorNaturalEndProgressTask?.value
+                    let result = await sessionBridge.reportProgress(
+                        position: endPosition,
+                        isPaused: true
+                    )
+                    #if os(iOS) || os(macOS)
+                    if result == .success { refreshHome?() }
+                    #endif
+                }
+            }
+        }
+
+        // Natural end of an offline download: latch the local watched state
+        // immediately (not just at close) so retention/reclaim see it even
+        // if the process dies before `cleanup()` runs.
+        if !isPremature, let offline = offlinePlaybackContext {
+            recordOfflineProgress(
+                context: offline,
+                position: currentTime,
+                markCompleted: true
+            )
+        }
+
+        if !isPremature, let nextPart = nextShufflePart {
+            playShufflePart(nextPart)
+            return
+        }
+        beginNextUpPostroll(videoEnded: true)
+
+        // After the postroll, which clears notices left over from playback;
+        // the postroll shows this one.
+        if isPremature {
+            // A download has no connection to lose: its early end is a file
+            // that stops short.
+            let isDownload = lastLoadRequest?.offlineDownloadId != nil
+            showNotice(
+                title: isDownload ? "Download incomplete" : "Connection lost",
+                message: isDownload
+                    ? "The downloaded video file ends early. Delete and re-download it."
+                    : "Lost connection to the server before the episode finished.",
+                tone: .warning,
+                duration: 6
+            )
+        }
+    }
+
+
+    /// Rebind commands and publication whenever Aether swaps its effective
+    /// video route. Native video uses Aether's player-scoped session;
+    /// software video (and macOS, where upstream has no video session) uses
+    /// the shared fallback. Rebinding clears the previous destination first.
+    private func syncNowPlayingDestination() {
+        guard !isDisposed else {
+            nowPlaying.detach()
+            return
+        }
+        if !isObservingSeekIntervals {
+            isObservingSeekIntervals = true
+            seekIntervalPreferences.observe(self) { [weak self] in
+                self?.syncNowPlayingSkipIntervals()
+            }
+        }
+        syncNowPlayingSkipIntervals()
+        let handlers = AetherVideoNowPlayingCoordinator.Handlers(
+            // On tvOS the physical Play/Pause button can arrive through the
+            // player-scoped media command center instead of SwiftUI's
+            // `onPlayPauseCommand`. Keep that route visually consistent with
+            // Select by revealing the transport controls as playback changes.
+            play:        { [weak self] in self?.handleNowPlayingPlay() },
+            pause:       { [weak self] in self?.handleNowPlayingPause() },
+            isPaused:    { [weak self] in
+                guard let self else { return true }
+                return self.hasReachedEndOfFile || self.aetherPlaybackController.isPaused
+            },
+            // System skip commands add to this. While an on-screen skip is
+            // still debouncing, its target is the playhead the user expects
+            // the next press to build on.
+            currentTime: { [weak self] in
+                guard let self else { return 0 }
+                return self.skipDebounceTask != nil ? self.scrubPreviewTime : self.currentTime
+            },
+            // Remote-position events use the source axis published above and
+            // must pass through the VM so a bounded V3 transport can replan.
+            seek:        { [weak self] t in self?.seekTo(seconds: t) },
+            // A command answered `.success` while the controller has no load
+            // reports work the system will never observe.
+            hasActiveLoad: { [weak self] in
+                self?.aetherPlaybackController.hasActiveLoad ?? false
+            }
+        )
+        #if os(iOS) || os(tvOS)
+        nowPlaying.attach(
+            session: aetherPlaybackController.videoNowPlayingSession,
+            useSharedFallback: aetherPlaybackController.shouldUseSharedVideoNowPlayingFallback,
+            handlers: handlers
+        )
+        #else
+        nowPlaying.attach(
+            useSharedFallback: aetherPlaybackController.shouldUseSharedVideoNowPlayingFallback,
+            handlers: handlers
+        )
+        #endif
+    }
+
+    /// Lock screen, Control Center, and headphone skip buttons label
+    /// themselves from these, so they are pushed again whenever the profile's
+    /// intervals change mid-playback.
+    private func syncNowPlayingSkipIntervals() {
+        guard !isDisposed else { return }
+        let pair = seekIntervalPreferences.pair(for: .videoSystemControls)
+        nowPlaying.setPreferredSkipIntervals(
+            backward: Double(pair.backward),
+            forward: Double(pair.forward)
+        )
+    }
+
+    private func handleNowPlayingPlay() {
+        guard !isReconnecting else { return }
+        if watchPartyAdapter?.request(.play) == true { return }
+        aetherPlaybackController.play()
+        #if os(tvOS)
+        scheduleHideControls()
+        #endif
+    }
+
+    private func handleNowPlayingPause() {
+        if watchPartyAdapter?.request(.pause) == true { return }
+        aetherPlaybackController.pause()
+        #if os(tvOS)
+        scheduleHideControls()
+        #endif
+    }
+
+    private func resetPublishedLoadState(
+        preferredAudioTrackIndex: Int?,
+        preferredSubtitleTrackIndex: Int?,
+        preferredSidecarSubtitleTrackId: Int64?,
+        preferredProtocolV3SubtitleIndex: Int? = nil
+    ) {
+        isLoadingSubtitles = false
+        isLoading = true
+        error = nil
+        errorIsRetryable = true
+        noticeDismissTask?.cancel()
+        noticeDismissTask = nil
+        remoteDismissTask?.cancel()
+        remoteDismissTask = nil
+        activeNotice = nil
+        remoteDismissToken = nil
+        // The exit a server-ended session started is cancelled above; the
+        // session this load starts handles its own end.
+        serverEndedSessionHandled = false
+        hideControlsTask?.cancel()
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        seekFilterTimeoutTask?.cancel()
+        seekFilterTimeoutTask = nil
+        tearDownHoldSeek()
+        isScrubbing = false
+        scrubPreviewTime = currentTime
+        scrubPreviewProvider.endInteraction()
+        scrubPreviewImage = nil
+        scrubPreviewImageSourceTime = nil
+        scrubPreviewImageSource = nil
+        seekOriginTime = nil
+        seekTargetTime = nil
+        watchPartyHeldSeek = nil
+        showControls = false
+        // The HUD belongs to the outgoing item. Replans deliberately bypass
+        // this reset so the HUD survives them; a replacement load must close
+        // it, both because its content is stale and because the tvOS controls
+        // host stays mounted through `isLoading` whenever this flag is up.
+        isHUDPresented = false
+        showNextUpScreen = isNextUpTransitioning
+        if !isNextUpTransitioning {
+            nextUpEpisode = nil
+            nextUpOnDeckItems = []
+        }
+        isLoadingNextUpEpisode = false
+        isLoadingNextUpOnDeck = false
+        nextUpLookupError = nil
+        nextUpStartError = nil
+        nextUpCountdownSeconds = nil
+        nextUpCountdownTotalSeconds = Self.nextUpCountdownDefaultSeconds
+        nextUpScreenVideoEnded = false
+        nextUpPresentationSource = .automatic
+        nextUpAutoplayCancelled = false
+        nextUpPromptDismissed = false
+        audioTracks = []
+        subtitleTracks = []
+        livePrimarySubtitleCues = []
+        liveSecondarySubtitleCues = []
+        chapters = []
+        introRange = nil
+        creditsRange = nil
+        recapRange = nil
+        markerReconcileTask?.cancel()
+        markerReconcileTask = nil
+        markerReconcileRequestId = nil
+        qualityOptions = [ApplePlaybackQuality.auto]
+        activeQualityId = ApplePlaybackQuality.autoId
+        isQualitySwitching = false
+        qualitySwitchError = nil
+        serverProvidedChapters = []
+        currentWatchDetail = nil
+        currentSelectedVersion = nil
+        activePreparedProtocolV3 = nil
+        autoSkippedCreditsKey = nil
+        didSkipCreditsToEnd = false
+        selectedAudioId = nil
+        selectedSubtitleId = nil
+        selectedSecondarySubtitleId = nil
+        bufferedAheadSeconds = 0
+        clearPlaybackStats()
+        knownExternalSubtitles = []
+        locallyRegisteredSidecarSubtitleTracks = []
+        localProtocolV3SubtitleSelection = nil
+        pendingServerRenderedSubtitleTrackId = nil
+        // Subtitle `-1` is the explicit "Off" sentinel; Aether inventory
+        // adoption disables subtitles when it sees a negative value.
+        pendingAudioFfIndex = preferredAudioTrackIndex
+        pendingSubtitleFfIndex = preferredSubtitleTrackIndex
+        pendingSidecarSubtitleTrackId = preferredSidecarSubtitleTrackId
+        hasExplicitSubtitleChoice =
+            preferredSubtitleTrackIndex != nil
+            || preferredSidecarSubtitleTrackId != nil
+            || preferredProtocolV3SubtitleIndex != nil
+        prefsForCurrentItem = nil
+        prefsResolvedForCurrentItem = false
+        deferredAutoSubtitlePick = nil
+    }
+
+    private func resolvedAudioTrackIndexForResume() -> Int? {
+        guard let selectedAudioId,
+              let selected = audioTracks.first(where: { $0.trackId == selectedAudioId }),
+              let selectionIndex = audioSelectionIndex(for: selected) else {
+            return lastLoadRequest?.preferredAudioTrackIndex
+        }
+        return selectionIndex
+    }
+
+    func subtitleUsesMovieTimeline(_ trackID: Int64?, slot: SubtitleSlot = .primary) -> Bool {
+        aetherPlaybackController.subtitleUsesMovieTimeline(appTrackID: trackID, slot: slot)
+    }
+
+    static func selectedEmbeddedSubtitleIndexForResume(plan: PlaybackV3Plan?, selectedTrackID: Int64?) -> Int? {
+        guard let plan,
+              plan.subtitle.mode == PlaybackProtocolV3.SubtitleMode.render,
+              let embedded = plan.subtitle.embedded,
+              let selected = plan.selectedSubtitleInventoryItem,
+              selectedTrackID == SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: selected.combinedIndex) else {
+            return nil
+        }
+        return embedded.streamIndex
+    }
+
+    static func serverSubtitlesDisabledForResume(
+        selectedTrackID: Int64?, hasExplicitChoice: Bool,
+        pendingEmbeddedIndex: Int?, pendingSidecarID: Int64?,
+        pendingServerRenderedID: Int64? = nil
+    ) -> Bool {
+        if selectedTrackID.map(SubtitleTrackIdSpace.isAILive) == true { return true }
+        // Before inventory arrives, nil can mean an unresolved requested track.
+        return hasExplicitChoice && selectedTrackID == nil
+            && pendingSidecarID == nil && pendingServerRenderedID == nil
+            && (pendingEmbeddedIndex ?? -1) < 0
+    }
+
+    private var hasDisabledServerSubtitlesForResume: Bool {
+        Self.serverSubtitlesDisabledForResume(
+            selectedTrackID: selectedSubtitleId, hasExplicitChoice: hasExplicitSubtitleChoice,
+            pendingEmbeddedIndex: pendingSubtitleFfIndex, pendingSidecarID: pendingSidecarSubtitleTrackId,
+            pendingServerRenderedID: pendingServerRenderedSubtitleTrackId
+        )
+    }
+
+    private func resolvedSubtitleTrackIndexForResume() -> Int? {
+        if hasDisabledServerSubtitlesForResume { return -1 }
+        if let index = Self.selectedEmbeddedSubtitleIndexForResume(
+            plan: activePreparedProtocolV3?.plan, selectedTrackID: selectedSubtitleId
+        ) {
+            return index
+        }
+        // The id space decides, not the row's metadata: a V3 picker row is
+        // published in the sidecar space and carries its FFmpeg index only so
+        // an embedded pick can be persisted. Restoring it as an embedded index
+        // would arm both identities for the same subtitle.
+        if let selectedSubtitleId, SubtitleTrackIdSpace.isSidecar(selectedSubtitleId) {
+            // Sidecars are re-applied client-side after the playback
+            // session returns `subtitle_urls`; keep embedded subtitles off
+            // until that explicit sidecar selection is restored.
+            return -1
+        }
+        if let selectedSubtitleId,
+           let selected = subtitleTracks.first(where: { $0.trackId == selectedSubtitleId }),
+           let ffIndex = selected.ffIndex {
+            return ffIndex
+        }
+        if !subtitleTracks.isEmpty || lastLoadRequest?.preferredSubtitleTrackIndex == -1 {
+            return -1
+        }
+        return lastLoadRequest?.preferredSubtitleTrackIndex
+    }
+
+    private func resolvedProtocolV3SubtitleIndexForResume() -> Int? {
+        if let localProtocolV3SubtitleSelection, let plan = activePreparedProtocolV3?.plan {
+            return localProtocolV3SubtitleSelection.replanIndex(in: plan)
+        }
+        guard let selectedSubtitleId,
+              !SubtitleTrackIdSpace.isAILive(selectedSubtitleId),
+              let selected = subtitleTracks.first(where: { $0.trackId == selectedSubtitleId }),
+              let version = currentSelectedVersion else {
+            return nil
+        }
+        return ApplePlaybackV3PlanAdapter.serverCombinedSubtitleIndex(
+            for: selected,
+            in: version,
+            inventory: activePreparedProtocolV3?.plan.subtitle.inventory ?? []
+        )
+    }
+
+    private func resolvedSidecarSubtitleTrackIdForResume() -> Int64? {
+        if hasDisabledServerSubtitlesForResume { return nil }
+        if Self.selectedEmbeddedSubtitleIndexForResume(
+            plan: activePreparedProtocolV3?.plan, selectedTrackID: selectedSubtitleId
+        ) != nil { return nil }
+        if let selectedSubtitleId, SubtitleTrackIdSpace.isSidecar(selectedSubtitleId) {
+            return selectedSubtitleId
+        }
+        return lastLoadRequest?.preferredSidecarSubtitleTrackId
+    }
+
+    private func adoptProtocolV3RenewalIntent(from prepared: PreparedPlayback, viewerQualityId: String? = nil) {
+        guard let protocolV3 = prepared.protocolV3,
+              let lastLoadRequest,
+              lastLoadRequest.offlineDownloadId == nil else {
+            return
+        }
+        let adopted = lastLoadRequest.adoptingProtocolV3Intent(
+            plan: protocolV3.plan,
+            selectedVersion: prepared.selectedVersion,
+            keepsExplicitOff: hasExplicitSubtitleChoice,
+            viewerQualityId: viewerQualityId
+        )
+        // A seek candidate still carries the server's frozen subtitle. Save
+        // the user's newer choice before loading: a failed candidate can be
+        // promoted into recovery without ever reaching the commit callback.
+        self.lastLoadRequest = localProtocolV3SubtitleSelection.map {
+            adopted.adoptingLocalProtocolV3SubtitleSelection($0, plan: protocolV3.plan)
+        } ?? adopted
+
+        armAdoptedProtocolV3TrackIntent(
+            plan: protocolV3.plan,
+            request: adopted
+        )
+
+        // Adopting an authoritative server plan does not convert an automatic
+        // system/server policy into a user choice. Manual choices stay latched;
+        // automatic choices remain eligible for later policy changes.
+        if hasExplicitSubtitleChoice {
+            prefsForCurrentItem = nil
+            prefsResolvedForCurrentItem = true
+        }
+    }
+
+    func armAdoptedProtocolV3TrackIntent(
+        plan: PlaybackV3Plan,
+        request: LoadRequest
+    ) {
+        // The V3 plan is authoritative for the tracks actually rendered.
+        // Apply it before the new source publishes a track list so container
+        // defaults and the post-open Auto resolver cannot drift away from the
+        // selection the server will preserve through replans and renewals.
+        let intent = Self.protocolV3PendingTrackIntent(plan: plan, request: request)
+        pendingAudioFfIndex = intent.audioIndex
+        pendingSubtitleFfIndex = intent.embeddedSubtitleIndex
+        pendingSidecarSubtitleTrackId = intent.sidecarSubtitleTrackId
+        pendingServerRenderedSubtitleTrackId = intent.serverRenderedSubtitleTrackId
+    }
+
+    /// Re-arms the plan's subtitle for a reload that keeps the same plan.
+    ///
+    /// `AetherEngine.load` clears the engine's subtitle selection with the old
+    /// source, and the plan's pending intent was consumed by the plan's first
+    /// load. Without this, a credential reload (one per access-token rotation
+    /// on a header-authenticated original file) comes back with the picker
+    /// still showing the plan's subtitle and no subtitle selected in the
+    /// engine, so cues stop mid-playback without an error.
+    ///
+    /// Audio needs no re-arm: the load spec carries the plan's audio stream.
+    /// Returns the intent it armed, or nil when the selection is not the
+    /// plan's to restore.
+    @discardableResult
+    func armProtocolV3SubtitleIntentForSamePlanReload(
+        plan: PlaybackV3Plan,
+        request: LoadRequest
+    ) -> ProtocolV3PendingTrackIntent? {
+        guard Self.protocolV3SubtitleSelectionIsPlanOwned(
+            plan: plan,
+            selectedSubtitleID: selectedSubtitleId,
+            hasLocalSelection: localProtocolV3SubtitleSelection != nil
+        ) else { return nil }
+        let intent = Self.protocolV3PendingTrackIntent(plan: plan, request: request)
+        pendingSubtitleFfIndex = intent.embeddedSubtitleIndex
+        pendingSidecarSubtitleTrackId = intent.sidecarSubtitleTrackId
+        pendingServerRenderedSubtitleTrackId = intent.serverRenderedSubtitleTrackId
+        return intent
+    }
+
+    /// Whether the subtitle on screen is the one the plan selected, so a
+    /// reload of that plan may select it again. Other selections have their
+    /// own restore paths and the plan must not replace them: a local pick
+    /// (`restoreLocalProtocolV3SubtitleSelection`), a sidecar this session
+    /// created (`reregisterLocallyCreatedSidecarsWithAether`), and a live AI
+    /// track, which Silo's overlay renders outside the engine.
+    static func protocolV3SubtitleSelectionIsPlanOwned(
+        plan: PlaybackV3Plan,
+        selectedSubtitleID: Int64?,
+        hasLocalSelection: Bool
+    ) -> Bool {
+        guard !hasLocalSelection else { return false }
+        let planSelectedID = plan.subtitle.mode == PlaybackProtocolV3.SubtitleMode.off
+            ? nil
+            : plan.selectedSubtitleCombinedIndex.map {
+                SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: $0)
+            }
+        return selectedSubtitleID == planSelectedID
+    }
+
+    private func beginFreshLoad(
+        request: LoadRequest,
+        progressPosition: Double?,
+        finalizeCurrentSession: Bool = false,
+        resumePositionOverride: Double? = nil,
+        allowNearEndResume: Bool = false,
+        origin: LoadOrigin = .userInitiated,
+        // A version switch the viewer chose: a quality change once its plan
+        // is adopted, not a new attempt.
+        viewerQualityChange: Bool = false
+    ) {
+        guard !isDisposed else { return }
+        // A renewal still waiting on its progress sync belongs to the load
+        // this one replaces. Left pending, it would reload its own captured
+        // request over the item that is starting now.
+        staleSessionRecoveryTask?.cancel()
+        staleSessionRecoveryTask = nil
+        #if os(iOS) || os(macOS)
+        if refreshHomeAfterPlaybackWrite == nil {
+            refreshHomeAfterPlaybackWrite = StartupContentPrefetcher.homeRefreshAfterPlaybackWrite()
+        }
+        #endif
+        #if os(tvOS)
+        PosterImageCache.trimDecodedMemory()
+        #endif
+        isNextUpTransitioning = origin == .autoplay && showNextUpScreen
+        recordCurrentPlaybackMutation()
+        let pendingNaturalEndProgressTask = naturalEndProgressTask
+        naturalEndProgressTask = nil
+        // Every other start is a new attempt, which drops a kept step-down
+        // estimate, and ends a quality change still on its way.
+        let qualityChange: UInt64?
+        if viewerQualityChange {
+            qualityChange = sendViewerQualityChange()
+        } else {
+            qualityChange = nil
+            settleViewerQualityChange(pendingViewerQualityChange, adopted: false)
+            bufferingQuality.newAttempt()
+        }
+        // Intro and recap decisions belong to the content, not to one stream
+        // of it. A retry or a reload that lands a seek keeps them, so a viewer
+        // who skipped or dismissed an intro is not asked again, `always`
+        // cannot skip the same intro twice when the reload lands just short of
+        // its end, and a recap the viewer went back to watch is not skipped
+        // again.
+        if lastLoadRequest?.contentId != request.contentId {
+            introSkipPrompt.reset()
+            resetBufferingQuality()
+            autoSkippedRecapKeys = []
+            viewingHasPlayed = false
+            reconnectLoadRequest = nil
+            // Other content starts with a full reconnect budget.
+            cancelReconnect()
+            reconnectCycle.resetBudget()
+        }
+        // Any other start takes the session over from a running reconnect,
+        // and from where one last resumed: a retry, a version switch or a
+        // remount is a fresh look at the stream.
+        if origin != .reconnect {
+            cancelReconnect()
+            lastEndReconnect = nil
+        }
+        lastLoadRequest = request
+        offlinePlaybackContext = nil
+        contentIdsNeedingDetailRefresh.insert(request.contentId)
+        hasReachedEndOfFile = false
+        // Retire the outgoing load's epoch *synchronously*. The actual
+        // dispose happens several awaits down, and until this is nil a late
+        // `.ended` or failure from the item we're replacing still matches
+        // `handleAetherEvent`'s epoch filter — landing end-of-file, or a
+        // terminal error, on the item that is only just starting to load.
+        activeAetherLoadEpoch = nil
+        committedProtocolV3LoadEpoch = nil
+        pendingProtocolV3FirstFrameEpoch = nil
+        // The outgoing item's queued follow-ups must not be replayed against
+        // the incoming one.
+        pendingProtocolV3SeekReanchorPosition = nil
+        pendingProtocolV3TrackChange = nil
+        seekReplanTask?.cancel()
+        seekReplanTask = nil
+        cancelNextUpFlow()
+        syncNowPlayingDestination()
+        resetPublishedLoadState(
+            preferredAudioTrackIndex: request.preferredAudioTrackIndex,
+            preferredSubtitleTrackIndex: request.preferredSubtitleTrackIndex,
+            preferredSidecarSubtitleTrackId: request.preferredSidecarSubtitleTrackId,
+            preferredProtocolV3SubtitleIndex: request.preferredProtocolV3SubtitleIndex
+        )
+        // No engine event arrives while the replacement session is prepared,
+        // so hand the pill the stall now. A same-content reload keeps the
+        // `always` undo, and its timer must hold through the spinner.
+        syncIntroSkipPrompt()
+
+        // The prior item's timer reads bridge state at each tick. Stop it
+        // before a replacement session becomes provisional or it can publish
+        // the new item's reset position against an uncommitted candidate.
+        progressTask?.cancel()
+        progressTask = nil
+        freshLoadTask?.cancel()
+        protocolV3ReplanTask?.cancel()
+        protocolV3ReplanTask = nil
+        freshLoadGeneration &+= 1
+        let currentFreshLoadGeneration = freshLoadGeneration
+        streamLoadGeneration &+= 1
+        let currentStreamLoadGeneration = streamLoadGeneration
+        let snapshotPosition = progressPosition
+        // Offline loads never start a replacement server session, so the
+        // prior one must be finalized here — otherwise the bridge keeps
+        // holding it and a later teardown would report the offline item's
+        // position against the stale session.
+        let shouldFinalizeCurrentSession = finalizeCurrentSession || request.offlineDownloadId != nil
+        // From here until this task exits, its catch is the only handler for
+        // a load failure — see `handleAetherFailure`.
+        freshLoadOwnsFailureHandling = true
+        freshLoadTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            // The load holds speed tests off from here, before its start
+            // request registers it.
+            self.syncSpeedTestHold()
+            var uncommittedPrepared: PreparedPlayback?
+            var adoptedBufferingPlan = false
+            defer {
+                self.settleViewerQualityChange(qualityChange, adopted: false)
+                if self.freshLoadGeneration == currentFreshLoadGeneration {
+                    // A reconnect handoff this load began but never installed.
+                    _ = self.reconnectCycle.finishHandoff()
+                    self.freshLoadTask = nil
+                    self.freshLoadOwnsFailureHandling = false
+                    // A Restore answered while this start was out, and not
+                    // carried by it, goes out now that its plan plays. With
+                    // no plan, the Restore's clear stays owed to the next
+                    // request.
+                    if let restore = self.deferredBufferingRestore {
+                        self.deferredBufferingRestore = nil
+                        if adoptedBufferingPlan { self.issueBufferingReplan(restore) }
+                    }
+                    self.syncBufferingQualitySignals()
+                    self.publishWatchPartySnapshot()
+                }
+            }
+
+            await pendingNaturalEndProgressTask?.value
+            if let snapshotPosition, snapshotPosition.isFinite, snapshotPosition >= 0 {
+                if shouldFinalizeCurrentSession {
+                    await self.sessionBridge.stopSession(position: snapshotPosition, isPaused: true)
+                } else {
+                    await self.sessionBridge.reportProgress(position: snapshotPosition, isPaused: true)
+                }
+                #if os(iOS) || os(macOS)
+                self.refreshHomeAfterPlaybackWrite?()
+                #endif
+            }
+            guard !Task.isCancelled,
+                  !self.isDisposed,
+                  currentFreshLoadGeneration == self.freshLoadGeneration,
+                  currentStreamLoadGeneration == self.streamLoadGeneration else { return }
+
+            await self.realtimeClient.unbind()
+            guard !Task.isCancelled,
+                  !self.isDisposed,
+                  currentFreshLoadGeneration == self.freshLoadGeneration,
+                  currentStreamLoadGeneration == self.streamLoadGeneration else { return }
+
+            do {
+                self.disposeAetherPlayback(forReplacement: true)
+                guard !Task.isCancelled, !self.isDisposed else { return }
+
+                // The init kicked off `settingsRefreshTask` to fetch the
+                // server's effective device settings before playback
+                // starts. Awaiting it here (instead of issuing a fresh
+                // `refreshFromServer`) avoids the race that produced two
+                // back-to-back `/settings/effective` round-trips on every
+                // play — the init request is already in flight and its
+                // result is what we want anyway. If the task already
+                // finished, this returns immediately.
+                // A download plays on the cached settings instead: with a
+                // network but no answering server, the refresh only ends at
+                // the request timeout. It still applies when it finishes.
+                if request.offlineDownloadId == nil {
+                    await self.settingsRefreshTask?.value
+                }
+                try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                guard currentFreshLoadGeneration == self.freshLoadGeneration else {
+                    throw CancellationError()
+                }
+
+                let prepared: PreparedPlayback
+                var preparedOfflineContext: OfflinePlaybackContext?
+                var preparedOfflineArtworkURL: URL?
+                // The estimate the start sends, for the plan's summary.
+                var probeEstimateKbps: Int?
+                if let offlineDownloadId = request.offlineDownloadId {
+                    // Fully local prepare from the stored record + manifest.
+                    // Must keep working in airplane mode, so nothing on this
+                    // branch (or downstream of it while
+                    // `offlinePlaybackContext` is set) may require the server.
+                    let offline = try await OfflinePlaybackBuilder.loadPreparedPlayback(
+                        downloadId: offlineDownloadId,
+                        startFromBeginning: request.startFromBeginning,
+                        resumePositionOverride: resumePositionOverride
+                    )
+                    preparedOfflineContext = OfflinePlaybackContext(
+                        mediaItemId: offline.mediaItemId,
+                        isServerPreparedFile: offline.isServerPreparedFile
+                    )
+                    preparedOfflineArtworkURL = offline.posterFileURL
+                    prepared = offline.prepared
+                    // A download playing is media playing: speed tests wait
+                    // for it. It sends no estimate.
+                    BandwidthProbeScheduler.shared.playbackStarting(by: self)
+                } else {
+                    // Bound the start-session call when the load was triggered
+                    // by autoplay or interruption recovery. A user-initiated load
+                    // keeps the unbounded behavior — a slow manual pick is
+                    // annoying but doesn't wedge the UI; a hung autoplay does
+                    // (the user is stuck on a half-cross-faded Next Up screen
+                    // with no obvious way out).
+                    // The start carries a fresh bandwidth probe result, and a
+                    // running probe stops so it cannot slow the start.
+                    // Only a reading of the server this start goes to (a TV
+                    // can start for another one), taken over the route its
+                    // media takes: a Watch Party's media keeps the saved
+                    // address.
+                    let startServerId = await TokenStore.shared.captureOrdinaryRequestAuth()?.account.serverId
+                    probeEstimateKbps = BandwidthProbeScheduler.shared.freshEstimateKbps(
+                        forServer: startServerId,
+                        overLocalRoute: !self.isWatchPartyPlayback && startServerId != nil
+                            && LocalRoute.active?.serverID == startServerId
+                    )
+                    BandwidthProbeScheduler.shared.playbackStarting(by: self)
+                    prepared = try await self.runStartSession(
+                        request: request,
+                        resumePosition: resumePositionOverride,
+                        allowNearEndResume: allowNearEndResume,
+                        probeEstimateKbps: probeEstimateKbps,
+                        // A Restore this start displaced: its clear rides here.
+                        learnedLimit: self.takeOwedBufferingLearnedLimitClear(),
+                        timeout: origin == .userInitiated ? nil : Self.autoplayStartSessionTimeout
+                    )
+                }
+                try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                guard currentFreshLoadGeneration == self.freshLoadGeneration else {
+                    throw CancellationError()
+                }
+                if prepared.protocolV3 != nil {
+                    uncommittedPrepared = prepared
+                }
+                // A reconnect's new session ends the reconnect; it plays only
+                // if the viewer was playing when the connection dropped.
+                let reconnectResume = self.adoptPlanEndingReconnect(
+                    requestedPosition: resumePositionOverride
+                )
+                if let preparedOfflineContext {
+                    self.offlinePlaybackContext = preparedOfflineContext
+                }
+                if let preparedOfflineArtworkURL {
+                    self.nowPlaying.setArtworkURL(preparedOfflineArtworkURL)
+                }
+
+                let session = prepared.session
+                self.activePlaybackSessionId = session.sessionId
+                self.autoSkippedCreditsKey = nil
+                self.staleSessionRecoverySessionId = nil
+                // Snapshot the preferred language for track-list ordering
+                // unconditionally (even with an explicit choice) so the
+                // displayed groups float the user's language to the top.
+                self.subtitleOrderingLanguage = self.settings.subtitleMatchesSystemAppearance
+                    ? self.settings.subtitleSystemSelectionPreferences.preferredLanguages.first
+                    : prepared.watchDetail.effectiveSubtitleLanguage
+
+                // Snapshot the server-resolved subtitle policy so the
+                // track-list callback (which fires after Aether opens media)
+                // can pick the right track without another fetch. Skip
+                // entirely if the caller already passed an explicit
+                // subtitle index — manual override always wins.
+                if !self.hasExplicitSubtitleChoice {
+                    self.prefsForCurrentItem = self.settings.subtitleMatchesSystemAppearance
+                        ? self.systemCaptionPrefsSnapshot()
+                        : self.serverSubtitlePrefsSnapshot(prepared.watchDetail)
+                }
+
+                self.title = prepared.displayTitle
+                self.metadata = prepared.playerMetadata()
+                self.pendingExternalSubtitles = session.subtitleUrls ?? []
+                self.knownExternalSubtitles = self.pendingExternalSubtitles
+                self.currentWatchDetail = prepared.watchDetail
+                self.currentSelectedVersion = prepared.selectedVersion
+                self.activePreparedProtocolV3 = prepared.protocolV3
+                self.adoptProtocolV3RenewalIntent(from: prepared)
+                // Artwork and Next Up are catalog fetches; the offline path
+                // already published its cached poster above and has no
+                // server to resolve a next episode against.
+                if request.offlineDownloadId == nil {
+                    self.pushNowPlayingArtwork(contentId: prepared.watchDetail.contentId)
+                    // The panel still describes the successor being loaded.
+                    // Fetch its following episode only once it has a picture,
+                    // otherwise the visible Play Now target can jump again.
+                    if !self.isNextUpTransitioning {
+                        self.loadNextUpCandidate(for: prepared.watchDetail)
+                        self.loadNextUpOnDeckItems(for: prepared.watchDetail)
+                    }
+                }
+                self.qualityOptions = ApplePlaybackQuality.playbackOptions(
+                    serverQualities: prepared.protocolV3?.plan.availableQualities ?? [],
+                    bandwidthLimit: prepared.protocolV3?.plan.bandwidthLimit
+                )
+                self.activeQualityId = prepared.activeQualityId
+                self.isQualitySwitching = false
+                self.qualitySwitchError = nil
+                self.serverProvidedChapters = self.chapterInfoList(from: prepared.selectedVersion)
+                self.duration = session.durationSeconds ?? prepared.selectedVersion.duration ?? 0
+                self.currentTime = self.movieTime(for: session)
+                self.applyMarkerRanges(
+                    intro: prepared.selectedVersion.intro,
+                    credits: prepared.selectedVersion.credits,
+                    recap: prepared.selectedVersion.recap
+                )
+
+                guard let streamRequest = await self.makeStreamRequest(
+                    session: session,
+                    additionalHeaders: prepared.protocolV3?.plan.stream.headers ?? [:],
+                    requiresHeaderAuthenticatedMedia: prepared.protocolV3?.serverFeatures.contains(
+                        PlaybackProtocolV3.headerAuthenticatedMediaFeature
+                    ) == true,
+                    allowsAuthorizedMediaOrigins:
+                        prepared.protocolV3?.negotiatedAuthorizedMediaOrigins == true
+                ) else {
+                    throw AetherLoadSpec.ValidationError.invalidStreamURL(session.streamUrl)
+                }
+                try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                guard currentFreshLoadGeneration == self.freshLoadGeneration else {
+                    throw CancellationError()
+                }
+                self.resolvedServerUrl = streamRequest.serverUrl
+
+                Self.logger.info("Play method: \(session.playMethod, privacy: .public)")
+                // Keep the tvOS console breadcrumb useful without printing the
+                // signed stream URL or any server identity.
+                print("[CMP] streamPrepared engine=AetherEngine playMethod=\(session.playMethod) startTime=\(session.position)")
+
+                try await self.loadAether(
+                    prepared: prepared,
+                    streamRequest: streamRequest,
+                    expectedStreamLoadGeneration: currentStreamLoadGeneration,
+                    shouldPlayWhenReady: !self.isWatchPartyPlayback && (reconnectResume ?? true)
+                )
+                // Seeks made while the reconnect's start was out, or while
+                // this transport loaded, are applied once it is committed.
+                let reconnectSeekTarget = self.reconnectCycle.finishHandoff()
+                if prepared.protocolV3 != nil {
+                    guard await self.sessionBridge.commitPendingProtocolV3Transition(prepared) else {
+                        throw CancellationError()
+                    }
+                    self.markProtocolV3AetherLoadCommitted()
+                    uncommittedPrepared = nil
+                    self.settleViewerQualityChange(qualityChange, adopted: true)
+                    self.adoptBufferingPlan(
+                        prepared,
+                        requestedEstimateKbps: probeEstimateKbps,
+                        controllerInitiated: false
+                    )
+                    adoptedBufferingPlan = true
+                    // The realtime channel is a server websocket keyed by the
+                    // committed session. Binding before Aether accepts the
+                    // candidate can leave commands attached to a rolled-back
+                    // session after a failed load.
+                    await self.bindRealtimeControl(sessionId: session.sessionId)
+                    try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                    self.reapplyDeferredAutoSubtitlePolicyIfNeeded()
+                }
+                if let seekTarget = reconnectSeekTarget {
+                    try self.requireCurrentStreamLoad(currentStreamLoadGeneration)
+                    self.commitSeek(to: seekTarget, source: "reconnectSeek")
+                }
+            } catch is CancellationError {
+                // Tear the abandoned Aether load down before retiring its
+                // session. Without this the engine keeps reading the stream
+                // URL after the DELETE and spends minutes in 404 backoff.
+                // Skip when a newer load already took the controller: its
+                // own `beginLoad` replaced this source.
+                if currentFreshLoadGeneration == self.freshLoadGeneration,
+                   currentStreamLoadGeneration == self.streamLoadGeneration {
+                    _ = self.disposeAetherPlayback()
+                }
+                if let uncommittedPrepared {
+                    await self.sessionBridge.rollbackPendingProtocolV3Transition(uncommittedPrepared)
+                }
+                return
+            } catch let error {
+                let loadFailure = self.protocolV3LoadFailureRecovery(error)
+                if let uncommittedPrepared {
+                    // `errorInfo` may already have been published for this
+                    // epoch, but the committed-load gate prevents that event
+                    // from racing us. Promote only the failed V3 identity (not
+                    // execution success) and let the server choose the next
+                    // bounded route rather than ending at the first open
+                    // failure.
+                    if loadFailure.shouldAdvanceRoute {
+                        if await self.sessionBridge.promotePendingProtocolV3TransitionForRecovery(
+                            uncommittedPrepared
+                        ) {
+                            Self.logger.warning(
+                                "Initial Protocol V3 route failed to open; requesting next route: \(MediaLogRedactor.sanitize(error), privacy: .public)"
+                            )
+                            if self.attemptProtocolV3Replan(
+                                position: self.currentTime,
+                                classification: loadFailure.classification,
+                                message: loadFailure.message
+                            ) {
+                                return
+                            }
+                        }
+                    }
+                    await self.sessionBridge.rollbackPendingProtocolV3Transition(uncommittedPrepared)
+                }
+                guard !Task.isCancelled, !self.isDisposed else { return }
+                // The plan this load replaced failed with it; its summary
+                // goes before the stop.
+                self.endBufferingPlan()
+                await self.sessionBridge.stopSession(
+                    position: self.currentTime,
+                    isPaused: true
+                )
+                Self.logger.error(
+                    "Load failed: \(MediaLogRedactor.sanitize(error), privacy: .public)"
+                )
+                self.handleBeginFreshLoadFailure(error: error, origin: origin)
+            }
+        }
+        syncBufferingQualitySignals()
+    }
+
+    /// Race `sessionBridge.startSession` against an optional timeout. A nil
+    /// `timeout` runs unbounded (matches the historical behavior). A non-nil
+    /// timeout cancels the in-flight start when it elapses; URLSession's
+    /// cancellation propagates as `CancellationError`, which we translate to
+    /// `BeginFreshLoadError.startSessionTimeout` for the caller's catch block.
+    /// If the surrounding `freshLoadTask` itself is cancelled (e.g. user
+    /// navigated away), we propagate the cancellation unchanged.
+    private func runStartSession(
+        request: LoadRequest,
+        resumePosition: Double?,
+        allowNearEndResume: Bool,
+        probeEstimateKbps: Int?,
+        learnedLimit: String?,
+        timeout: TimeInterval?
+    ) async throws -> PreparedPlayback {
+        let initialSubtitlePreferences: PlaybackSessionBridge.InitialProtocolV3SubtitlePreferences? = {
+            guard settings.subtitleMatchesSystemAppearance, !hasExplicitSubtitleChoice else {
+                return nil
+            }
+            let preferences = systemCaptionPrefsSnapshot()
+            return PlaybackSessionBridge.InitialProtocolV3SubtitlePreferences(
+                preferredLanguage: preferences.preferredLanguage,
+                additionalPreferredLanguages: preferences.additionalPreferredLanguages,
+                mode: preferences.mode,
+                showForced: preferences.showForced,
+                forcedOnly: preferences.forcedOnly,
+                preferAccessibilityTracks: preferences.preferAccessibilityTracks,
+                disableWhenNoLanguageMatch: preferences.disableWhenNoLanguageMatch,
+                trackSignature: preferences.trackSignature
+            )
+        }()
+        // Read once, so the start and the path-change check agree on which
+        // pair this session asked for. A Watch Party keeps the main pair.
+        let onMeteredNetwork = usesMeteredQuality
+        // A fixed in-player pick lasts for its title: reloads keep it, any
+        // other title drops it.
+        let keepsViewerPick = viewerQualityPickApplies(toContentId: request.contentId)
+        if !keepsViewerPick {
+            explicitQualityPick = nil
+        }
+        if isWatchPartyPlayback {
+            networkQuality?.stop()
+        } else {
+            networkQuality?.sessionStarted(onMeteredNetwork: onMeteredNetwork, keepsViewerPick: keepsViewerPick)
+        }
+        let bufferingQualityMode = settings.bufferingQualityMode
+        let startSession = { [sessionBridge] () async throws -> PreparedPlayback in
+            try await sessionBridge.startSession(
+                contentId: request.contentId,
+                libraryId: request.libraryId,
+                preferredFileId: request.preferredFileId,
+                preferredAudioTrackIndex: request.preferredAudioTrackIndex,
+                preferredSubtitleTrackIndex: request.preferredSubtitleTrackIndex,
+                preferredProtocolV3SubtitleIndex: request.preferredProtocolV3SubtitleIndex,
+                initialSubtitlePreferences: initialSubtitlePreferences,
+                startFromBeginning: request.startFromBeginning,
+                resumePosition: resumePosition,
+                allowNearEndResume: allowNearEndResume,
+                prefersLastUsedVersion: request.prefersLastUsedVersion,
+                preferredQualityOverride: request.preferredQualityOverride,
+                onMeteredNetwork: onMeteredNetwork,
+                bufferingQualityMode: bufferingQualityMode,
+                probeEstimateKbps: probeEstimateKbps,
+                learnedLimit: learnedLimit,
+                allowAlternateVersions: request.allowAlternateVersions,
+                pinsVersion: request.pinsVersion,
+                startsAtFirstPart: request.startsAtFirstPart
+            )
+        }
+        guard let timeout else {
+            return try await startSession()
+        }
+        let startTask = Task<PreparedPlayback, Error> {
+            try await startSession()
+        }
+        let timeoutTask = Task<Void, Never> { [startTask] in
+            try? await Task.sleep(for: .seconds(timeout))
+            startTask.cancel()
+        }
+        defer { timeoutTask.cancel() }
+
+        do {
+            return try await startTask.value
+        } catch is CancellationError {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw BeginFreshLoadError.startSessionTimeout
+        }
+    }
+
+    /// Routes a `beginFreshLoad` failure based on what triggered the load.
+    /// User-initiated loads keep the historical full-screen error wall.
+    /// Autoplay and interruption-recovery loads instead restore the Next Up
+    /// postroll with `nextUpStartError` set so the user can pick something
+    /// from On Deck or hit Back without the player being taken hostage by an
+    /// `error` overlay.
+    private func handleBeginFreshLoadFailure(error: Error, origin: LoadOrigin) {
+        watchPartyAdapter?.onFailure?((error as? PlaybackV3TerminalFailure)?.reason, error.localizedDescription)
+        isNextUpTransitioning = false
+        let message: String = {
+            if case BeginFreshLoadError.startSessionTimeout = error {
+                return "The server didn't respond in time."
+            }
+            if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
+                return localized
+            }
+            return String(describing: error)
+        }()
+
+        switch origin {
+        case .userInitiated:
+            finalizeTerminalPlaybackError(message, retryable: Self.isRetryablePlaybackFailure(error))
+        case .autoplay:
+            let logMessage = MediaLogRedactor.sanitize(message)
+            Self.logger.warning(
+                "[CMP] beginFreshLoad recovered from autoplay failure: \(logMessage, privacy: .public)"
+            )
+            // Tear down the disposed player the same way
+            // `finalizeTerminalPlaybackError` would, but DON'T set
+            // `viewModel.error` — we want a recoverable surface, not a wall.
+            disposeAetherPlayback()
+            isLoading = false
+            isPlaying = false
+            // Restore the postroll surface so the user can choose what to
+            // do next. Drop the candidate episode so the panel renders the
+            // "Finished" branch with the new `nextUpStartError` message.
+            cancelNextUpFlow()
+            nextUpStartError = message
+            nextUpEpisode = nil
+            nextUpAutoplayCancelled = true
+            isLoadingNextUpEpisode = false
+            showNextUpScreen = true
+            nextUpScreenVideoEnded = true
+            var noticeTitle = "Couldn't start the next episode"
+            // A shuffle keeps offering the pick that failed: Play Now
+            // retries it, since it never reached a first frame. A later part
+            // of an item that already played moves on to the next pick.
+            if let shuffleState {
+                let isNextPart = lastLoadRequest?.contentId == shuffleState.advanceFromContentId
+                shuffleActionError = isNextPart ? "Couldn't play the next part." : "Couldn't start the next pick."
+                noticeTitle = isNextPart ? "Couldn't play the next part" : "Couldn't start the next pick"
+                publishShuffleNextUp()
+            }
+            // The tvOS episode panel shows the reason itself. The other
+            // panels only say the start failed, and macOS has no postroll, so
+            // there the notice carries the reason.
+            #if os(tvOS)
+            let panelShowsReason = shuffleState == nil
+            #else
+            let panelShowsReason = false
+            #endif
+            if !panelShowsReason {
+                showNotice(
+                    title: noticeTitle,
+                    message: message,
+                    tone: .warning,
+                    duration: 6
+                )
+            }
+        case .recovery:
+            let logMessage = MediaLogRedactor.sanitize(message)
+            Self.logger.warning(
+                "[CMP] beginFreshLoad recovered from playback recovery failure: \(logMessage, privacy: .public)"
+            )
+            disposeAetherPlayback()
+            isLoading = false
+            isPlaying = false
+            // The reload froze the pill's timer; with no playback left under
+            // it, it would sit over the dead player indefinitely.
+            introSkipPrompt.withdraw()
+            showNotice(
+                title: "Playback recovery failed",
+                message: message,
+                tone: .warning,
+                duration: 6
+            )
+        case .reconnect:
+            guard reconnectCycle.isActive else {
+                // The start was answered with a plan, so the reconnect is
+                // over and the new transport failed on its own: an ordinary
+                // playback failure.
+                finalizeTerminalPlaybackError(message)
+                return
+            }
+            // The failed start stopped the old session in the bridge, so the
+            // next attempt starts a new one instead of replanning.
+            disposeAetherPlayback()
+            activePlaybackSessionId = nil
+            activePreparedProtocolV3 = nil
+            isPlaying = false
+            // The start's own timeout is the server not answering in time.
+            let reconnectError: Error = error is BeginFreshLoadError ? URLError(.timedOut) : error
+            continueReconnect(after: reconnectError, step: .start)
+        }
+    }
+
+    /// Whether retrying can help after `error`. Only a terminal failure
+    /// marked not retryable says otherwise: the server's terminal outcome, or
+    /// a server or profile that cannot play until it changes. Transport and
+    /// engine failures stay retryable, and so does a recovery replan that
+    /// ran out of attempts, because Retry starts a fresh session.
+    nonisolated static func isRetryablePlaybackFailure(_ error: Error) -> Bool {
+        (error as? PlaybackV3TerminalFailure)?.retryable ?? true
+    }
+
+    private func finalizeTerminalPlaybackError(_ message: String, retryable: Bool = true) {
+        #if os(iOS) || os(tvOS)
+        // Terminal outcome #1 of 2 (the other is `handleEndOfFile`). Every
+        // Aether recovery path ends either here or in `handleEndOfFile`,
+        // so a report always shows how playback finished. Emit before teardown
+        // so position and plan still describe the failed session.
+        DiagTrace.breadcrumb(
+            .essential,
+            level: .error,
+            category: .playback,
+            tag: "Player",
+            message: "playback ended in failure",
+            attrs: [
+                "reason": .string(stablePlaybackFailureToken(for: message)),
+                "play_method": .string(activeRouteLabel),
+                // Shared with the bridge's session breadcrumbs so a report's
+                // positions are all on the same scale and rounding.
+                "position_ms": .int(PlaybackSessionBridge.diagnosticsPositionMilliseconds(currentTime)),
+            ]
+        )
+        #endif
+        // Pin the resume point before anything is torn down. The periodic
+        // reporter ticks every 10s and is cancelled immediately below, so
+        // without this the user resumes up to ten seconds behind where the
+        // failure actually happened. Best-effort and non-blocking; issued
+        // while `activePlaybackSessionId` is still live.
+        flushPlaybackProgressNow(reason: "terminal_failure")
+        progressTask?.cancel()
+        progressTask = nil
+        staleSessionRecoveryTask?.cancel()
+        staleSessionRecoveryTask = nil
+        cancelReconnect()
+        endBufferingPlan()
+        disposeAetherPlayback()
+        // Nothing plays behind the error, so speed tests may run again.
+        BandwidthProbeScheduler.shared.playbackEnded(by: self)
+        activePlaybackSessionId = nil
+        activePreparedProtocolV3 = nil
+        // The error view hides the pill, but Menu, Escape and Return still
+        // reach it; a reload's stall froze its timer, so it would never leave.
+        introSkipPrompt.withdraw()
+        error = message
+        errorIsRetryable = retryable
+        isLoading = false
+        isPlaying = false
+    }
+
+    @discardableResult
+    private func attemptStaleSessionRenewal(reason: String, observedPosition: Double) -> Bool {
+        guard !isDisposed,
+              let lastLoadRequest,
+              let renewalRequest = makeRecoveryLoadRequest() else {
+            return false
+        }
+        // A running reconnect owns the session: it starts a new one itself
+        // once the server answers that the old one is gone.
+        if reconnectCycle.isActive {
+            return true
+        }
+
+        let staleSessionId = activePlaybackSessionId ?? "unknown"
+        if staleSessionRecoverySessionId == staleSessionId {
+            return true
+        }
+        staleSessionRecoverySessionId = staleSessionId
+        let resumePosition = observedPosition.isFinite
+            ? max(0, observedPosition)
+            : max(0, currentTime)
+        let contentId = currentWatchDetail?.contentId ?? lastLoadRequest.contentId
+        let durationHint = duration.isFinite && duration > 0
+            ? duration
+            : (currentSelectedVersion?.duration ?? 0)
+
+        Self.logger.warning(
+            "Renewing stale playback session \(staleSessionId, privacy: .public) reason=\(reason, privacy: .public) position=\(resumePosition, privacy: .public)"
+        )
+
+        staleSessionRecoveryTask?.cancel()
+        staleSessionRecoveryTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            _ = await self.sessionBridge.syncProgress(
+                contentId: contentId,
+                position: resumePosition,
+                duration: durationHint,
+                forceOverwrite: true
+            )
+            guard !Task.isCancelled, !self.isDisposed else { return }
+
+            self.progressTask?.cancel()
+            // This task is the renewal; the load it starts must not cancel it.
+            self.staleSessionRecoveryTask = nil
+            self.beginFreshLoad(
+                request: renewalRequest,
+                progressPosition: nil,
+                resumePositionOverride: resumePosition,
+                allowNearEndResume: true,
+                origin: .recovery
+            )
+        }
+        return true
+    }
+
+    /// A start request for the current item that keeps what the viewer is
+    /// watching: the same version and the current audio and subtitle choice
+    /// (subtitles that are off stay off).
+    private func makeRecoveryLoadRequest() -> LoadRequest? {
+        guard let lastLoadRequest else { return nil }
+        return lastLoadRequest.copyForRecovery(
+            preferredFileId: currentSelectedVersion?.fileId ?? lastLoadRequest.preferredFileId,
+            preferredAudioTrackIndex: resolvedAudioTrackIndexForResume(),
+            preferredSubtitleTrackIndex: resolvedSubtitleTrackIndexForResume(),
+            preferredSidecarSubtitleTrackId: resolvedSidecarSubtitleTrackIdForResume(),
+            offlineDownloadId: nil,
+            serverSubtitlesDisabled: hasDisabledServerSubtitlesForResume
+        )
+    }
+
+    // MARK: - Mid-stream reconnect (playback protocol v3 §6.2)
+    //
+    // A stream that already played and then lost the server has not failed
+    // its route, so the player pauses, keeps the position and retries with
+    // backoff. Each attempt first asks for the current route again with a
+    // `track_change` that changes nothing; if the session did not survive (a
+    // server restart answers 404) it starts a new session at the same
+    // position with the same tracks. Any plan the server hands back ends the
+    // cycle; leaving the player or starting other playback cancels it. Only
+    // one attempt is in flight at a time.
+
+    /// Whether the transport on screen is a committed Protocol V3 load that
+    /// has shown its own first frame.
+    private var currentTransportHasShownFrame: Bool {
+        guard activePreparedProtocolV3 != nil, let epoch = activeAetherLoadEpoch else { return false }
+        return startedAetherLoadEpoch == epoch && committedProtocolV3LoadEpoch == epoch
+    }
+
+    /// The last position the stream played from: a seek target it has not
+    /// played from yet, otherwise the clock.
+    private var sourcePlayhead: Double {
+        sourceWatch.playhead(currentTime: currentTime)
+    }
+
+    /// The app's own requests could not reach the server either, or the
+    /// stream came over the local route, whose address stops leading to the
+    /// server once the device leaves the network. A stream on the local route
+    /// that dies is therefore reconnected first; the reconnect drops the
+    /// route and loads from the saved address, where a genuine failure meets
+    /// the ordinary recovery.
+    private var isServerUnreachable: Bool {
+        let monitor = ConnectionMonitor.shared
+        return !monitor.isDeviceOnline || monitor.serverStatus == .unreachable || streamLocalRoute != nil
+    }
+
+    /// Starts a reconnect, or joins the one already running. Returns false
+    /// when this playback cannot reconnect (offline or Watch Party playback,
+    /// or nothing to restart), leaving the caller's ordinary handling.
+    /// `freshBudget` is the viewer's Try again: a full budget, first attempt
+    /// at once.
+    @discardableResult
+    private func beginReconnect(position: Double, resume: Bool, freshBudget: Bool = false) -> Bool {
+        guard !isDisposed,
+              !isWatchPartyPlayback,
+              offlinePlaybackContext == nil,
+              let lastLoadRequest,
+              lastLoadRequest.offlineDownloadId == nil else {
+            return false
+        }
+        if reconnectCycle.isActive { return true }
+        if let streamLocalRoute {
+            LocalRouteController.reportFailure(of: streamLocalRoute)
+        }
+        // Taken while the viewer's selection is still published. After a
+        // give-up the session is torn down, so Try again reuses it.
+        if activePreparedProtocolV3 != nil || reconnectLoadRequest == nil {
+            reconnectLoadRequest = makeRecoveryLoadRequest()
+        }
+        guard let next = reconnectCycle.begin(
+            position: position,
+            resume: resume,
+            freshBudget: freshBudget,
+            now: Date()
+        ) else { return true }
+        Self.logger.warning(
+            "Playback connection lost; reconnecting position=\(self.reconnectCycle.position, privacy: .public) resume=\(resume, privacy: .public) attempts=\(self.reconnectCycle.attempts, privacy: .public)"
+        )
+        // Nothing plays until a new plan arrives. Progress reports and
+        // stale-session renewal would race the reconnect's own requests; the
+        // adopted plan's first frame starts reporting again.
+        progressTask?.cancel()
+        progressTask = nil
+        staleSessionRecoveryTask?.cancel()
+        staleSessionRecoveryTask = nil
+        aetherPlaybackController.pause()
+        isPlaying = false
+        isLoading = false
+        isBuffering = false
+        bufferingProgress = nil
+        error = nil
+        errorIsRetryable = true
+        connectionState = .reconnecting
+        scheduleReconnect(next)
+        return true
+    }
+
+    private func scheduleReconnect(_ next: PlaybackReconnectCycle.Next) {
+        switch next {
+        case .giveUp:
+            giveUpReconnect(message: Self.connectionLostMessage)
+        case .attempt(let delay):
+            reconnectTimerTask?.cancel()
+            let generation = reconnectCycle.generation
+            reconnectTimerTask = Task { @MainActor [weak self] in
+                if delay > 0 {
+                    try? await Task.sleep(for: .seconds(delay))
+                }
+                guard !Task.isCancelled,
+                      let self,
+                      !self.isDisposed,
+                      self.reconnectCycle.isCurrent(generation) else { return }
+                self.reconnectTimerTask = nil
+                self.runReconnectAttempt(generation: generation)
+            }
+        }
+    }
+
+    private func runReconnectAttempt(generation: UInt64) {
+        guard !isDisposed, reconnectCycle.isCurrent(generation) else { return }
+        // One request at a time: a replan or start already talking to the
+        // server decides first; check again once it has settled.
+        if protocolV3ReplanTask != nil || freshLoadTask != nil {
+            scheduleReconnect(.attempt(after: PlaybackReconnectPolicy.baseDelay))
+            return
+        }
+        reconnectCycle.beginAttempt()
+        Self.logger.info(
+            "Playback reconnect attempt \(self.reconnectCycle.attempts, privacy: .public)/\(PlaybackReconnectPolicy.maxAttempts, privacy: .public)"
+        )
+        if activePreparedProtocolV3 != nil,
+           activePlaybackSessionId != nil,
+           attemptProtocolV3Replan(
+               position: reconnectCycle.position,
+               classification: PlaybackReconnectPolicy.classification,
+               message: "Reconnect at the saved position after the connection to the server was lost."
+           ) {
+            return
+        }
+        startReconnectSession()
+    }
+
+    /// A new session at the saved position with the viewer's tracks, for a
+    /// session that did not survive (or that a give-up already tore down).
+    private func startReconnectSession() {
+        guard let request = reconnectLoadRequest ?? makeRecoveryLoadRequest() else {
+            giveUpReconnect(message: Self.connectionLostMessage)
+            return
+        }
+        beginFreshLoad(
+            request: request,
+            progressPosition: nil,
+            resumePositionOverride: reconnectCycle.position,
+            allowNearEndResume: true,
+            origin: .reconnect
+        )
+    }
+
+    /// An attempt's request failed: wait for the next one, start a new
+    /// session, or give up.
+    private func continueReconnect(after error: Error, step: PlaybackReconnectPolicy.Step) {
+        guard !isDisposed, reconnectCycle.isActive else { return }
+        if PlaybackSessionBridge.isPlaybackSessionEnded(error) {
+            leaveServerEndedSession()
+            return
+        }
+        isLoading = false
+        Self.logger.warning(
+            "Playback reconnect attempt failed step=\(String(describing: step), privacy: .public): \(MediaLogRedactor.sanitize(error), privacy: .public)"
+        )
+        switch PlaybackReconnectPolicy.verdict(for: error, step: step) {
+        case .retryLater:
+            scheduleReconnect(reconnectCycle.retryLater(now: Date()))
+        case .startNewSession:
+            scheduleReconnectSessionStart()
+        case .giveUp:
+            giveUpReconnect(
+                message: error.localizedDescription,
+                retryable: Self.isRetryablePlaybackFailure(error)
+            )
+        }
+    }
+
+    /// Starts the new session from a fresh task: the failing replan's task is
+    /// still unwinding, and the new load must not cancel it mid-cleanup.
+    private func scheduleReconnectSessionStart() {
+        reconnectTimerTask?.cancel()
+        let generation = reconnectCycle.generation
+        reconnectTimerTask = Task { @MainActor [weak self] in
+            guard let self,
+                  !self.isDisposed,
+                  self.reconnectCycle.isCurrent(generation) else { return }
+            self.reconnectTimerTask = nil
+            self.startReconnectSession()
+        }
+    }
+
+    /// Ends a running reconnect because the server handed back a plan for a
+    /// request made at `requestedPosition`, and starts the handoff to the new
+    /// transport: until the caller installs it (`finishHandoff`), a seek
+    /// still moves the reconnect's position. Returns the play intent the new
+    /// transport takes, or nil when no reconnect was running.
+    private func adoptPlanEndingReconnect(requestedPosition: Double?) -> Bool? {
+        guard let resume = reconnectCycle.beginHandoff(
+            requestedPosition: requestedPosition,
+            now: Date()
+        ) else { return nil }
+        reconnectTimerTask?.cancel()
+        reconnectTimerTask = nil
+        connectionState = .connected
+        Self.logger.info("Playback reconnected resume=\(resume, privacy: .public)")
+        return resume
+    }
+
+    /// Stops a running reconnect without a plan: the viewer left, other
+    /// playback started, or playback ended in an error.
+    private func cancelReconnect() {
+        reconnectTimerTask?.cancel()
+        reconnectTimerTask = nil
+        reconnectCycle.end(recovered: false, now: Date())
+        if connectionState != .connected {
+            connectionState = .connected
+        }
+    }
+
+    /// The budget ran out or the server refused a new session: tell the
+    /// viewer, and keep the position and intent for Try again. A refusal the
+    /// server marked not retryable offers no Try again, so the connection is
+    /// not reported as lost.
+    private func giveUpReconnect(message: String, retryable: Bool = true) {
+        Self.logger.error("Playback reconnect gave up after \(self.reconnectCycle.attempts, privacy: .public) attempts")
+        let position = reconnectCycle.position
+        cancelReconnect()
+        currentTime = position
+        finalizeTerminalPlaybackError(message, retryable: retryable)
+        if retryable {
+            connectionState = .lost
+        }
+    }
+
+    private func isPlaybackSessionMissingMessage(_ message: String) -> Bool {
+        let lowered = message.lowercased()
+        return lowered.contains("playback_session_not_found")
+            || lowered.contains("playback session not found")
+    }
+
+    /// A signed playback URL can surface a bare 404 through Aether. Renew once
+    /// at the current source position before treating it as a missing file.
+    ///
+    /// Deliberately typed rather than a substring match on the message. Only
+    /// `sourceRefused` names the *session's own* source request, and only with
+    /// `underlyingDomain == nil` is `underlyingCode` the origin's HTTP status
+    /// rather than some framework's error code. A substring match on "404"
+    /// would tear down a session over a sidecar or segment 404 and never match
+    /// on non-English devices — half of Aether's messages are
+    /// `localizedDescription` forwarded from underneath.
+    private func isExpiredPlaybackSessionSource(_ failure: PlaybackErrorInfo?) -> Bool {
+        guard let failure,
+              failure.kind == .sourceRefused,
+              failure.underlyingDomain == nil,
+              failure.underlyingCode == 404 else {
+            return false
+        }
+        // Nothing to renew unless we actually hold a server session.
+        return activePlaybackSessionId != nil
+    }
+
+    func loadAndPlay(
+        contentId: String,
+        preferredFileId: Int? = nil,
+        pinsVersion: Bool = false,
+        preferredAudioTrackIndex: Int? = nil,
+        preferredSubtitleTrackIndex: Int? = nil,
+        startFromBeginning: Bool,
+        resumePositionOverride: Double? = nil,
+        prefersLastUsedVersion: Bool = false,
+        offlineDownloadId: String? = nil,
+        shuffle: APIv2Shuffle? = nil
+    ) {
+        guard !isWatchPartyPlayback else { return }
+        if let shuffle {
+            shuffleState = PlayerShuffleState(shuffle: shuffle)
+        }
+        // Another version of the title playing now is a quality change the
+        // viewer chose.
+        var switchesVersion = false
+        if let preferredFileId, lastLoadRequest?.contentId == contentId,
+           let playing = currentSelectedVersion?.fileId, playing != preferredFileId {
+            switchesVersion = true
+        }
+        var request = LoadRequest(
+            contentId: contentId,
+            preferredFileId: preferredFileId,
+            preferredAudioTrackIndex: preferredAudioTrackIndex,
+            preferredSubtitleTrackIndex: preferredSubtitleTrackIndex,
+            preferredSidecarSubtitleTrackId: nil,
+            startFromBeginning: startFromBeginning,
+            offlineDownloadId: offlineDownloadId
+        )
+        request.libraryId = initialLibraryId
+        request.prefersLastUsedVersion = prefersLastUsedVersion
+        request.pinsVersion = pinsVersion
+        request.startsAtFirstPart = shuffleState != nil
+        beginFreshLoad(
+            request: request,
+            progressPosition: currentTime,
+            resumePositionOverride: resumePositionOverride,
+            viewerQualityChange: switchesVersion
+        )
+    }
+
+    /// Plays provider-owned media through the same Aether controller and player surface as Silo.
+    /// Xtream credentials are part of the URL, so it is never logged or forwarded to the Silo server.
+    ///
+    /// Build 99 called `beginLoad` without recording the epoch in `activeAetherLoadEpoch`, so
+    /// `handleAetherEvent` dropped every engine event (playing, time, duration, tracks, end,
+    /// failure), and it replaced Aether's typed failure with one generic sentence. This load is
+    /// epoch-tracked like a Silo load; `handleExternalPlaybackEvent` owns the events that would
+    /// otherwise reach Silo's session, replan and progress logic.
+    func loadExternalPlayback(_ request: ExternalPlaybackRequest) {
+        externalPlaybackTask?.cancel()
+        externalPlayback = request
+        title = request.title
+        externalPlaybackDiagnosticCode = nil
+        errorIsRetryable = true
+        guard ["http", "https"].contains(request.url.scheme?.lowercased() ?? ""), request.url.host != nil else {
+            error = "This provider returned an invalid playback address."
+            errorIsRetryable = false
+            isLoading = false
+            return
+        }
+        error = nil
+        isLoading = true
+        isBuffering = false
+        isPlaying = false
+        hasReachedEndOfFile = false
+        currentTime = max(0, request.startPosition)
+        duration = 0
+        Self.recordExternalPlayback("open_requested", "resume=\(request.startPosition > 0 ? "yes" : "no")")
+        externalPlaybackTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var epoch: AetherPlaybackController.LoadEpoch?
+            do {
+                let spec = try AetherLoadSpec(
+                    directURL: request.url,
+                    headers: [:],
+                    startPosition: max(0, request.startPosition),
+                    audioOnly: false,
+                    preferredAudioLanguages: AetherInitialAudioPreference.languages(
+                        selectedOrdinal: nil, tracks: [], fallbackLanguage: settings.audioLanguage),
+                    forwardBufferSegments: settings.bufferAhead.forwardBufferSegments
+                )
+                let loadEpoch = aetherPlaybackController.beginLoad(spec, shouldPlayWhenReady: true)
+                epoch = loadEpoch
+                activeAetherLoadEpoch = loadEpoch
+                establishedAetherLoadEpoch = nil
+                sourceWatch = PlaybackSourceWatch()
+                try await aetherPlaybackController.finishLoad(loadEpoch)
+                guard !Task.isCancelled, !isDisposed, activeAetherLoadEpoch == loadEpoch else { return }
+                establishedAetherLoadEpoch = loadEpoch
+                adoptAetherInventory()
+                isLoading = currentPhaseIsLoading()
+                aetherPlaybackController.play()
+                Self.recordExternalPlayback(
+                    "opened",
+                    "audio=\(audioTracks.count) subtitles=\(subtitleTracks.count)"
+                )
+            } catch is CancellationError {
+                // A replacement load or dismissal owns the next state.
+            } catch {
+                guard !Task.isCancelled, !isDisposed else { return }
+                if let epoch, activeAetherLoadEpoch == epoch {
+                    activeAetherLoadEpoch = nil
+                    establishedAetherLoadEpoch = nil
+                }
+                let failure = (error as? AetherPlaybackController.LoadFailure)?.failure
+                    ?? aetherPlaybackController.engine.errorInfo
+                await failExternalPlayback(failure, request: request)
+            }
+        }
+    }
+
+    /// Engine events of an external load that must not reach Silo's handlers. Returns false for
+    /// the transport events both kinds of load handle the same way (state, time, duration,
+    /// buffering, tracks).
+    private func handleExternalPlaybackEvent(_ event: AetherPlaybackController.Event) -> Bool {
+        guard let request = externalPlayback else { return false }
+        switch event {
+        case .firstFrame:
+            viewingHasPlayed = true
+            isLoading = false
+            Self.recordExternalPlayback("first_frame", "")
+            return true
+        case .ended:
+            hasReachedEndOfFile = true
+            isPlaying = false
+            isLoading = false
+            Self.recordExternalPlayback("ended", "")
+            return true
+        case .failure(let failure):
+            guard failure.kind != .audioTrackSwitchFailed || isAetherLoadEstablished else { return true }
+            externalPlaybackTask?.cancel()
+            externalPlaybackTask = Task { @MainActor [weak self] in
+                await self?.failExternalPlayback(failure, request: request)
+            }
+            return true
+        case .transportRestoreFailed:
+            externalPlaybackTask?.cancel()
+            externalPlaybackTask = Task { @MainActor [weak self] in
+                await self?.failExternalPlayback(nil, request: request)
+            }
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Shows the engine's classification at once, then refines it with the request's probe. The
+    /// probe runs only after the engine has released the source, so it never competes with
+    /// playback for a provider connection.
+    private func failExternalPlayback(_ failure: PlaybackErrorInfo?, request: ExternalPlaybackRequest) async {
+        guard !isDisposed else { return }
+        if aetherPlaybackController.activeLoadEpoch != nil {
+            disposeAetherPlayback()
+        }
+        activeAetherLoadEpoch = nil
+        establishedAetherLoadEpoch = nil
+        isLoading = false
+        isPlaying = false
+        isBuffering = false
+        let kind = failure?.kind.rawValue
+        let engineReason = ExternalPlaybackDiagnostics.reason(
+            kind: kind ?? "", domain: failure?.underlyingDomain, code: failure?.underlyingCode)
+        error = ExternalPlaybackDiagnostics.userMessage(for: engineReason)
+        errorIsRetryable = true
+        externalPlaybackDiagnosticCode = ExternalPlaybackDiagnostics.diagnosticCode(
+            reason: engineReason, kind: kind, domain: failure?.underlyingDomain,
+            code: failure?.underlyingCode, probe: nil)
+        Self.recordExternalPlayback("failed", externalPlaybackDiagnosticCode ?? "")
+        guard let probe = request.probe else { return }
+        let report = await probe()
+        guard !Task.isCancelled, !isDisposed, externalPlayback?.id == request.id, error != nil else { return }
+        let reason = ExternalPlaybackDiagnostics.reason(engine: engineReason, probe: report)
+        error = ExternalPlaybackDiagnostics.userMessage(for: reason)
+        errorIsRetryable = reason != .insecureConnectionBlocked && reason != .notFound
+            && reason != .unsupportedMedia && reason != .notMedia
+        externalPlaybackDiagnosticCode = ExternalPlaybackDiagnostics.diagnosticCode(
+            reason: reason, kind: kind, domain: failure?.underlyingDomain,
+            code: failure?.underlyingCode, probe: report)
+        Self.recordExternalPlayback("probe", externalPlaybackDiagnosticCode ?? "")
+    }
+
+    private static func recordExternalPlayback(_ event: String, _ state: String) {
+        #if os(iOS)
+        // Credential-free by construction: callers pass counts and diagnostic codes only.
+        KyroLifecycleJournal.record("iptv_vod", event, state)
+        #endif
+        logger.info("[IPTV-VOD] \(event, privacy: .public) \(state, privacy: .public)")
+    }
+
+    /// Re-run the last `loadAndPlay` from scratch after an error. Currently a
+    /// fresh session — simpler than retrying just the stream load, and
+    /// tolerates stale server-side sessions that may have been reaped.
+    func retry() {
+        if let external = externalPlayback {
+            // Provider media has no Silo session to renew; reopen it where it stopped.
+            loadExternalPlayback(external.resuming(at: currentTime))
+            return
+        }
+        if connectionState == .lost {
+            // Try again after a lost connection: a fresh reconnect at the
+            // saved position, with the viewer's tracks and play intent.
+            connectionState = .connected
+            if beginReconnect(
+                position: reconnectCycle.position,
+                resume: reconnectCycle.resume,
+                freshBudget: true
+            ) {
+                return
+            }
+        }
+        guard let last = lastLoadRequest else { return }
+        Self.logger.info("Retrying playback for contentId=\(last.contentId, privacy: .public)")
+        beginFreshLoad(
+            request: last,
+            progressPosition: currentTime,
+            resumePositionOverride: currentTime,
+            allowNearEndResume: true
+        )
+    }
+
+    func togglePlayPause() {
+        // Nothing can play until the reconnect hands over a new transport.
+        guard !isReconnecting else { return }
+        if watchPartyAdapter?.request(isPlaying ? .pause : .play) == true { return }
+        // `isPlaying` is driven by the backend's `onPauseChange` callback;
+        // let that be the single writer so the UI can't drift out of sync
+        // with the actual pipeline state on error paths.
+        if isPlaying {
+            aetherPlaybackController.pause()
+        } else {
+            aetherPlaybackController.play()
+        }
+        scheduleHideControls()
+    }
+
+    #if os(tvOS)
+    /// Native-player Select behavior for timeline entry: pause immediately
+    /// and keep the full transport mounted. When controls were hidden,
+    /// `TVPlayerControls` consumes a separate request token to focus and
+    /// activate its timeline scrubber.
+    func pauseForTimelineSelection() {
+        if watchPartyAdapter?.request(.pause) == true {
+            pinControlsVisible()
+            return
+        }
+        guard !isLoading, !hasReachedEndOfFile else { return }
+        if isPlaying {
+            aetherPlaybackController.pause()
+        }
+        pinControlsVisible()
+    }
+    #endif
+
+    func switchQuality(_ qualityId: String) {
+        // One switch at a time, from any surface or SiloRemote: a second
+        // request would race the first one's replan and clear its state.
+        guard !isQualitySwitching else { return }
+        let resolvedQualityId = activePreparedProtocolV3 == nil
+            ? ApplePlaybackQuality.normalizeStoredId(qualityId)
+            : ApplePlaybackQuality.protocolV3QualityId(qualityId)
+        // Only Auto, or the viewer's own pick, is already in force. A row lit
+        // because the saved settings landed on it is still a real pick: it
+        // holds that rung for this title over connection changes.
+        let isAlreadyPicked = resolvedQualityId == highlightedQualityOptionId
+            && (resolvedQualityId == ApplePlaybackQuality.autoId
+                || explicitQualityPick.map {
+                    ApplePlaybackQuality.protocolV3QualityId($0.qualityId) == resolvedQualityId
+                } == true)
+        guard !isAlreadyPicked || qualitySwitchError != nil else { return }
+
+        let target = currentTime.isFinite ? max(0, currentTime) : 0
+        // Read once: the request and the pick's record must agree on which
+        // side of the connection this switch was made for.
+        let onMeteredNetwork = usesMeteredQuality
+        isQualitySwitching = true
+        qualitySwitchError = nil
+        showControls = true
+        hideControlsTask?.cancel()
+
+        if activePreparedProtocolV3 != nil {
+            // A rejected replan already cleared `isQualitySwitching`, but
+            // without a message the sheet just silently snapped back to the
+            // old quality with no explanation. The pick is recorded once the
+            // replan commits.
+            let issued = attemptProtocolV3Replan(
+                position: target,
+                classification: "quality_changed",
+                message: "User selected playback quality \(resolvedQualityId).",
+                operation: PlaybackProtocolV3.ReplanOperation.qualityChange,
+                qualityPreference: resolvedQualityId,
+                // Auto keeps the saved cap for the connection.
+                autoBandwidthCapKbps: settings.playbackQualityAxes(onMeteredNetwork: onMeteredNetwork).bitrateKbps,
+                qualitySwitchOnMeteredNetwork: onMeteredNetwork,
+                viewerQualityChange: true
+            )
+            if !issued {
+                isQualitySwitching = false
+                qualitySwitchError = "Couldn't change quality right now. Try again."
+            }
+            return
+        }
+        guard var request = lastLoadRequest,
+              request.offlineDownloadId == nil else {
+            isQualitySwitching = false
+            qualitySwitchError = "Quality selection is unavailable for offline playback."
+            return
+        }
+        // A switch the player takes is a quality change; a refused one isn't.
+        bufferingQuality.qualityChanged()
+        request = request.copyForRecovery(
+            preferredFileId: request.preferredFileId,
+            preferredAudioTrackIndex: resolvedAudioTrackIndexForResume(),
+            preferredSubtitleTrackIndex: resolvedSubtitleTrackIndexForResume(),
+            preferredSidecarSubtitleTrackId: resolvedSidecarSubtitleTrackIdForResume(),
+            offlineDownloadId: nil,
+            serverSubtitlesDisabled: hasDisabledServerSubtitlesForResume
+        )
+        request.preferredQualityOverride = resolvedQualityId
+        recordViewerQualityPick(resolvedQualityId, forContentId: request.contentId, onMeteredNetwork: onMeteredNetwork)
+        beginFreshLoad(
+            request: request,
+            progressPosition: target,
+            finalizeCurrentSession: true,
+            resumePositionOverride: target,
+            allowNearEndResume: true
+        )
+    }
+
+    #if os(iOS)
+    func playerPresentationDidAppear() {
+        isPlayerPresentationVisible = true
+        // Only reached once SwiftUI really mounted the cover — for a restore,
+        // via `PlayerPresentationRestoration.consumeAdoption`. That is the
+        // first moment AVKit's restore can honestly be reported successful.
+        resolvePendingPictureInPictureRestore(true)
+    }
+
+    /// SwiftUI can remove the full-screen player while AVKit is moving the
+    /// same Aether graph into PiP. Defer final teardown only for that exact,
+    /// owner-scoped engagement; every ordinary dismissal still cleans up now.
+    func playerPresentationDidDisappear() {
+        isPlayerPresentationVisible = false
+        guard PictureInPictureCoordinator.shared.ownsEngagedSession(self) else {
+            cleanup()
+            return
+        }
+        Self.logger.info("Deferring player cleanup while Aether PiP is engaged")
+    }
+
+    func pictureInPictureEngagementDidEnd() {
+        guard !isPlayerPresentationVisible else { return }
+        // A restore still in flight owns the outcome: AVKit can report the
+        // stop before the re-presented cover mounts, and cleaning up here
+        // would tear down the very session the user asked to come back to.
+        // The restore timeout is the backstop if the cover never arrives.
+        guard pendingRestoreCompletion == nil else {
+            Self.logger.info("Deferring player cleanup while a PiP restore is still pending")
+            return
+        }
+        cleanup()
+    }
+
+    /// Answer AVKit's restore-user-interface request for this session.
+    ///
+    /// Three outcomes, and every one of them has to be truthful: AVKit tears the
+    /// PiP window down regardless, so an optimistic `true` with nothing behind it
+    /// leaves the engine playing to no surface with the server session still open.
+    func restorePictureInPictureUserInterface(_ completion: @escaping (Bool) -> Void) {
+        guard !isDisposed else {
+            completion(false)
+            return
+        }
+        // Auto-PiP from inline never removed the cover, so it is already the
+        // interface AVKit is asking for.
+        if isPlayerPresentationVisible {
+            completion(true)
+            return
+        }
+        guard PlayerPresentationRestoration.reopen(self) else {
+            Self.logger.error("PiP restore found no player presentation owner; ending the session")
+            completion(false)
+            // Nothing can come back, so the deferred teardown happens now rather
+            // than waiting for a stop callback that leaves playback headless.
+            cleanup()
+            return
+        }
+        Self.logger.info("PiP restore re-presenting the full-screen player")
+        // Asking the router to re-present is not the same as the cover being
+        // on screen: another full-screen cover can keep SwiftUI from mounting
+        // this one. Reporting success there leaves AVKit's window gone,
+        // `handleDidStop` suppressed because the restore "worked", and a
+        // headless playing session parked on `pendingAdoption` forever. Hold
+        // AVKit's handler until `playerPresentationDidAppear` confirms the
+        // adoption, or until the timeout ends the session.
+        resolvePendingPictureInPictureRestore(false)
+        pendingRestoreCompletion = completion
+        pendingRestoreTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.pictureInPictureRestoreTimeoutNanoseconds)
+            guard !Task.isCancelled else { return }
+            self?.abandonPictureInPictureRestore()
+        }
+    }
+
+    /// Answer AVKit's held restore handler at most once and stop the timeout.
+    private func resolvePendingPictureInPictureRestore(_ didRestore: Bool) {
+        pendingRestoreTimeoutTask?.cancel()
+        pendingRestoreTimeoutTask = nil
+        guard let completion = pendingRestoreCompletion else { return }
+        pendingRestoreCompletion = nil
+        completion(didRestore)
+    }
+
+    /// The re-presented cover never mounted. AVKit has taken the PiP window
+    /// down regardless, so the session ends here — final progress and the
+    /// server session stop — rather than playing on with no surface.
+    private func abandonPictureInPictureRestore() {
+        guard pendingRestoreCompletion != nil else { return }
+        Self.logger.error("PiP restore never mounted the player; ending the session")
+        PlayerPresentationRestoration.discardAdoption(for: self)
+        resolvePendingPictureInPictureRestore(false)
+        cleanup()
+    }
+
+    /// A Picture in Picture start that never happened is invisible to the user —
+    /// AVKit reports both cases to the delegate only, so the tapped button just
+    /// looks inert. Surface it on the same transient notice the player already
+    /// uses for replan rejections.
+    func reportPictureInPictureStartFailure(
+        _ failure: PictureInPictureCoordinator.StartFailure
+    ) {
+        guard !isDisposed else { return }
+        switch failure {
+        case .notReady:
+            showNotice(
+                title: "Picture in Picture not ready",
+                message: "This video isn't ready for Picture in Picture yet. Try again in a moment.",
+                tone: .warning,
+                duration: 4
+            )
+        case .failed:
+            showNotice(
+                title: "Picture in Picture failed",
+                message: "iOS couldn't start Picture in Picture for this video.",
+                tone: .warning,
+                duration: 5
+            )
+        }
+    }
+    #endif
+
+    /// The interval on-screen controls, keyboard, gestures, and remote clicks
+    /// use right now: the profile's setting on a revision-9 server, otherwise
+    /// this platform's fixed interval.
+    var skipIntervals: SeekIntervalPair {
+        seekIntervalPreferences.pair(for: .videoPlayer)
+    }
+
+    /// Solo playback parks at end of file behind the postroll, so local seeks
+    /// stop there. A Watch Party has no postroll: its seeks are requests to
+    /// the room, and the room's seek remounts the ended stream (see
+    /// `applyWatchPartyTransport`).
+    private var refusesSeekAtEndOfFile: Bool {
+        hasReachedEndOfFile && !isWatchPartyPlayback
+    }
+
+    /// Skips forward by `seconds`, or by the configured interval when nil.
+    /// Returns false when the player refuses the skip.
+    @discardableResult
+    func skipForward(_ seconds: Double? = nil, revealingControls: Bool = true) -> Bool {
+        guard !refusesSeekAtEndOfFile else { return false }
+        let seconds = seconds ?? Double(skipIntervals.forward)
+        Self.logger.info(
+            "[CMP-SEEK] skip forward requested seconds=\(seconds, privacy: .public) current=\(self.currentTime, privacy: .public) preview=\(self.scrubPreviewTime, privacy: .public) isScrubbing=\(self.isScrubbing, privacy: .public)"
+        )
+        queueSkipDebounce(delta: seconds)
+        if revealingControls || showControls {
+            scheduleHideControls()
+        }
+        return true
+    }
+
+    /// Skips backward by `seconds`, or by the configured interval when nil.
+    /// Returns false when the player refuses the skip.
+    @discardableResult
+    func skipBackward(_ seconds: Double? = nil, revealingControls: Bool = true) -> Bool {
+        guard !refusesSeekAtEndOfFile else { return false }
+        let seconds = seconds ?? Double(skipIntervals.backward)
+        Self.logger.info(
+            "[CMP-SEEK] skip backward requested seconds=\(seconds, privacy: .public) current=\(self.currentTime, privacy: .public) preview=\(self.scrubPreviewTime, privacy: .public) isScrubbing=\(self.isScrubbing, privacy: .public)"
+        )
+        queueSkipDebounce(delta: -seconds)
+        if revealingControls || showControls {
+            scheduleHideControls()
+        }
+        return true
+    }
+
+    /// The intro pill's action: past the intro for `ask`, back to its start
+    /// for `always`'s undo. Either way the intro is decided and the pill goes.
+    func selectIntroSkipPrompt() {
+        guard let target = withoutAnimation({ introSkipPrompt.select() }) else { return }
+        Self.logger.info(
+            "[CMP-MARKERS] intro prompt selected target=\(target, privacy: .public) current=\(self.currentTime, privacy: .public)"
+        )
+        seekTo(seconds: target)
+    }
+
+    /// Back / Menu / Escape while the intro pill is up. Returns true when it
+    /// took the pill down, so the caller consumes the press only then.
+    @discardableResult
+    func dismissIntroSkipPrompt() -> Bool {
+        guard withoutAnimation({ introSkipPrompt.dismiss() }) else { return false }
+        Self.logger.info("[CMP-MARKERS] intro prompt dismissed")
+        return true
+    }
+
+    /// Select at the player root while a buffering pill is up: **Lower
+    /// quality** on the prompt, **Restore quality** on the undo pill.
+    func selectBufferingPrimary() {
+        withoutAnimation { bufferingQuality.selectPrimary() }
+    }
+
+    /// **Keep quality** on the buffering prompt.
+    func selectBufferingKeep() {
+        withoutAnimation { bufferingQuality.selectKeep() }
+    }
+
+    /// Back / Menu / Escape while a buffering pill is up. Returns true when it
+    /// took the pill down, so the caller consumes the press only then.
+    @discardableResult
+    func dismissBufferingPill() -> Bool {
+        withoutAnimation { bufferingQuality.back() }
+    }
+
+    /// The pill fades when its timer runs out but goes at once when the viewer
+    /// acts on it, so these two paths opt out of the views' fade.
+    private func withoutAnimation<Result>(_ body: () -> Result) -> Result {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        return withTransaction(transaction, body)
+    }
+
+    func skipCredits() {
+        guard let creditsRange else { return }
+        if let key = currentCreditsSkipKey(for: creditsRange) {
+            autoSkippedCreditsKey = key
+        }
+        performCreditsSkip(to: creditsRange.end)
+    }
+
+    /// Enter continuous seek mode. The rate starts at ±1× (sign from
+    /// `forward`) and auto-ramps 1 → 2 → 4 → 8 over the next ~4 s unless
+    /// the user manually adjusts it with Left/Right, in which case the
+    /// ramp yields to manual control. The session persists after the
+    /// arrow is released — exit via Select (commit) or Menu (cancel).
+    ///
+    /// Does *not* call `scheduleHideControls()`: the tvOS focus sink
+    /// needs to stay in the focus hierarchy so subsequent D-pad / Select
+    /// / Menu presses route through us rather than the scrubber or the
+    /// transport buttons.
+    func beginHoldSeek(forward: Bool) {
+        guard canRequestSeek else { return }
+        guard !refusesSeekAtEndOfFile else { return }
+        if isHoldSeeking { return } // already in a session
+        Self.logger.info(
+            "[CMP-SEEK] hold seek begin direction=\(forward ? "forward" : "backward", privacy: .public) current=\(self.currentTime, privacy: .public)"
+        )
+
+        // A pending tap-skip debounce would commit behind our back; kill it.
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+
+        holdSeekRate = forward ? 1 : -1
+        syncBufferingQualitySignals()
+        // Seek preview always starts from the live playhead (ignore any
+        // stale `scrubPreviewTime` left by a prior tap-skip preview that
+        // didn't land).
+        scrubPreviewTime = currentTime
+        isScrubbing = true
+        scrubPreviewProvider.begin(atSourceTime: scrubPreviewTime)
+
+        holdSeekTask?.cancel()
+        holdSeekTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let rate = self.holdSeekRate
+                if rate == 0 { break }
+                let step = Self.holdSeekBaseStep * Double(rate)
+                let cap = self.duration > 0 ? self.duration : self.scrubPreviewTime + abs(step)
+                self.scrubPreviewTime = max(0, min(self.scrubPreviewTime + step, cap))
+                self.scrubPreviewProvider.request(atSourceTime: self.scrubPreviewTime)
+                try? await Task.sleep(nanoseconds: Self.holdSeekTickNanos)
+            }
+        }
+
+        startHoldSeekAutoRamp()
+    }
+
+    /// Step the seek rate along `seekRates`. Positive `delta` moves toward
+    /// faster forward, negative toward faster backward. Cancels the
+    /// auto-ramp — once the user touches Left/Right they're driving.
+    func adjustHoldSeekRate(delta: Int) {
+        guard isHoldSeeking else { return }
+        holdSeekAutoRampTask?.cancel()
+        holdSeekAutoRampTask = nil
+        guard let currentIdx = Self.seekRates.firstIndex(of: holdSeekRate) else { return }
+        let newIdx = max(0, min(Self.seekRates.count - 1, currentIdx + delta))
+        holdSeekRate = Self.seekRates[newIdx]
+    }
+
+    /// Commit the current seek preview and exit seek mode. Schedules the
+    /// overlay auto-hide so the user briefly sees the landed position on
+    /// the scrubber before it fades.
+    func commitHoldSeek() {
+        guard isHoldSeeking else { return }
+        Self.logger.info(
+            "[CMP-SEEK] hold seek commit target=\(self.scrubPreviewTime, privacy: .public) current=\(self.currentTime, privacy: .public)"
+        )
+        tearDownHoldSeek()
+        commitSeek(to: scrubPreviewTime, source: "holdSeek")
+        scheduleHideControls()
+    }
+
+    /// Abandon the seek session without moving the playhead. Used by
+    /// Menu / Exit so a curious user can back out without committing.
+    func cancelHoldSeek() {
+        guard isHoldSeeking else { return }
+        tearDownHoldSeek()
+        cancelScrub()
+    }
+
+    /// Run a short auto-ramp that steps the rate magnitude 1 → 2 → 4 → 8
+    /// in ~1.2 s increments. Only runs during the initial phase of a
+    /// session; cancelled the instant the user manually steers.
+    private func startHoldSeekAutoRamp() {
+        holdSeekAutoRampTask?.cancel()
+        holdSeekAutoRampTask = Task { @MainActor [weak self] in
+            let magnitudes: [Int] = [2, 4, 8]
+            for magnitude in magnitudes {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                guard !Task.isCancelled, let self else { return }
+                let current = self.holdSeekRate
+                guard current != 0 else { return }
+                let sign = current > 0 ? 1 : -1
+                self.holdSeekRate = magnitude * sign
+            }
+        }
+    }
+
+    private func tearDownHoldSeek() {
+        holdSeekTask?.cancel()
+        holdSeekTask = nil
+        holdSeekAutoRampTask?.cancel()
+        holdSeekAutoRampTask = nil
+        holdSeekRate = 0
+        syncBufferingQualitySignals()
+    }
+
+    /// Accumulate a skip delta into `scrubPreviewTime` and schedule a
+    /// trailing-edge commit. Each call cancels the prior pending commit and
+    /// starts a fresh window, so rapid bursts coalesce into a single seek
+    /// fired after the user stops pressing.
+    private func queueSkipDebounce(delta: Double) {
+        let wasScrubbing = isScrubbing
+        let base = isScrubbing ? scrubPreviewTime : currentTime
+        let target = RelativeSeek.target(
+            current: currentTime,
+            pending: isScrubbing ? scrubPreviewTime : nil,
+            delta: delta,
+            duration: duration
+        )
+
+        isScrubbing = true
+        scrubPreviewTime = target
+        if wasScrubbing {
+            scrubPreviewProvider.request(atSourceTime: target)
+        } else {
+            scrubPreviewProvider.begin(atSourceTime: target)
+        }
+        Self.logger.info(
+            "[CMP-SEEK] skip debounce queued delta=\(delta, privacy: .public) base=\(base, privacy: .public) target=\(target, privacy: .public) duration=\(self.duration, privacy: .public)"
+        )
+
+        skipDebounceTask?.cancel()
+        skipDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: self?.skipDebounceNanos ?? 200_000_000)
+            guard !Task.isCancelled, let self else { return }
+            Self.logger.info(
+                "[CMP-SEEK] skip debounce commit target=\(self.scrubPreviewTime, privacy: .public) current=\(self.currentTime, privacy: .public)"
+            )
+            self.commitSeek(to: self.scrubPreviewTime, source: "skipDebounce")
+            self.skipDebounceTask = nil
+        }
+    }
+
+    /// Commit a seek target. Optimistically moves `currentTime` to the
+    /// target and arms the origin↔target filter so stale `onTimeChange`
+    /// frames from the pipeline can't overwrite it. Without this, the
+    /// scrubber visibly jumps back to the pre-seek position between the
+    /// `seek` call and the first post-seek report.
+    ///
+    /// Back-to-back seeks are safe because we capture `seekOriginTime`
+    /// from the pre-commit `currentTime` (which on a repeat commit is the
+    /// prior optimistic target) — the midpoint between that and the new
+    /// target still correctly rejects drainage from either the current or
+    /// the prior seek.
+    @discardableResult
+    private func commitSeek(
+        to target: Double, source: String = "unspecified", roomCommand: Bool = false,
+        requestedPaused: Bool? = nil
+    ) -> Bool {
+        if !roomCommand, let outcome = watchPartyAdapter?.submit(.seek(target), isPaused: requestedPaused),
+           outcome != .solo {
+            isScrubbing = false
+            scrubPreviewProvider.endInteraction()
+            // A request the room session did not send (denied, or not
+            // connected and attached) never runs: nothing is held, and the
+            // timeline stays on the engine.
+            guard outcome == .sent else {
+                scrubPreviewTime = watchPartyPlaybackSnapshot.sourceTime
+                return true
+            }
+            // The room runs the seek a lead later. Until then show the
+            // requested target, as a local seek does, so the timeline does
+            // not snap back and the next relative skip builds on it instead
+            // of on the stream the room is about to move.
+            // The origin is the engine's clock: an earlier request's held
+            // target is not where playback ticks will come from.
+            let requested = duration > 0 ? min(max(0, target), duration) : max(0, target)
+            let origin = watchPartyPlaybackSnapshot.sourceTime
+            seekOriginTime = origin
+            seekTargetTime = requested
+            watchPartyHeldSeek = WatchPartyHeldSeek(target: requested, origin: origin)
+            currentTime = requested
+            scrubPreviewTime = requested
+            armSeekFilterTimeout(restoringRoomPosition: true)
+            return true
+        }
+        let clampedTarget = duration > 0 ? min(max(0, target), duration) : max(0, target)
+        if isReconnecting || reconnectCycle.isHandingOff {
+            // The transport is dead, or its replacement is not installed
+            // yet; the reconnect resumes where the viewer wants to be.
+            reconnectCycle.updatePosition(clampedTarget)
+            currentTime = clampedTarget
+            scrubPreviewTime = clampedTarget
+            isScrubbing = false
+            scrubPreviewProvider.endInteraction()
+            return false
+        }
+        let requiresReplan: Bool = {
+            guard let timeline = aetherPlaybackController.activeSpec?.timeline else { return true }
+            if case .replan = timeline.seekDisposition(forSourceTime: clampedTarget) {
+                return true
+            }
+            return false
+        }()
+
+        Self.logger.info(
+            "[CMP-SEEK] commit requested source=\(source, privacy: .public) target=\(clampedTarget, privacy: .public) current=\(self.currentTime, privacy: .public) route=\(self.activeRouteLabel, privacy: .public) replan=\(requiresReplan, privacy: .public)"
+        )
+        hasReachedEndOfFile = false
+        // A room seek for an earlier skip in a burst moves the engine but
+        // leaves the newest request on the timeline, and ticks from the
+        // engine's new position are filtered as stale until the room's seek
+        // to that request runs. That seek still filters ticks from where the
+        // engine played, not from the target the timeline already shows.
+        var held = roomCommand ? watchPartyHeldSeek : nil
+        let (shownTarget, origin) = WatchPartyHeldSeek.roomSeek(to: clampedTarget, held: &held, from: currentTime)
+        watchPartyHeldSeek = held
+        seekOriginTime = origin
+        seekTargetTime = shownTarget
+        currentTime = shownTarget
+        sourceWatch.seekCommitted(to: clampedTarget)
+        scrubPreviewTime = shownTarget
+        isScrubbing = false
+        scrubPreviewProvider.endInteraction()
+
+        // Snapshotted synchronously, before the seek is even issued. A seek
+        // that resolves `.requiresReplan` after a different item began
+        // loading would otherwise restart that *new* item at this item's
+        // position, because `lastLoadRequest` has already been replaced.
+        let seekFreshLoadGeneration = freshLoadGeneration
+        let seekLoadEpoch = aetherPlaybackController.activeLoadEpoch
+        seekReplanTask?.cancel()
+        seekOperationGeneration &+= 1
+        let operationGeneration = seekOperationGeneration
+        seekReplanTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposed else { return }
+            defer {
+                // An overlapping quality/track load can retire the old Aether
+                // epoch before seek returns. Clear only this task's handle so
+                // readiness is not held by completed work or a newer seek.
+                if self.seekOperationGeneration == operationGeneration {
+                    self.seekReplanTask = nil
+                }
+                self.publishWatchPartySnapshot()
+            }
+            let result = await self.aetherPlaybackController.seek(toSourceTime: clampedTarget)
+            guard !Task.isCancelled,
+                  !self.isDisposed,
+                  self.freshLoadGeneration == seekFreshLoadGeneration,
+                  self.aetherPlaybackController.activeLoadEpoch == seekLoadEpoch else {
+                return
+            }
+            self.seekReplanTask = nil
+            switch result {
+            case .completed:
+                // A seek a replan queued completes here when it needs no
+                // replan of its own, so this is the last chance to apply a
+                // caption pick held for that replan.
+                self.reapplyDeferredAutoSubtitlePolicyIfNeeded()
+            case .requiresReplan(let sourceSeconds):
+                if let protocolV3 = self.activePreparedProtocolV3,
+                   protocolV3.serverFeatures.contains(PlaybackProtocolV3.seekReanchorFeature) {
+                    // `attemptProtocolV3Replan` raises the spinner itself once
+                    // it commits to a replan, so an early rejection (no watch
+                    // detail) never leaves the player spinning.
+                    guard self.attemptProtocolV3Replan(
+                        position: sourceSeconds,
+                        classification: "seek_reanchor",
+                        message: "Reanchor the active stream at the requested source position.",
+                        operation: PlaybackProtocolV3.ReplanOperation.seekReanchor
+                    ) else {
+                        self.isLoading = false
+                        self.showNotice(
+                            title: "Couldn't seek",
+                            message: "Playback couldn't move to that position. Try again.",
+                            tone: .warning,
+                            duration: 5
+                        )
+                        return
+                    }
+                } else if let request = self.lastLoadRequest {
+                    self.beginFreshLoad(
+                        request: request,
+                        progressPosition: self.seekOriginTime,
+                        resumePositionOverride: sourceSeconds,
+                        allowNearEndResume: true
+                    )
+                }
+            }
+        }
+
+        armSeekFilterTimeout(restoringRoomPosition: held != nil)
+        syncBufferingQualitySignals()
+        // Playback ticks stop while paused, so a seek out of (or back into)
+        // the intro has to reach the pill here rather than on the next tick.
+        // Last, after this seek is fully issued: a seek into an unresolved
+        // intro under `always` commits its own skip from in here, and that
+        // later seek must replace this one rather than be cancelled by it.
+        syncIntroSkipPrompt()
+        return requiresReplan
+    }
+
+    /// Seek to a specific timestamp. Used by the chapter sheet and the tvOS
+    /// progress-bar scrubber.
+    func seekTo(seconds: Double) {
+        guard !refusesSeekAtEndOfFile else { return }
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        Self.logger.info(
+            "[CMP-SEEK] absolute seek requested seconds=\(seconds, privacy: .public)"
+        )
+        commitSeek(to: max(0, seconds), source: "absolute")
+        scheduleHideControls()
+    }
+
+    private func applyMarkerRanges(intro: TimeRange?, credits: TimeRange?, recap: TimeRange?) {
+        introRange = validTimeRange(intro)
+        creditsRange = validTimeRange(credits)
+        recapRange = validTimeRange(recap)
+        if let introRange {
+            Self.logger.info(
+                "[CMP-MARKERS] intro range active start=\(introRange.start, privacy: .public) end=\(introRange.end, privacy: .public)"
+            )
+        }
+        if let creditsRange {
+            Self.logger.info(
+                "[CMP-MARKERS] credits range active start=\(creditsRange.start, privacy: .public) end=\(creditsRange.end, privacy: .public)"
+            )
+        }
+        syncIntroSkipPrompt()
+        autoSkipRecapIfNeeded(at: currentTime)
+        autoSkipCreditsIfNeeded(at: currentTime)
+    }
+
+    /// The marker ranges a replan replaced when it switched files.
+    struct ReplacedMarkerRanges: Equatable {
+        let intro: TimeRange?
+        let credits: TimeRange?
+        let recap: TimeRange?
+    }
+
+    /// Adopts the file version a replan selected. A replan can switch to
+    /// another file (edition), whose markers then replace the old file's.
+    /// For the same file the current ranges stay: a `markers_updated` event
+    /// may be newer than the replan's snapshot. Returns the ranges it
+    /// replaced, for a rollback to put back, or nil when it kept them.
+    @discardableResult
+    func adoptReplannedVersion(_ version: FileVersion) -> ReplacedMarkerRanges? {
+        let fileChanged = version.fileId != currentSelectedVersion?.fileId
+        currentSelectedVersion = version
+        guard fileChanged else { return nil }
+        let replaced = ReplacedMarkerRanges(intro: introRange, credits: creditsRange, recap: recapRange)
+        applyMarkerRanges(intro: version.intro, credits: version.credits, recap: version.recap)
+        return replaced
+    }
+
+    /// Test seam: the playback identity a marker reconcile is fenced on.
+    func bindMarkerReconciliationForTesting(sessionId: String, detail: WatchDetail, version: FileVersion) {
+        activePlaybackSessionId = sessionId
+        currentWatchDetail = detail
+        currentSelectedVersion = version
+    }
+
+    func reconcileMarkersAfterRealtimeConnect() {
+        guard offlinePlaybackContext == nil,
+              let sessionId = activePlaybackSessionId,
+              let contentId = currentWatchDetail?.contentId,
+              let fileId = currentSelectedVersion?.fileId else {
+            return
+        }
+
+        let requestId = UUID()
+        let libraryId = self.libraryId
+        markerReconcileRequestId = requestId
+        markerReconcileTask?.cancel()
+        markerReconcileTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.markerReconcileRequestId == requestId {
+                    self.markerReconcileTask = nil
+                    self.markerReconcileRequestId = nil
+                }
+            }
+            do {
+                // The read is owner-fenced: it is sent for the owner captured
+                // at dispatch and refused if that owner changed in flight.
+                let detail = try await self.markerDetailLoader(contentId, libraryId)
+                guard !Task.isCancelled,
+                      self.markerReconcileRequestId == requestId,
+                      self.activePlaybackSessionId == sessionId,
+                      self.currentSelectedVersion?.fileId == fileId,
+                      let version = detail.versions.first(where: { $0.fileId == fileId }) else {
+                    return
+                }
+                let refreshedIntro = version.intro
+                let refreshedCredits = version.credits
+                self.applyMarkerRanges(
+                    intro: refreshedIntro,
+                    credits: refreshedCredits,
+                    recap: version.recap
+                )
+            } catch {
+                guard !Task.isCancelled, self.markerReconcileRequestId == requestId else { return }
+                Self.logger.warning(
+                    "[CMP-MARKERS] realtime marker reconciliation failed: \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func validTimeRange(_ range: TimeRange?) -> TimeRange? {
+        guard let range,
+              range.start.isFinite,
+              range.end.isFinite,
+              range.start >= 0,
+              range.end > range.start else {
+            return nil
+        }
+        return range
+    }
+
+    /// Feeds the intro pill the latest playback state.
+    ///
+    /// Called wherever one of its inputs moves: the playhead, the markers, and
+    /// the play/pause, loading and buffering state. The pill's own timer runs
+    /// in between. The one seek it can ask for is `always`'s immediate skip.
+    private func syncIntroSkipPrompt() {
+        // Do not offer or resolve a skip while the engine has yet to present
+        // this load. Seeking and pausing before its first frame can prevent
+        // the startup milestone and its session progress reporting.
+        let range = markerPlaybackHasStarted ? introRange : nil
+        let target = introSkipPrompt.update(
+            IntroSkipPrompt.Inputs(
+                position: currentTime,
+                range: range,
+                key: range.flatMap(currentIntroSkipKey(for:)),
+                mode: introSkipMode,
+                activity: introSkipActivity
+            )
+        )
+        guard let target, !hasReachedEndOfFile else { return }
+        Self.logger.info(
+            "[CMP-MARKERS] auto-skip intro target=\(target, privacy: .public) current=\(self.currentTime, privacy: .public)"
+        )
+        // Not `seekTo`: that reveals the transport, and nobody touched the
+        // remote. The undo pill is the feedback for this seek.
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        commitSeek(to: target, source: "introAutoSkip")
+    }
+
+    /// A Watch Party never skips an intro on its own, because the seek would
+    /// move every member. A member who may seek gets the offer instead; one
+    /// who may not gets no pill to press.
+    private var introSkipMode: IntroSkipMode {
+        guard isWatchPartyPlayback else { return settings.introSkipMode }
+        guard canRequestSeek else { return .never }
+        return settings.introSkipMode == .never ? .never : .ask
+    }
+
+    /// Playback as the intro pill's timer sees it. Loading and buffering are a
+    /// stall, which the pill only treats as a pause once it outlasts the grace
+    /// window; a paused player freezes the timer at once.
+    private var introSkipActivity: IntroSkipPrompt.Activity {
+        if hasReachedEndOfFile { return .paused }
+        if isLoading || isBuffering { return .stalled }
+        return isPlaying ? .playing : .paused
+    }
+
+    private func autoSkipCreditsIfNeeded(at time: Double) {
+        guard !isWatchPartyPlayback else { return }
+        let key = creditsRange.flatMap(currentCreditsSkipKey(for:))
+        guard let target = CreditsAutoSkipPolicy.target(
+            enabled: settings.autoSkipCredits,
+            playbackEligible: !isLoading && !hasReachedEndOfFile,
+            time: time,
+            range: creditsRange,
+            markerKey: key,
+            lastSkippedKey: autoSkippedCreditsKey
+        ), let key else {
+            return
+        }
+
+        // Set the latch before seeking: a synchronous backend time callback
+        // caused by the seek must see this marker as already handled.
+        autoSkippedCreditsKey = key
+        Self.logger.info(
+            "[CMP-MARKERS] auto-skip credits target=\(target, privacy: .public) current=\(time, privacy: .public)"
+        )
+        performCreditsSkip(to: target)
+    }
+
+    /// Jumps past a recap once per recap when the profile turns on
+    /// `playback.auto_skip_recap`; see ``RecapAutoSkipPolicy``.
+    private func autoSkipRecapIfNeeded(at time: Double) {
+        let key = recapRange.flatMap(currentRecapSkipKey(for:))
+        guard let target = RecapAutoSkipPolicy.target(
+            enabled: settings.autoSkipRecap,
+            isWatchParty: isWatchPartyPlayback,
+            playbackStarted: markerPlaybackHasStarted,
+            playbackEligible: !isLoading && !hasReachedEndOfFile,
+            time: time,
+            range: recapRange,
+            markerKey: key,
+            skippedKeys: autoSkippedRecapKeys
+        ), let key else {
+            return
+        }
+
+        // Set the latch before seeking: a synchronous backend time callback
+        // caused by the seek must see this recap as already handled.
+        autoSkippedRecapKeys.insert(key)
+        Self.logger.info(
+            "[CMP-MARKERS] auto-skip recap target=\(target, privacy: .public) current=\(time, privacy: .public)"
+        )
+        seekTo(seconds: target)
+    }
+
+    private func performCreditsSkip(to target: Double) {
+        if watchPartyAdapter?.request(.seek(target)) == true { return }
+        // Aether deliberately parks a programmatic seek at the exact duration
+        // in a paused state. TheIntroDB uses that exact bound when credits run
+        // to EOF, so complete the item through Silo's normal end/Next Up path
+        // instead of leaving a frozen final frame.
+        if duration.isFinite,
+           duration > 0,
+           target >= duration - 0.5 {
+            if presentNextUpOverCredits() { return }
+            currentTime = duration
+            handleEndOfFile(sourceEnded: false)
+            return
+        }
+        seekTo(seconds: target)
+    }
+
+    /// Credits that run to the end of the file leave nothing to seek to.
+    /// When Next Up has something to offer, open it now and let the credits
+    /// keep playing in its preview instead of stopping on a frozen frame.
+    /// Returns false when the caller should finish the item at EOF instead.
+    private func presentNextUpOverCredits() -> Bool {
+        // A shuffle plays every part of a multi-part item first: skipping
+        // credits finishes the part at EOF, which starts the next one.
+        guard !isWatchPartyPlayback,
+              canShowNextUpScreen,
+              nextShufflePart == nil,
+              !hasReachedEndOfFile,
+              !isNextUpTransitioning,
+              let epoch = activeAetherLoadEpoch,
+              startedAetherLoadEpoch == epoch else {
+            return false
+        }
+        didSkipCreditsToEnd = true
+        if showNextUpScreen {
+            // Auto-skip can fire under a prompt that is already open. Switch
+            // it to the credits countdown rather than waiting out the tail.
+            nextUpPresentationSource = .credits
+            startNextUpCountdownIfNeeded()
+        } else {
+            beginNextUpPostroll(videoEnded: false, source: .credits)
+        }
+        return true
+    }
+
+    /// Identifies an intro across seeks and stream reloads of the same file.
+    /// Deliberately not keyed on the playback session: a protocol-v3 replan
+    /// can replace the session id mid-playback, and the intro must stay
+    /// decided across it.
+    private func currentIntroSkipKey(for range: TimeRange) -> String? {
+        guard let contentId = currentWatchDetail?.contentId,
+              let fileId = currentSelectedVersion?.fileId else {
+            return nil
+        }
+        return "\(contentId):\(fileId):\(range.start):\(range.end)"
+    }
+
+    private func currentCreditsSkipKey(for range: TimeRange) -> String? {
+        guard let sessionId = activePlaybackSessionId,
+              let fileId = currentSelectedVersion?.fileId else {
+            return nil
+        }
+        return "\(sessionId):\(fileId):credits:\(range.start):\(range.end)"
+    }
+
+    /// Names the marker, not the session, like the intro key: a protocol-v3
+    /// replan or a reload can replace the session id mid-playback, and a
+    /// recap already skipped must stay skipped across it.
+    private func currentRecapSkipKey(for range: TimeRange) -> String? {
+        guard activePlaybackSessionId != nil,
+              let contentId = currentWatchDetail?.contentId,
+              let fileId = currentSelectedVersion?.fileId else {
+            return nil
+        }
+        return "\(contentId):\(fileId):recap:\(range.start):\(range.end)"
+    }
+
+    func beginScrub(fraction: Double) {
+        guard canRequestSeek else { return }
+        guard !refusesSeekAtEndOfFile else { return }
+        guard duration > 0 else { return }
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        isScrubbing = true
+        scrubPreviewTime = max(0, min(fraction, 1)) * duration
+        scrubPreviewProvider.begin(atSourceTime: scrubPreviewTime)
+        hideControlsTask?.cancel()
+    }
+
+    func updateScrub(fraction: Double) {
+        guard !refusesSeekAtEndOfFile else { return }
+        guard duration > 0 else { return }
+        scrubPreviewTime = max(0, min(fraction, 1)) * duration
+        scrubPreviewProvider.request(atSourceTime: scrubPreviewTime)
+    }
+
+    func endScrub(resumePlayback: Bool = false, shouldSeek: Bool = true) {
+        guard !refusesSeekAtEndOfFile else { return }
+        guard isScrubbing else { return }
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        let reloadsPlaybackPipeline: Bool
+        if shouldSeek {
+            Self.logger.info(
+                "[CMP-SEEK] scrub ended target=\(self.scrubPreviewTime, privacy: .public) current=\(self.currentTime, privacy: .public)"
+            )
+            reloadsPlaybackPipeline = commitSeek(
+                to: scrubPreviewTime, source: "scrub", requestedPaused: resumePlayback ? false : nil
+            )
+        } else {
+            // Select entered and exited timeline mode without moving the
+            // playhead. Keep the backend parked at its exact paused position
+            // instead of issuing a redundant seek that can snap to a nearby
+            // keyframe and briefly rebuffer.
+            isScrubbing = false
+            scrubPreviewTime = currentTime
+            scrubPreviewProvider.endInteraction()
+            reloadsPlaybackPipeline = false
+            Self.logger.info(
+                "[CMP-SEEK] scrub ended without movement; resuming without seek at current=\(self.currentTime, privacy: .public)"
+            )
+        }
+        if resumePlayback, !reloadsPlaybackPipeline {
+            handleNowPlayingPlay()
+        }
+        scheduleHideControls()
+    }
+
+    /// Lets playback ticks through again if the seek never arrives. A held
+    /// room request the room never answered (refused, or lost in flight)
+    /// also puts the timeline back on the engine's position: ticks
+    /// behind the held target would be filtered out as stale, and a paused
+    /// member sends none.
+    private func armSeekFilterTimeout(restoringRoomPosition: Bool = false) {
+        seekFilterTimeoutTask?.cancel()
+        seekFilterTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.seekFilterNanos)
+            guard !Task.isCancelled, let self else { return }
+            self.seekOriginTime = nil
+            self.seekTargetTime = nil
+            self.watchPartyHeldSeek = nil
+            self.seekFilterTimeoutTask = nil
+            self.syncBufferingQualitySignals()
+            if restoringRoomPosition, self.isWatchPartyPlayback, !self.isScrubbing {
+                self.currentTime = self.watchPartyPlaybackSnapshot.sourceTime
+                self.scrubPreviewTime = self.currentTime
+            }
+        }
+    }
+
+    /// Abandon an in-progress scrub without seeking. Used when the user
+    /// transitions focus away from the scrubber for a reason that's not a
+    /// commit — most commonly, opening a sheet — so the scrub preview
+    /// doesn't become an accidental seek.
+    func cancelScrub() {
+        guard isScrubbing else { return }
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        isScrubbing = false
+        scrubPreviewTime = currentTime
+        scrubPreviewProvider.endInteraction()
+    }
+
+    // MARK: - Track selection
+    //
+    // Aether owns all embedded and external media-track selection. Synthetic
+    // realtime AI tracks remain app-owned and deliberately never enter
+    // Aether's media-track id namespace.
+
+    func selectAudio(_ track: PlayerTrack) {
+        if activePreparedProtocolV3 != nil {
+            // The server owns the switch on this path, so the track must not
+            // be applied locally before its plan arrives. The selection is
+            // published optimistically because the replan reads it back, but
+            // nothing is persisted or recorded until the replan is actually
+            // under way — a dropped switch must not be filed as a success.
+            let priorAudioId = selectedAudioId
+            let priorPendingAudioFfIndex = pendingAudioFfIndex
+            pendingAudioFfIndex = nil
+            selectedAudioId = track.trackId
+            reapplySystemSubtitlePolicy()
+            guard attemptProtocolV3Replan(
+                position: currentTime,
+                classification: "audio_track_changed",
+                message: "User selected audio track \(track.title ?? String(track.trackId)).",
+                requeueWhenBusy: true,
+                trackTarget: queuedTrackTarget(forAudio: track)
+            ) else {
+                selectedAudioId = priorAudioId
+                pendingAudioFfIndex = priorPendingAudioFfIndex
+                reapplySystemSubtitlePolicy()
+                showNotice(
+                    title: "Couldn't change audio",
+                    message: "The audio track couldn't be switched. Try again.",
+                    tone: .warning,
+                    duration: 5
+                )
+                scheduleHideControls()
+                return
+            }
+            persistAudioSelection(track)
+            recordAudioTrackSelectionBreadcrumb(
+                track.trackId,
+                reason: "user_selection",
+                viaServerReplan: true
+            )
+            scheduleHideControls()
+            return
+        }
+        pendingAudioFfIndex = nil
+        selectedAudioId = track.trackId
+        persistAudioSelection(track)
+        reapplySystemSubtitlePolicy()
+        applyAudioTrackSelection(track.trackId, reason: "user_selection")
+        reopenAutoSubtitlePolicyForAudioChange()
+        applyAutoSubtitlePreferencesIfNeeded()
+        scheduleHideControls()
+    }
+
+    /// The server-preference subtitle pick depends on the audio language:
+    /// Auto hides subtitles for audio already in the subtitle language, and
+    /// Off shows the forced track for it. After an audio switch the automatic
+    /// pass runs again with the new audio, unless the viewer picked a
+    /// subtitle. On the V3 path this runs when the audio replan commits, so
+    /// the pass sees the new plan. System-caption mode re-runs through
+    /// `reapplySystemSubtitlePolicy` instead.
+    private func reopenAutoSubtitlePolicyForAudioChange() {
+        guard !settings.subtitleMatchesSystemAppearance, !hasExplicitSubtitleChoice else { return }
+        prefsResolvedForCurrentItem = false
+    }
+
+    /// Subtitle selection state a user pick changes optimistically, so the
+    /// V3 branch can undo it if the server switch never gets issued.
+    private struct SubtitleSelectionRollback {
+        let selectedSubtitleId: Int64?
+        let selectedSecondarySubtitleId: Int64?
+        let pendingSubtitleFfIndex: Int?
+        let pendingSidecarSubtitleTrackId: Int64?
+        let pendingServerRenderedSubtitleTrackId: Int64?
+        let hasExplicitSubtitleChoice: Bool
+    }
+
+    private func captureSubtitleSelection() -> SubtitleSelectionRollback {
+        SubtitleSelectionRollback(
+            selectedSubtitleId: selectedSubtitleId,
+            selectedSecondarySubtitleId: selectedSecondarySubtitleId,
+            pendingSubtitleFfIndex: pendingSubtitleFfIndex,
+            pendingSidecarSubtitleTrackId: pendingSidecarSubtitleTrackId,
+            pendingServerRenderedSubtitleTrackId: pendingServerRenderedSubtitleTrackId,
+            hasExplicitSubtitleChoice: hasExplicitSubtitleChoice
+        )
+    }
+
+    private func restoreSubtitleSelection(_ prior: SubtitleSelectionRollback) {
+        selectedSubtitleId = prior.selectedSubtitleId
+        pendingSubtitleFfIndex = prior.pendingSubtitleFfIndex
+        pendingSidecarSubtitleTrackId = prior.pendingSidecarSubtitleTrackId
+        pendingServerRenderedSubtitleTrackId = prior.pendingServerRenderedSubtitleTrackId
+        hasExplicitSubtitleChoice = prior.hasExplicitSubtitleChoice
+        if selectedSecondarySubtitleId != prior.selectedSecondarySubtitleId {
+            selectedSecondarySubtitleId = prior.selectedSecondarySubtitleId
+            applySecondarySubtitleTrackSelection(prior.selectedSecondarySubtitleId)
+        }
+    }
+
+    /// `savesPreference` is false only for automatic restores (the live AI
+    /// track's teardown): a series preference records what the viewer
+    /// picked, never what the player put back on its own.
+    func selectSubtitle(_ track: PlayerTrack, savesPreference: Bool = true) {
+        let prior = captureSubtitleSelection()
+        hasExplicitSubtitleChoice = true
+        pendingSubtitleFfIndex = nil
+        pendingSidecarSubtitleTrackId = nil
+        pendingServerRenderedSubtitleTrackId = nil
+        if selectedSecondarySubtitleId == track.trackId {
+            selectedSecondarySubtitleId = nil
+            applySecondarySubtitleTrackSelection(nil)
+        }
+        selectedSubtitleId = track.trackId
+        Self.logger.info(
+            "[CMP-SUB] select primary trackId=\(track.trackId, privacy: .public) title=\(track.title ?? "nil", privacy: .public) external=\(track.isExternal, privacy: .public) codec=\(track.codec ?? "nil", privacy: .public)"
+        )
+        if activePreparedProtocolV3 != nil,
+           !SubtitleTrackIdSpace.isAILive(track.trackId) {
+            if applyLocalProtocolV3SubtitleSelection(track, reason: "user_selection") {
+                if savesPreference { persistSubtitleSelection(track) }
+                scheduleHideControls()
+                return
+            }
+            let trackTarget = queuedTrackTarget(forSubtitle: track)
+            if case .subtitle(_, let combinedIndex) = trackTarget {
+                cmpLog(
+                    "[CMP-SUB] phase=user_tap source="
+                        + (track.isExternal ? "external" : "embedded")
+                        + " combined_index="
+                        + (combinedIndex.map(String.init) ?? "unmapped")
+                )
+            }
+            // The replan is what actually switches the track, so nothing is
+            // persisted or recorded until one is under way.
+            guard attemptProtocolV3Replan(
+                position: currentTime,
+                classification: "subtitle_track_changed",
+                message: "User selected subtitle track \(track.title ?? String(track.trackId)).",
+                requeueWhenBusy: true,
+                trackTarget: trackTarget
+            ) else {
+                restoreSubtitleSelection(prior)
+                showNotice(
+                    title: "Couldn't change subtitles",
+                    message: "The subtitle track couldn't be switched. Try again.",
+                    tone: .warning,
+                    duration: 5
+                )
+                scheduleHideControls()
+                return
+            }
+            if savesPreference { persistSubtitleSelection(track) }
+            recordSubtitleTrackSelectionBreadcrumb(
+                track.trackId,
+                reason: "user_selection",
+                viaServerReplan: true
+            )
+            scheduleHideControls()
+            return
+        }
+        localProtocolV3SubtitleSelection = nil
+        if savesPreference { persistSubtitleSelection(track) }
+        applySubtitleTrackSelection(track.trackId, reason: "user_selection")
+        scheduleHideControls()
+    }
+
+    /// See `selectSubtitle(_:savesPreference:)`.
+    func disableSubtitles(savesPreference: Bool = true) {
+        let prior = captureSubtitleSelection()
+        hasExplicitSubtitleChoice = true
+        pendingSubtitleFfIndex = -1
+        pendingSidecarSubtitleTrackId = nil
+        pendingServerRenderedSubtitleTrackId = nil
+        if selectedSecondarySubtitleId != nil {
+            selectedSecondarySubtitleId = nil
+            applySecondarySubtitleTrackSelection(nil)
+        }
+        selectedSubtitleId = nil
+        Self.logger.info("[CMP-SUB] disable primary subtitles")
+        if activePreparedProtocolV3 != nil {
+            if applyLocalProtocolV3SubtitleSelection(nil, reason: "user_selection") {
+                if savesPreference { persistSubtitleSelection(nil) }
+                scheduleHideControls()
+                return
+            }
+            // The replan is what actually clears the track, so nothing is
+            // persisted or recorded until one is under way.
+            guard attemptProtocolV3Replan(
+                position: currentTime,
+                classification: "subtitle_track_changed",
+                message: "User disabled subtitles.",
+                requeueWhenBusy: true,
+                trackTarget: .subtitle(trackId: nil, combinedIndex: nil)
+            ) else {
+                restoreSubtitleSelection(prior)
+                showNotice(
+                    title: "Couldn't change subtitles",
+                    message: "Subtitles couldn't be turned off. Try again.",
+                    tone: .warning,
+                    duration: 5
+                )
+                scheduleHideControls()
+                return
+            }
+            if savesPreference { persistSubtitleSelection(nil) }
+            recordSubtitleTrackSelectionBreadcrumb(
+                nil,
+                reason: "user_selection",
+                viaServerReplan: true
+            )
+            scheduleHideControls()
+            return
+        }
+        if savesPreference { persistSubtitleSelection(nil) }
+        applySubtitleTrackSelection(nil, reason: "user_selection")
+        scheduleHideControls()
+    }
+
+    /// Server pref key for remembering explicit track picks: series id
+    /// for episodes (one choice covers the series), the item's own
+    /// content id for movies. Nil during offline playback — there is no
+    /// server to remember anything for.
+    private var trackPrefPersistKey: String? {
+        guard offlinePlaybackContext == nil, let detail = currentWatchDetail else { return nil }
+        return TrackSelectionPersistence.prefKey(
+            seriesId: detail.seriesId,
+            contentId: detail.contentId
+        )
+    }
+
+    /// Best-effort write of an explicit audio pick so it sticks across
+    /// player exits (web-app parity; the server only auto-persists
+    /// audio on its own change endpoint, which Apple's engine-local
+    /// switching never calls). Prefers the server's probed metadata for
+    /// the signature so re-resolution gets an exact match.
+    private func persistAudioSelection(_ track: PlayerTrack) {
+        guard let key = trackPrefPersistKey else { return }
+        let ordinal = audioSelectionIndex(for: track)
+        let request: AudioPrefRequest
+        if let ordinal,
+           let version = currentSelectedVersion,
+           let fromDetail = TrackSelectionPersistence.audioRequest(version: version, ordinal: ordinal) {
+            request = fromDetail
+        } else {
+            request = TrackSelectionPersistence.audioRequest(track: track, ordinal: ordinal)
+        }
+        TrackSelectionPersistence.saveAudio(prefKey: key, request: request)
+    }
+
+    /// Best-effort write of an explicit subtitle pick (or explicit
+    /// "Off" when `track` is nil). Live AI translation tracks are
+    /// session-scoped and never persisted.
+    private func persistSubtitleSelection(_ track: PlayerTrack?) {
+        guard let key = trackPrefPersistKey else { return }
+        if let track, SubtitleTrackIdSpace.isAILive(track.trackId) { return }
+        let request: SubtitlePrefRequest
+        if let track {
+            if !track.isExternal,
+               let ffIndex = track.ffIndex,
+               let version = currentSelectedVersion,
+               let fromDetail = TrackSelectionPersistence.subtitleRequest(version: version, ffIndex: ffIndex) {
+                request = fromDetail
+            } else {
+                request = TrackSelectionPersistence.subtitleRequest(track: track)
+            }
+        } else {
+            request = TrackSelectionPersistence.subtitleOffRequest()
+        }
+        TrackSelectionPersistence.saveSubtitle(prefKey: key, request: request)
+    }
+
+    func selectSecondarySubtitle(_ track: PlayerTrack) {
+        guard backendCapabilities.supportsSecondarySubtitles else { return }
+        guard !SubtitleCodecClassifier.isBitmap(track.codec) else { return }
+        // Secondary sub cannot equal the primary sid; guard at the UI layer
+        // so the user gets an immediate no-op rather than seeing stale state.
+        guard track.trackId != selectedSubtitleId else { return }
+        guard canRenderAsSecondarySubtitle(track) else { return }
+        selectedSecondarySubtitleId = track.trackId
+        applySecondarySubtitleTrackSelection(track.trackId)
+        scheduleHideControls()
+    }
+
+    func disableSecondarySubtitles() {
+        guard backendCapabilities.supportsSecondarySubtitles else { return }
+        selectedSecondarySubtitleId = nil
+        applySecondarySubtitleTrackSelection(nil)
+        scheduleHideControls()
+    }
+
+    // MARK: - AI subtitles (translate / transcribe over polling)
+
+    /// Start an AI translation of an existing text subtitle track into
+    /// `targetLanguage`. Forwarded to ``SubtitleAIController`` which POSTs the
+    /// job and polls it to completion, then hands the result back through
+    /// `registerCompletedAISubtitle`.
+    func startSubtitleTranslation(track: PlayerTrack, to targetLanguage: String) {
+        subtitleAI.translateExisting(track: track, to: targetLanguage)
+    }
+
+    /// Start an AI transcription of an audio track (`audioIndex`, `-1` =
+    /// server default), optionally translating the transcript into
+    /// `translateTo`.
+    func startSubtitleTranscription(audioIndex: Int, translateTo: String?) {
+        subtitleAI.transcribe(audioIndex: audioIndex, translateTo: translateTo)
+    }
+
+    // MARK: - Subtitle provider search (synchronous, no job machinery)
+
+    /// Client-side half of the "Search Subtitles…" gate: an active playback
+    /// session (the synthesized stream URL is session-scoped) and a known
+    /// media file. False for offline/local playback. It says nothing about
+    /// whether the *server* can service a search; entry points use
+    /// ``subtitleSearchEnabled``.
+    var subtitleSearchVisible: Bool {
+        activePlaybackSessionId != nil
+            && currentSelectedVersion?.fileId != nil
+    }
+
+    /// Whether "Search Subtitles…" is offered: visible *and* the server has
+    /// external subtitle providers configured. Every entry point shows the
+    /// row only when this is true, so a server without providers never shows
+    /// a search that cannot return anything.
+    ///
+    /// ``SubtitleProvidersStore/isAvailable`` stays true until the
+    /// provider-status probe answers; a failed probe keeps search offered for
+    /// servers that predate the probe.
+    var subtitleSearchEnabled: Bool {
+        subtitleSearchVisible && SubtitleProvidersStore.shared.isAvailable
+    }
+
+    /// Why search stopped being available, or `nil` while it is. An open
+    /// search menu shows it when the provider probe answers "unavailable"
+    /// after the menu opened.
+    var subtitleSearchUnavailableReason: String? {
+        guard subtitleSearchVisible, !subtitleSearchEnabled else { return nil }
+        return "Not set up on this server"
+    }
+
+    /// Run a provider search for the current media file. Synchronous on the
+    /// server (fan-out with 20–30s per-provider timeouts) — the caller shows
+    /// a long-running spinner. Throws `HTTPError` verbatim for the UI.
+    func searchSubtitles(languages: [String]) async throws -> SubtitleSearchResponse {
+        guard let fileId = currentSelectedVersion?.fileId else {
+            throw HTTPError.invalidURL("subtitle search requires an active media file")
+        }
+        return try await SiloAI.shared.searchSubtitles(
+            SubtitleSearchBody(mediaFileId: fileId, languages: languages)
+        )
+    }
+
+    /// Download a chosen search result and hand it to the picker (register +
+    /// auto-select) with **no session restart** — the same sidecar path the AI
+    /// completion uses.
+    ///
+    /// Mirrors `SubtitleAIController.completePersistedHandoff` minus the
+    /// job/latch/websocket machinery: the download response carries the stored
+    /// `id` but no stream URL, so we re-list to place the row in the plan's
+    /// subtitle ordinals and synthesize a URL pinned to that `id` (see
+    /// ``DownloadedSubtitleOrdinals``).
+    ///
+    /// The download is `non_retryable` and is sent once, for the owner
+    /// captured before the first await. The outcome tells the menu whether
+    /// the subtitle is stored, definitely not stored, or may be stored; the
+    /// menu never resends the last two cases' result on its own. The server
+    /// sends no `subtitle_ready` broadcast for provider downloads, so a
+    /// subtitle that is stored but not registered here appears only the next
+    /// time the file plays. ``SubtitleDownloadOutcome/resolve`` owns the
+    /// outcome mapping.
+    func downloadSearchedSubtitle(_ result: SubtitleSearchResult) async -> SubtitleDownloadOutcome {
+        guard let fileId = currentSelectedVersion?.fileId else {
+            return .failed(SubtitleDownloadOutcome.genericFailure)
+        }
+        let body = SubtitleDownloadBody(from: result, mediaFileId: fileId)
+        return await SubtitleDownloadOutcome.resolve(
+            download: {
+                let auth = try await SiloAI.shared.captureAuthority()
+                return (auth, try await SiloAI.shared.downloadSubtitle(body, auth: auth))
+            },
+            relist: { auth in try await SiloAI.shared.downloadedSubtitles(mediaFileId: fileId, auth: auth) },
+            isStillCurrent: { auth in
+                guard await SiloAI.shared.matchesAuthority(auth) else { return false }
+                return self.currentSelectedVersion?.fileId == fileId
+            },
+            register: { listing, position in
+                // Provider downloads are synced automatically; follow the job
+                // so the cues are fetched again once it applies, and report
+                // it to the viewer who downloaded it.
+                self.subtitleSync.bind(mediaFileId: fileId)
+                self.subtitleSync.remember(listing[position])
+                guard let context = self.makeSubtitleHandoffContext(),
+                      let descriptor = listing[position].synthesizedDescriptor(
+                          sessionId: context.sessionId,
+                          ordinal: context.ordinals.ordinal(at: position, in: listing),
+                          resolveURL: context.resolveURL
+                      )
+                else { return false }
+                self.registerCompletedAISubtitle(descriptor, autoSelect: true)
+                return true
+            }
+        )
+    }
+
+    // MARK: - Subtitle sync
+
+    /// The sync key of a subtitle row: the inventory's `sync_key`, or, from a
+    /// server that predates sync keys, `stored-{id}` read from the
+    /// `downloaded_subtitle_id` pin on a downloaded track's URL. Nil for
+    /// embedded, live, and offline tracks; the inventory also leaves it off
+    /// formats that cannot be retimed.
+    func subtitleSyncKey(for track: PlayerTrack) -> String? {
+        guard offlinePlaybackContext == nil, SubtitleTrackIdSpace.isSidecar(track.trackId),
+              !SubtitleTrackIdSpace.isAILive(track.trackId) else {
+            return nil
+        }
+        let ordinal = track.srcId ?? SubtitleTrackIdSpace.sidecarIndex(from: track.trackId)
+        let item = activePreparedProtocolV3?.plan.subtitle.inventory.first(where: { $0.combinedIndex == ordinal })
+        if let key = item?.syncKey, !key.isEmpty { return key }
+        let url = item?.url ?? knownExternalSubtitles.first(where: { $0.index == ordinal })?.url
+        return url.flatMap(Self.storedSubtitleId(fromURL:)).map(SubtitleSyncState.storedKey)
+    }
+
+    static func storedSubtitleId(fromURL url: String) -> String? {
+        guard let raw = URLComponents(string: url)?.queryItems?
+                .first(where: { $0.name == "downloaded_subtitle_id" })?.value,
+              let first = raw.first, first != "0",
+              raw.allSatisfy({ ("0"..."9").contains($0) }) else { return nil }
+        return raw
+    }
+
+    /// A subtitle row's sync status ("Syncing… 40%", "Synced −3.0 s"), once
+    /// read.
+    func subtitleSyncStatus(for track: PlayerTrack) -> String? {
+        subtitleSync.statusLabel(for: subtitleSyncKey(for: track))
+    }
+
+    /// The sync key of the selected primary track, when it has one.
+    var selectedSubtitleSyncKey: String? {
+        selectedSubtitleId
+            .flatMap { id in subtitleTracks.first(where: { $0.trackId == id }) }
+            .flatMap(subtitleSyncKey(for:))
+    }
+
+    /// Points the sync model at the playing file and re-reads its syncable
+    /// subtitles. Called when a subtitle menu opens, so a job that finished
+    /// meanwhile shows its result.
+    /// Re-reads whether the server has subtitle providers, so a provider an
+    /// administrator added or removed while the app was open shows or hides
+    /// "Search Subtitles…" the next time the subtitle controls open.
+    func refreshSubtitleProviders() {
+        guard offlinePlaybackContext == nil else { return }
+        Task { await SubtitleProvidersStore.shared.refresh() }
+    }
+
+    func refreshSubtitleSync() {
+        updateSubtitleSyncActiveTrack()
+        guard offlinePlaybackContext == nil,
+              subtitleTracks.contains(where: { subtitleSyncKey(for: $0) != nil }) else { return }
+        Task { await subtitleSync.reload() }
+    }
+
+    /// Tells the sync model which file plays and which track is on screen,
+    /// so it can tell when a retimed track's new cues show.
+    private func updateSubtitleSyncActiveTrack() {
+        subtitleSync.bind(mediaFileId: offlinePlaybackContext == nil ? currentSelectedVersion?.fileId : nil)
+        subtitleSync.setActiveTrack(key: selectedSubtitleSyncKey)
+    }
+
+    /// Fetches a subtitle's cues again after the server changed its timing.
+    /// The track's URL is unchanged and serves the new timing, but the
+    /// engine keeps the cues it already fetched. A registered track that is
+    /// not selected is registered again too: a track declared at load would
+    /// otherwise backfill the old cues when it is selected later. A
+    /// burned-in track keeps the old timing until the next replan.
+    private func refetchSubtitleCues(syncKey: String) {
+        for track in subtitleTracks where subtitleSyncKey(for: track) == syncKey {
+            let primary = track.trackId == selectedSubtitleId
+            let secondary = track.trackId == selectedSecondarySubtitleId
+            let reloaded = aetherPlaybackController.reloadExternalSubtitleTrack(
+                appTrackID: track.trackId, primary: primary, secondary: secondary
+            )
+            Self.logger.info(
+                "[CMP-SUB] subtitle timing changed; refetch trackId=\(track.trackId, privacy: .public) primary=\(primary, privacy: .public) secondary=\(secondary, privacy: .public) reloaded=\(reloaded, privacy: .public)"
+            )
+        }
+    }
+
+    /// Build the context ``SubtitleAIController`` needs to synthesize a
+    /// completed subtitle's player descriptor. Returns `nil` when no active
+    /// session exists or the current backend can't host downloaded sidecars —
+    /// the controller treats `nil` as a soft failure so the user isn't left on
+    /// a dismissed menu with no track.
+    ///
+    /// `ordinals` comes from the V3 plan's subtitle inventory, the
+    /// authoritative track list: it publishes every track, including
+    /// burn-in-only bitmap streams that carry no fetchable URL, over one dense
+    /// ordinal space ordered externals → embedded → downloaded. Never derive
+    /// ordinals by counting the delivered sidecar URLs or the v2 stored
+    /// listing: the first omits burn-in-only tracks and the second omits rows
+    /// whose language the server cannot canonicalize.
+    private func makeSubtitleHandoffContext() -> SubtitleAIController.HandoffContext? {
+        guard let sessionId = activePlaybackSessionId, !sessionId.isEmpty else {
+            Self.logger.warning("[AI-SUB] no active session id for subtitle handoff")
+            return nil
+        }
+        let serverUrl = resolvedServerUrl
+        guard let inventory = activePreparedProtocolV3?.plan.subtitle.inventory else {
+            Self.logger.warning("[AI-SUB] no V3 subtitle inventory for subtitle handoff")
+            return nil
+        }
+        return SubtitleAIController.HandoffContext(
+            sessionId: sessionId,
+            ordinals: Self.protocolV3DownloadedSubtitleOrdinals(inventory),
+            resolveURL: { [weak self] path in self?.resolveServerUrl(path, serverUrl: serverUrl) }
+        )
+    }
+
+    /// Reads each published downloaded row's ordinal from the
+    /// `downloaded_subtitle_id` pin on its inventory URL.
+    static func protocolV3DownloadedSubtitleOrdinals(
+        _ inventory: [PlaybackV3SubtitleInventoryItem]
+    ) -> DownloadedSubtitleOrdinals {
+        var published: [String: Int] = [:]
+        for item in inventory where item.source.caseInsensitiveCompare("downloaded") == .orderedSame {
+            guard let url = item.url,
+                  let rowID = URLComponents(string: url)?.queryItems?
+                      .first(where: { $0.name == "downloaded_subtitle_id" })?.value,
+                  !rowID.isEmpty else { continue }
+            published[rowID] = item.combinedIndex
+        }
+        let next = (inventory.map(\.combinedIndex).max() ?? -1) + 1
+        return DownloadedSubtitleOrdinals(published: published, next: next)
+    }
+
+    enum ProtocolV3SidecarRestoreIntent: Equatable {
+        case renderLocally(Int64)
+        case serverRendered(Int64)
+    }
+
+    static func protocolV3SidecarRestoreIntent(
+        snapshot: Int64?,
+        selectedSubtitleIndex: Int?,
+        subtitleMode: String?,
+        isEmbedded: Bool = false
+    ) -> ProtocolV3SidecarRestoreIntent? {
+        guard !isEmbedded else { return nil }
+        guard let snapshot,
+              SubtitleTrackIdSpace.isSidecar(snapshot),
+              SubtitleTrackIdSpace.sidecarIndex(from: snapshot) == selectedSubtitleIndex else {
+            return nil
+        }
+        switch subtitleMode {
+        case let mode? where PlaybackProtocolV3.SubtitleMode.locallyRendered.contains(mode):
+            return .renderLocally(snapshot)
+        case PlaybackProtocolV3.SubtitleMode.burnIn:
+            return .serverRendered(snapshot)
+        default:
+            return nil
+        }
+    }
+
+    enum AutomaticProtocolV3SubtitlePlanAction: Equatable {
+        /// The plan already has the pick.
+        case keepPlan
+        /// Held in `deferredAutoSubtitlePick` until the running load or
+        /// replan commits; staging a replan now would be rolled back or
+        /// rejected as busy.
+        case holdUntilCommitted
+        case replan
+    }
+
+    /// What an automatic subtitle pick does to the active V3 plan. An audio
+    /// switch re-runs the automatic pass while its own replan is still
+    /// loading, so a pick the new plan lacks is held for that replan's exit
+    /// rather than dropped.
+    static func automaticProtocolV3SubtitlePlanAction(
+        pickCombinedIndex: Int?,
+        planCombinedIndex: Int?,
+        loadCommitted: Bool,
+        replanInFlight: Bool
+    ) -> AutomaticProtocolV3SubtitlePlanAction {
+        guard pickCombinedIndex != planCombinedIndex else { return .keepPlan }
+        return loadCommitted && !replanInFlight ? .replan : .holdUntilCommitted
+    }
+
+    /// Whether a clock tick during a seek is from before it: nearer the
+    /// position the seek left than its target.
+    nonisolated static func isStaleSeekTick(_ time: Double, origin: Double, target: Double) -> Bool {
+        abs(time - origin) < abs(time - target)
+    }
+
+    static func isUnexpectedBackwardPlaybackTime(
+        _ candidate: Double,
+        currentTime: Double,
+        explicitSeekInFlight: Bool
+    ) -> Bool {
+        guard !explicitSeekInFlight,
+              candidate.isFinite,
+              currentTime.isFinite else {
+            return false
+        }
+        return candidate + 0.75 < currentTime
+    }
+
+    struct ProtocolV3PendingTrackIntent: Equatable {
+        let audioIndex: Int?
+        let embeddedSubtitleIndex: Int?
+        let sidecarSubtitleTrackId: Int64?
+        let serverRenderedSubtitleTrackId: Int64?
+    }
+
+    static func protocolV3PendingTrackIntent(
+        plan: PlaybackV3Plan,
+        request: LoadRequest
+    ) -> ProtocolV3PendingTrackIntent {
+        let rendersSubtitleLocally = PlaybackProtocolV3.SubtitleMode.locallyRendered
+            .contains(plan.subtitle.mode)
+        return ProtocolV3PendingTrackIntent(
+            audioIndex: request.preferredAudioTrackIndex,
+            embeddedSubtitleIndex: rendersSubtitleLocally
+                ? (plan.subtitle.embedded?.streamIndex ?? request.preferredSubtitleTrackIndex)
+                : -1,
+            sidecarSubtitleTrackId: rendersSubtitleLocally && plan.subtitle.embedded == nil
+                ? request.preferredSidecarSubtitleTrackId
+                : nil,
+            serverRenderedSubtitleTrackId: plan.subtitle.mode == PlaybackProtocolV3.SubtitleMode.burnIn
+                ? plan.selectedSubtitleCombinedIndex.map { SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: $0) }
+                : nil
+        )
+    }
+
+    /// Completion handoff for a finished AI subtitle job: register the
+    /// controller-synthesized descriptor through the **same** sidecar path the
+    /// playback session uses, then auto-select it.
+    ///
+    /// The controller has already synthesized the combined index + stream URL
+    /// (the server's downloaded-subtitle listing carries neither) the way
+    /// Android's `SubtitleTrackMerge` does. Here we (1) record it in
+    /// `knownExternalSubtitles` as a `SubtitleUrl` so a later route/quality
+    /// switch re-registers it like any other sidecar (de-dupes on index),
+    /// (2) seed `pendingSidecarSubtitleTrackId` so `appendSidecarTracks`
+    /// auto-selects it once registered, and (3) call the active backend's
+    /// `registerSidecarSubtitles`, which fires `onSidecarTracksRegistered` →
+    /// `appendSidecarTracks`. No new selection plumbing.
+    private func registerCompletedAISubtitle(
+        _ descriptor: SidecarSubtitleDescriptor,
+        autoSelect: Bool = true
+    ) {
+        // Remember it (as a `SubtitleUrl`, the cache's shape) so a later
+        // route/quality switch re-registers it. De-dupe on combined index.
+        if !knownExternalSubtitles.contains(where: { $0.index == descriptor.index }) {
+            knownExternalSubtitles.append(SubtitleUrl(
+                index: descriptor.index,
+                language: descriptor.language,
+                codec: descriptor.codec,
+                label: descriptor.label,
+                source: descriptor.source,
+                forced: descriptor.forced,
+                url: descriptor.url.absoluteString
+            ))
+        }
+
+        // Seed the pending selection so the append path selects it for us —
+        // unless this is a `subtitle_ready` broadcast, which registers the
+        // track as selectable WITHOUT hijacking the viewer's current choice.
+        let trackId = SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: descriptor.index)
+        if autoSelect {
+            pendingSidecarSubtitleTrackId = trackId
+        }
+
+        Self.logger.info(
+            "[AI-SUB] registering completed subtitle index=\(descriptor.index, privacy: .public) lang=\(descriptor.language ?? "nil", privacy: .public) trackId=\(trackId, privacy: .public) autoSelect=\(autoSelect, privacy: .public)"
+        )
+        aetherPlaybackController.addExternalSubtitleTrack(
+            makeExternalSubtitleTrack(
+                url: descriptor.url,
+                name: descriptor.label,
+                language: descriptor.language,
+                isForced: descriptor.forced ?? false,
+                isHearingImpaired: descriptor.isHearingImpaired ?? false,
+                isDefault: descriptor.isDefault ?? false,
+                formatHint: descriptor.codec
+            ),
+            appTrackID: trackId
+        )
+        // The active V3 plan predates this track, so the plan-derived picker
+        // cannot name it. Keep the row session-side until a later plan's
+        // inventory publishes the same ordinal.
+        if !locallyRegisteredSidecarSubtitleTracks.contains(where: { $0.trackId == trackId }) {
+            locallyRegisteredSidecarSubtitleTracks.append(PlayerTrack(
+                trackId: trackId,
+                kind: .sub,
+                title: descriptor.label,
+                lang: descriptor.language,
+                codec: descriptor.codec,
+                audioChannelCount: nil,
+                bitrate: nil,
+                isDefault: descriptor.isDefault ?? false,
+                isForced: descriptor.forced ?? false,
+                isHearingImpaired: descriptor.isHearingImpaired ?? false,
+                isExternal: true,
+                isSelected: false,
+                ffIndex: nil,
+                srcId: descriptor.index
+            ))
+        }
+        adoptAetherInventory()
+    }
+
+    // MARK: - Live AI subtitle bridge
+    //
+    // Thin internal accessors the `LiveSubtitleCoordinator` adapters call.
+    // They exist because the adapters are distinct fileprivate types and so
+    // can't reach the VM's `private` playback/notice state directly. Each is a
+    // one-liner over an existing primitive; the interesting logic (offset-aware
+    // cue conversion, dedupe) lives in the sink adapter.
+
+    /// Open the synthetic live track on the active backend and add its picker
+    /// row. Returns the live track id.
+    @discardableResult
+    func installLiveSubtitleTrackRow(ordinal: Int, label: String?, language: String?) -> Int64 {
+        openLiveSubtitleTrack()
+        return appendLiveSubtitleTrack(ordinal: ordinal, label: label, language: language)
+    }
+
+    /// Select the live track (no-op selection of an already-installed track is
+    /// handled in the backends).
+    func selectLiveSubtitleTrack(trackId: Int64) {
+        if let track = subtitleTracks.first(where: { $0.trackId == trackId }) {
+            selectSubtitle(track)
+        }
+    }
+
+    /// Close the live track and remove its picker row. If it was selected,
+    /// `restoreLiveSubtitleSelection` is expected to follow (the coordinator
+    /// drives that separately).
+    func closeLiveSubtitleTrackRow(trackId: Int64) {
+        removeLiveSubtitleTrackRow(trackId: trackId)
+        closeLiveSubtitleTrack()
+    }
+
+    /// Remove only the picker row for a stale synthetic live track. Used when a
+    /// newer live renderer already owns the single primary product slot.
+    func removeLiveSubtitleTrackRow(trackId: Int64) {
+        subtitleTracks.removeAll { $0.trackId == trackId }
+    }
+
+    /// Seamless swap: arm the live track `trackId` to be closed AFTER the
+    /// handed-off persisted track is selected (in `appendSidecarTracks`), rather
+    /// than synchronously. A bounded fallback timer guarantees the row is never
+    /// stranded if the persisted selection never lands (e.g. the handoff listing
+    /// fetch failed after the server reported completion): the live track is
+    /// closed anyway once the window elapses.
+    func armDeferredLiveSubtitleClose(trackId: Int64) {
+        // Single-slot pending id: if a DIFFERENT live track is still awaiting its
+        // deferred close when a second job completes back-to-back, overwriting the
+        // pending id here (and cancelling its fallback timer below) would orphan
+        // the previous synthetic row forever. Close it now before re-arming so the
+        // earlier track is never stranded. (Common case: nothing pending, or the
+        // same id re-armed — both no-op this guard.)
+        if let previousId = pendingLiveSubtitleCloseTrackId, previousId != trackId {
+            removeLiveSubtitleTrackRow(trackId: previousId)
+        }
+        pendingLiveSubtitleCloseTrackId = trackId
+        deferredLiveSubtitleCloseTask?.cancel()
+        deferredLiveSubtitleCloseTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard let self, !Task.isCancelled else { return }
+            // Selection never landed — close the orphaned live row as a fallback
+            // and clear any lingering live selection.
+            guard self.pendingLiveSubtitleCloseTrackId == trackId else { return }
+            self.pendingLiveSubtitleCloseTrackId = nil
+            self.closeLiveSubtitleTrackRow(trackId: trackId)
+            if self.selectedSubtitleId.map(SubtitleTrackIdSpace.isAILive) == true {
+                self.disableSubtitles(savesPreference: false)
+            }
+            Self.logger.warning("[AI-SUB] deferred live-track close fired on fallback timeout (persisted selection never landed)")
+        }
+    }
+
+    /// Perform the deferred live-track close, if armed. Called when Aether's
+    /// inventory publishes the persisted sidecar selection, so the swap is
+    /// seamless (selection has already moved off the live row).
+    private func performDeferredLiveSubtitleCloseIfNeeded() {
+        guard let trackId = pendingLiveSubtitleCloseTrackId else { return }
+        pendingLiveSubtitleCloseTrackId = nil
+        deferredLiveSubtitleCloseTask?.cancel()
+        deferredLiveSubtitleCloseTask = nil
+        closeLiveSubtitleTrackRow(trackId: trackId)
+    }
+
+    /// Restore a prior subtitle selection (or disable if there was none).
+    /// Selecting an AI-live id is refused — that track is being torn down.
+    func restoreLiveSubtitleSelection(_ trackId: Int64?) {
+        guard let trackId,
+              !SubtitleTrackIdSpace.isAILive(trackId),
+              let track = subtitleTracks.first(where: { $0.trackId == trackId }) else {
+            // Only actively disable if a live track is still the selection; a
+            // restore to "none" shouldn't clobber a selection the user changed.
+            if selectedSubtitleId.map(SubtitleTrackIdSpace.isAILive) == true {
+                disableSubtitles(savesPreference: false)
+            }
+            return
+        }
+        selectSubtitle(track, savesPreference: false)
+    }
+
+    /// The "Preparing subtitles" notice shown while the first live cues land.
+    /// Kind-agnostic copy (this live path serves translate, transcribe, and
+    /// transcribe+translate jobs alike), so it avoids "Translating…" wording.
+    func showLiveSubtitlePreparingNotice() {
+        showNotice(
+            title: "Preparing subtitles",
+            message: "Generating subtitles for the current scene — playback resumes in a moment.",
+            tone: .info,
+            duration: 30
+        )
+        // Remember which notice is the preparing one so we can retract it the
+        // instant playback resumes — otherwise the 30s safety duration leaves
+        // "playback resumes in a moment" on screen long after it already has,
+        // which reads as a stuck/broken pause.
+        liveSubtitlePreparingNoticeId = activeNotice?.id
+    }
+
+    /// Clear the live-subtitle "Preparing subtitles" notice once playback has
+    /// resumed (first cues) or the job finished. No-ops if it has already been
+    /// replaced by a newer notice, so an unrelated message is never clobbered.
+    func dismissLiveSubtitlePreparingNotice() {
+        guard let id = liveSubtitlePreparingNoticeId else { return }
+        liveSubtitlePreparingNoticeId = nil
+        guard activeNotice?.id == id else { return }
+        noticeDismissTask?.cancel()
+        noticeDismissTask = nil
+        activeNotice = nil
+    }
+
+    /// Soft failure notice for the live subtitle path.
+    func showLiveSubtitleFailureNotice(_ message: String) {
+        showNotice(
+            title: "Subtitles unavailable",
+            message: message,
+            tone: .warning,
+            duration: 5
+        )
+    }
+
+    func cycleAudioTrack() {
+        guard !audioTracks.isEmpty else { return }
+        let nextIndex: Int
+        if let selectedAudioId,
+           let currentIndex = audioTracks.firstIndex(where: { $0.trackId == selectedAudioId }) {
+            nextIndex = audioTracks.index(after: currentIndex) % audioTracks.count
+        } else {
+            nextIndex = 0
+        }
+        selectAudio(audioTracks[nextIndex])
+    }
+
+    func cycleSubtitleTrack() {
+        guard !subtitleTracks.isEmpty else { return }
+
+        if selectedSubtitleId == nil {
+            selectSubtitle(subtitleTracks[0])
+            return
+        }
+
+        guard let selectedSubtitleId,
+              let currentIndex = subtitleTracks.firstIndex(where: { $0.trackId == selectedSubtitleId }) else {
+            disableSubtitles()
+            return
+        }
+
+        let nextIndex = subtitleTracks.index(after: currentIndex)
+        if nextIndex < subtitleTracks.count {
+            selectSubtitle(subtitleTracks[nextIndex])
+        } else {
+            disableSubtitles()
+        }
+    }
+
+    func toggleSubtitles() {
+        if selectedSubtitleId != nil {
+            disableSubtitles()
+        } else if let first = subtitleTracks.first {
+            selectSubtitle(first)
+        }
+    }
+
+    func seekToAdjacentChapter(forward: Bool) {
+        guard !chapters.isEmpty else { return }
+        let sorted = chapters.sorted { $0.time < $1.time }
+        let target: PlayerChapterInfo?
+        if forward {
+            target = sorted.first { $0.time > currentTime + 1.0 }
+        } else {
+            target = sorted.last { $0.time < currentTime - 1.0 }
+        }
+        if let target {
+            seekTo(seconds: target.time)
+        }
+    }
+
+    func toggleControls() {
+        showControls.toggle()
+        if showControls {
+            scheduleHideControls()
+        }
+    }
+
+    func revealControls() {
+        scheduleHideControls()
+    }
+
+    /// Hide the controls overlay immediately, cancelling any pending
+    /// auto-hide. Wired to the Siri Remote Menu button on tvOS so the user
+    /// can dismiss the overlay without waiting out the 5s timer; tapping
+    /// Menu again falls through to player dismissal via `PlayerView`.
+    func dismissControls() {
+        if isHoldSeeking {
+            cancelHoldSeek()
+        }
+        hideControlsTask?.cancel()
+        withAnimation { showControls = false }
+    }
+
+    /// Keep the controls overlay visible and cancel the pending auto-hide.
+    /// Used while the HUD is presented — otherwise the auto-hide timer can
+    /// tear the HUD's host out from under it.
+    func pinControlsVisible() {
+        hideControlsTask?.cancel()
+        showControls = true
+    }
+
+    /// Resume the standard auto-hide behavior after a pin.
+    func resumeAutoHide() {
+        scheduleHideControls()
+    }
+
+    /// Open the tvOS options HUD. Synchronous so the shell-level Menu handler
+    /// and the transport overlay see a consistent state within one run loop.
+    func openHUD() {
+        if isHoldSeeking {
+            cancelHoldSeek()
+        }
+        pinControlsVisible()
+        isHUDPresented = true
+        refreshSubtitleProviders()
+    }
+
+    #if os(tvOS)
+    func openSettingsHUD() {
+        requestedTVHUDEntryPoint = .settings
+        openHUD()
+    }
+
+    func consumeTVHUDEntryRequest() {
+        requestedTVHUDEntryPoint = nil
+    }
+    #endif
+
+    /// Close the tvOS options HUD and resume normal auto-hide. Safe to call
+    /// when the HUD is already closed.
+    func closeHUD() {
+        guard isHUDPresented else { return }
+        isHUDPresented = false
+        scheduleHideControls()
+    }
+
+    func cleanup() {
+        guard !isDisposed else { return }
+        externalPlaybackTask?.cancel()
+        externalPlaybackTask = nil
+        if let external = externalPlayback, viewingHasPlayed {
+            // Resume state stays with the provider's catalog, never Silo's progress API.
+            external.onFinish?(currentTime, duration, hasReachedEndOfFile)
+        }
+        #if os(iOS)
+        KyroPiPDiagnostics.record(
+            "player_cleanup",
+            state: "intent=\(aetherPlaybackController.shouldPlayWhenReady ? "play" : "paused")"
+        )
+        #endif
+        let partyAdapter = watchPartyAdapter
+        watchPartyAdapter = nil
+        partyAdapter?.playerDidExit()
+        Self.logger.info("PlayerViewModel.cleanup()")
+        // Resolve the credits latch against the current position now: the
+        // teardown below clears `creditsRange` before the final progress
+        // flush reads the latch.
+        didSkipCreditsToEnd = skippedCreditsToEnd
+        let reportedPosition = progressReportPosition
+        let currentItemCompleted = PlayerNextUpCompletionPolicy.shouldFinalizeAsCompleted(
+            isNextUpPresented: showNextUpScreen,
+            hasReachedEndOfFile: finishedAtEndOfFile,
+            currentTime: reportedPosition,
+            duration: duration,
+            promptSeconds: settings.nextUpPromptSeconds,
+            skippedCredits: skippedCreditsToEnd
+        )
+        recordCurrentPlaybackMutation()
+        // The server counts an episode watched past its threshold, which is
+        // often before the Next Up prompt. Leaving during the credits must
+        // still move the Series page on to the next episode.
+        let crossedWatchedThreshold = duration.isFinite && duration > 0
+            && reportedPosition / duration > Self.defaultWatchedFraction
+        SeriesPlaybackReturnInbox.publish(
+            seriesPlaybackReturn(completed: currentItemCompleted || crossedWatchedThreshold),
+            generation: seriesReturnGeneration
+        )
+        let pendingNaturalEndProgressTask = naturalEndProgressTask
+        naturalEndProgressTask = nil
+        // Before the session stop below, so the plan's summary precedes it.
+        endBufferingPlan()
+        BandwidthProbeScheduler.shared.playbackEnded(by: self)
+        isDisposed = true
+        #if os(iOS)
+        // A restore waiting on a cover that will now never mount has to be
+        // answered, or AVKit is left holding a handler for a dead session.
+        resolvePendingPictureInPictureRestore(false)
+        // The PiP coordinator is a singleton and its controller strongly
+        // retains the AVPlayerLayer, the AVPlayer, and everything hanging off
+        // it. SwiftUI's `dismantleUIView` normally releases it, but ordering
+        // there is not guaranteed relative to this teardown, so drop it here
+        // too rather than risk stranding the whole playback graph. Owner-keyed
+        // so a late teardown cannot unbind a newer session's PiP.
+        PictureInPictureCoordinator.shared.endSession(owner: self)
+        // A restore that staged this view model but never reached SwiftUI would
+        // otherwise hold the whole playback graph on a static.
+        PlayerPresentationRestoration.discardAdoption(for: self)
+        #endif
+        activePlaybackSessionId = nil
+        staleSessionRecoverySessionId = nil
+        currentWatchDetail = nil
+        currentSelectedVersion = nil
+        clearPlaybackStats()
+        introRange = nil
+        creditsRange = nil
+        recapRange = nil
+        markerReconcileTask?.cancel()
+        markerReconcileTask = nil
+        markerReconcileRequestId = nil
+        introSkipPrompt.reset()
+        autoSkippedCreditsKey = nil
+        autoSkippedRecapKeys = []
+        knownExternalSubtitles = []
+        locallyRegisteredSidecarSubtitleTracks = []
+        localProtocolV3SubtitleSelection = nil
+        subtitleAI.reset()
+        subtitleSync.bind(mediaFileId: nil)
+        deferredLiveSubtitleCloseTask?.cancel()
+        deferredLiveSubtitleCloseTask = nil
+        pendingLiveSubtitleCloseTrackId = nil
+        pendingServerRenderedSubtitleTrackId = nil
+        noticeDismissTask?.cancel()
+        noticeDismissTask = nil
+        remoteDismissTask?.cancel()
+        remoteDismissTask = nil
+        activeNotice = nil
+        tearDownHoldSeek()
+        hideControlsTask?.cancel()
+        progressTask?.cancel()
+        staleSessionRecoveryTask?.cancel()
+        staleSessionRecoveryTask = nil
+        // Leaving the player stops a running reconnect.
+        cancelReconnect()
+        settingsRefreshTask?.cancel()
+        settingsRefreshTask = nil
+        seekIntervalRefreshTask?.cancel()
+        seekIntervalRefreshTask = nil
+        freshLoadTask?.cancel()
+        freshLoadOwnsFailureHandling = false
+        streamLoadGeneration &+= 1
+        protocolV3ReplanTask?.cancel()
+        protocolV3ReplanTask = nil
+        seekReplanTask?.cancel()
+        seekReplanTask = nil
+        networkQuality?.stop()
+        networkPathObservation?.cancel()
+        networkPathObservation = nil
+        if let outputRouteObserverToken {
+            NotificationCenter.default.removeObserver(outputRouteObserverToken)
+            self.outputRouteObserverToken = nil
+        }
+        if let systemCaptionObserverToken {
+            NotificationCenter.default.removeObserver(systemCaptionObserverToken)
+            self.systemCaptionObserverToken = nil
+        }
+        if let seekrPreviewsEnabledObserverToken {
+            NotificationCenter.default.removeObserver(seekrPreviewsEnabledObserverToken)
+            self.seekrPreviewsEnabledObserverToken = nil
+        }
+        if let foregroundExitObserverToken {
+            NotificationCenter.default.removeObserver(foregroundExitObserverToken)
+            self.foregroundExitObserverToken = nil
+        }
+        surfaceVisibilityObservers.forEach(NotificationCenter.default.removeObserver)
+        surfaceVisibilityObservers = []
+        #if os(macOS)
+        macBufferingSummaryObservers.forEach(NotificationCenter.default.removeObserver)
+        macBufferingSummaryObservers = []
+        #endif
+        nextUpLookupTask?.cancel()
+        nextUpOnDeckTask?.cancel()
+        nextUpCountdownTask?.cancel()
+        shuffleTask?.cancel()
+        shuffleRefreshTask?.cancel()
+        skipDebounceTask?.cancel()
+        seekFilterTimeoutTask?.cancel()
+        holdSeekTask?.cancel()
+        holdSeekAutoRampTask?.cancel()
+        sleepTimer.cancel()
+        nowPlaying.detach()
+
+        // Final offline progress flush before teardown — the counterpart of
+        // the online path's `stopSession` report below. Captures the final
+        // position before teardown; the strong capture keeps the last offline
+        // write. Offline playback has no server session of its own (the fresh-load
+        // path finalized any prior one), so skip the server stop below —
+        // it would report the offline position against a stale session.
+        let stopServerSessionOnTeardown = offlinePlaybackContext == nil
+        var offlineProgressWrite: Task<Void, Never>?
+        if let offline = offlinePlaybackContext {
+            let finalOfflinePosition = completionProgressPositionForCurrentItem()
+            let endedNaturally = PlayerNextUpCompletionPolicy.shouldFinalizeAsCompleted(
+                isNextUpPresented: showNextUpScreen,
+                hasReachedEndOfFile: finishedAtEndOfFile,
+                currentTime: currentTime,
+                duration: duration,
+                promptSeconds: settings.nextUpPromptSeconds,
+                skippedCredits: skippedCreditsToEnd
+            )
+            // Strong capture on purpose: this is the last write of the
+            // resume point and must not be dropped because the VM was
+            // released between dismiss and the hop to the MainActor.
+            offlineProgressWrite = Task { @MainActor in
+                self.recordOfflineProgress(
+                    context: offline,
+                    position: finalOfflinePosition,
+                    markCompleted: endedNaturally
+                )
+            }
+        }
+
+        // Same completion rule as the offline branch above. Closing from the
+        // Next Up prompt (or after EOF) means the user finished the item, so
+        // the final `stopSession` has to report the duration rather than the
+        // paused position a few seconds short of it — otherwise online
+        // playback never latches watched from that surface, while offline
+        // playback does.
+        let finalPosition = completionProgressPositionForCurrentItem()
+        let scrubPreviewShutdown = disposeAetherPlayback()
+        #if os(macOS)
+        aetherPlaybackController.releaseDisplaySleepPrevention()
+        #endif
+
+        let connectivityToken = realtimeConnectivityObserverToken
+        realtimeConnectivityObserverToken = nil
+        let unavailabilityToken = realtimeUnavailabilityObserverToken
+        realtimeUnavailabilityObserverToken = nil
+        let cleanupCompletion = Task { [offlineProgressWrite] in
+            // The offline counterpart of the final `stopSession` below; a
+            // page waiting on this teardown reloads after it.
+            await offlineProgressWrite?.value
+            await scrubPreviewShutdown?.value
+            // Remove our availability observer before tearing down the realtime
+            // client; normal fresh-load unbinds preserve this observer.
+            if let connectivityToken {
+                await realtimeClient.removeConnectivityObserver(connectivityToken)
+            }
+            if let unavailabilityToken {
+                await realtimeClient.removeUnavailabilityObserver(unavailabilityToken)
+            }
+            await realtimeClient.unbind()
+            await pendingNaturalEndProgressTask?.value
+            if stopServerSessionOnTeardown {
+                await sessionBridge.stopSession(position: finalPosition, isPaused: true)
+            }
+            #if os(iOS) || os(macOS)
+            refreshHomeAfterPlaybackWrite?()
+            #endif
+        }
+        cleanupCompletionTask = cleanupCompletion
+        PlayerCleanupBarrier.record(cleanupCompletion, generation: cleanupBarrierGeneration)
+    }
+
+    func waitForCleanupCompletion() async {
+        // onDisappear calls cleanup immediately before unregistering the TV
+        // receiver. Yield briefly if presentation teardown has not installed
+        // the final progress task yet.
+        for _ in 0..<100 where cleanupCompletionTask == nil {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        await cleanupCompletionTask?.value
+    }
+
+    /// Safety net: SwiftUI normally drives `cleanup()` from `PlayerView.onDisappear`,
+    /// but if that path is missed (edge cases in sheet/NavigationStack teardown)
+    /// we still need to guarantee the backend is torn down so audio can't
+    /// outlive the view. `dispose()` is idempotent.
+    deinit {
+        print("[CMP-LIFE] deinit PlayerViewModel")
+        MainActor.assumeIsolated {
+            #if os(iOS)
+            KyroPiPDiagnostics.record("player_view_model_deinit")
+            #endif
+            Self.logger.info("PlayerViewModel.deinit")
+            isDisposed = true
+            if let systemCaptionObserverToken {
+                NotificationCenter.default.removeObserver(systemCaptionObserverToken)
+            }
+            if let seekrPreviewsEnabledObserverToken {
+                NotificationCenter.default.removeObserver(seekrPreviewsEnabledObserverToken)
+            }
+            if let outputRouteObserverToken {
+                NotificationCenter.default.removeObserver(outputRouteObserverToken)
+            }
+            if let foregroundExitObserverToken {
+                NotificationCenter.default.removeObserver(foregroundExitObserverToken)
+            }
+            freshLoadTask?.cancel()
+            markerReconcileTask?.cancel()
+            streamLoadGeneration &+= 1
+            protocolV3ReplanTask?.cancel()
+            seekReplanTask?.cancel()
+            staleSessionRecoveryTask?.cancel()
+            disposeAetherPlayback()
+            let realtimeClient = self.realtimeClient
+            Task {
+                await realtimeClient?.unbind()
+            }
+        }
+    }
+
+    /// Binds the control socket to a committed session under the owner and
+    /// installation that started it.
+    private func bindRealtimeControl(sessionId: String) async {
+        guard let authority = await sessionBridge.committedProtocolV3Authority(sessionId: sessionId) else { return }
+        await realtimeClient.bind(sessionId: sessionId, authority: authority)
+    }
+
+    func handleRealtimeEvent(_ event: PlaybackRealtimeEventEnvelope) async {
+        guard event.sessionId == activePlaybackSessionId else { return }
+        switch event.name {
+        case .markersUpdated:
+            guard let payload = PlaybackRealtimeMarkersUpdatedPayload(payload: event.payload) else {
+                Self.logger.warning("[CMP-MARKERS] ignored malformed markers_updated event")
+                return
+            }
+            if let payloadSessionId = payload.sessionId, payloadSessionId != event.sessionId {
+                return
+            }
+            guard payload.fileId == currentSelectedVersion?.fileId else {
+                return
+            }
+            applyMarkerRanges(
+                intro: payload.introUpdate.resolving(current: introRange),
+                credits: payload.creditsUpdate.resolving(current: creditsRange),
+                recap: payload.recapUpdate.resolving(current: recapRange)
+            )
+            // An in-flight reconcile snapshot may predate this event. Replace
+            // it rather than drop it: the event can omit a kind whose update
+            // was missed while the socket was down.
+            if markerReconcileRequestId != nil {
+                reconcileMarkersAfterRealtimeConnect()
+            }
+        case .chapterThumbnailReady:
+            break
+        case .subtitleTimingChanged:
+            guard let payload = PlaybackRealtimeSubtitleTimingChangedPayload(payload: event.payload) else {
+                Self.logger.warning("[CMP-SUB] ignored malformed subtitle_timing_changed event")
+                return
+            }
+            if let payloadSessionId = payload.sessionId, payloadSessionId != event.sessionId {
+                return
+            }
+            guard let fileId = currentSelectedVersion?.fileId, payload.fileId == fileId else {
+                return
+            }
+            subtitleSync.bind(mediaFileId: fileId)
+            subtitleSync.timingChanged(key: payload.syncKey)
+        case .subtitleSyncUpdated:
+            guard let payload = PlaybackRealtimeSubtitleSyncUpdatedPayload(payload: event.payload) else {
+                Self.logger.warning("[CMP-SUB] ignored malformed subtitle_sync_updated event")
+                return
+            }
+            if let payloadSessionId = payload.sessionId, payloadSessionId != event.sessionId {
+                return
+            }
+            guard let fileId = currentSelectedVersion?.fileId, payload.fileId == fileId else {
+                return
+            }
+            subtitleSync.bind(mediaFileId: fileId)
+            subtitleSync.syncUpdated(payload)
+        case .subtitleTranslationStarted,
+             .subtitleTranslationCues,
+             .subtitleTranslationCompleted,
+             .subtitleTranslationFailed,
+             .subtitleReady:
+            // AI subtitle live-streaming events. Decode the typed payload
+            // and hand it to the controller, which scopes it to the active job
+            // and drives the live coordinator.
+            guard let subtitleEvent = PlaybackRealtimeSubtitleEvent(
+                name: event.name,
+                payload: event.payload
+            ) else {
+                Self.logger.warning("[AI-LIVE] ignored malformed \(event.name.rawValue, privacy: .public) event")
+                return
+            }
+            subtitleAI.handle(subtitleEvent)
+        case .unknown(let raw):
+            Self.logger.debug("[CMP-RT] ignoring unknown realtime event \(raw, privacy: .public)")
+        }
+    }
+
+    private func handleRealtimeCommand(_ command: PlaybackRealtimeCommandEnvelope) async throws {
+        if isWatchPartyPlayback {
+            switch command.name {
+            case .pause:
+                if isAdminIssued(command) {
+                    pauseForLocalPreparation()
+                    return
+                }
+                guard canRequestPlayPause else { throw PlaybackRealtimeCommandExecutionError.unsupportedCommand }
+                _ = watchPartyAdapter?.request(.pause)
+                return
+            case .unpause:
+                if isAdminIssued(command) {
+                    resumeAfterLocalPreparation()
+                    return
+                }
+                guard canRequestPlayPause else { throw PlaybackRealtimeCommandExecutionError.unsupportedCommand }
+                _ = watchPartyAdapter?.request(.play)
+                return
+            case .playPause:
+                if isAdminIssued(command) {
+                    if isPlaying { pauseForLocalPreparation() }
+                    else { resumeAfterLocalPreparation() }
+                    return
+                }
+                guard canRequestPlayPause else { throw PlaybackRealtimeCommandExecutionError.unsupportedCommand }
+                togglePlayPause()
+                return
+            case .seek:
+                guard canRequestSeek else { throw PlaybackRealtimeCommandExecutionError.unsupportedCommand }
+            case .stop, .terminate:
+                cleanup()
+                requestRemoteDismiss()
+                return
+            default: break
+            }
+        }
+        switch command.name {
+        case .pause:
+            aetherPlaybackController.pause()
+            if isAdminIssued(command) {
+                showNotice(
+                    title: "Playback paused by admin",
+                    message: "An administrator paused this session.",
+                    tone: .warning,
+                    duration: 6
+                )
+            }
+        case .unpause:
+            aetherPlaybackController.play()
+            if isAdminIssued(command) {
+                showNotice(
+                    title: "Playback resumed by admin",
+                    message: "An administrator resumed this session.",
+                    tone: .info,
+                    duration: 6
+                )
+            }
+        case .playPause:
+            let wasPaused = aetherPlaybackController.isPaused
+            if wasPaused {
+                aetherPlaybackController.play()
+            } else {
+                aetherPlaybackController.pause()
+            }
+            if isAdminIssued(command) {
+                showNotice(
+                    title: wasPaused ? "Playback resumed by admin" : "Playback paused by admin",
+                    message: wasPaused
+                        ? "An administrator resumed this session."
+                        : "An administrator paused this session.",
+                    tone: wasPaused ? .info : .warning,
+                    duration: 6
+                )
+            }
+        case .seek:
+            guard !isLoading else {
+                throw PlaybackRealtimeCommandExecutionError.playerNotReady
+            }
+            guard let position = command.payload.number(
+                forKeys: "position",
+                "position_seconds",
+                "seconds"
+            ) else {
+                throw PlaybackRealtimeCommandExecutionError.missingSeekPosition
+            }
+            applyRemoteSeek(to: position)
+            if isAdminIssued(command) {
+                showNotice(
+                    title: "Playback changed by admin",
+                    message: "An administrator changed the playback position.",
+                    tone: .warning,
+                    duration: 5
+                )
+            }
+        case .displayMessage:
+            showNotice(
+                title: command.payload.string(forKeys: "title")
+                    ?? (isAdminIssued(command) ? "Message from admin" : "Playback notice"),
+                message: command.payload.string(forKeys: "message")
+                    ?? "A server message was received.",
+                tone: isAdminIssued(command) ? .warning : .info,
+                duration: isAdminIssued(command) ? 10 : 8
+            )
+        case .serverRestarting:
+            showNotice(
+                title: command.payload.string(forKeys: "title") ?? "Server restarting",
+                message: command.payload.string(forKeys: "message")
+                    ?? "Playback may end shortly while the server restarts.",
+                tone: .warning,
+                duration: 10
+            )
+        case .serverShuttingDown:
+            showNotice(
+                title: command.payload.string(forKeys: "title") ?? "Server shutting down",
+                message: command.payload.string(forKeys: "message")
+                    ?? "Playback may end shortly while the server shuts down.",
+                tone: .warning,
+                duration: 10
+            )
+        case .stop, .terminate:
+            aetherPlaybackController.pause()
+            if isAdminIssued(command) {
+                let isTerminate = command.name == .terminate
+                showNotice(
+                    title: command.payload.string(forKeys: "title")
+                        ?? (isTerminate ? "Session ended by admin" : "Playback stopped by admin"),
+                    message: command.payload.string(forKeys: "message")
+                        ?? (isTerminate
+                            ? "An administrator ended this playback session."
+                            : "An administrator stopped this playback session."),
+                    tone: .warning,
+                    duration: 1.2
+                )
+                requestRemoteDismiss(after: 0.8)
+            } else {
+                requestRemoteDismiss()
+            }
+        case .setVolume, .playMedia, .setAudioTrack, .setSubtitleTrack:
+            throw PlaybackRealtimeCommandExecutionError.unsupportedCommand
+        }
+    }
+
+    private func applyRemoteSeek(to seconds: Double) {
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+
+        let cappedTarget: Double
+        if duration > 0 {
+            cappedTarget = min(max(0, seconds), duration)
+        } else {
+            cappedTarget = max(0, seconds)
+        }
+        Self.logger.info(
+            "[CMP-SEEK] remote seek requested seconds=\(seconds, privacy: .public) capped=\(cappedTarget, privacy: .public) duration=\(self.duration, privacy: .public)"
+        )
+        commitSeek(to: cappedTarget, source: "remoteCommand")
+    }
+
+    private func showNotice(
+        title: String,
+        message: String,
+        tone: PlayerNoticeTone,
+        symbol: String? = nil,
+        duration: TimeInterval
+    ) {
+        let notice = PlayerNotice(title: title, message: message, tone: tone, symbol: symbol)
+        activeNotice = notice
+        noticeDismissTask?.cancel()
+        noticeDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(duration))
+            guard !Task.isCancelled, let self, self.activeNotice?.id == notice.id else { return }
+            self.activeNotice = nil
+            self.noticeDismissTask = nil
+        }
+    }
+
+    /// The server ended this session for good: an administrator stopped it
+    /// while the player could not be told over the control socket. Leave the
+    /// way an administrator stop does, instead of renewing into a new session.
+    private func leaveServerEndedSession() {
+        guard !isDisposed, !serverEndedSessionHandled else { return }
+        serverEndedSessionHandled = true
+        cancelReconnect()
+        aetherPlaybackController.pause()
+        showNotice(
+            title: "Playback stopped by admin",
+            message: "An administrator ended this playback session.",
+            tone: .warning,
+            duration: 1.2
+        )
+        requestRemoteDismiss(after: 0.8)
+    }
+
+    /// Stops playback and its server session now, then asks the view to
+    /// close however it was shown: a cover, or on tvOS a pushed route that
+    /// clearing `presentedPlayer` doesn't reach. The TV's remote receiver
+    /// uses this, so a phone taking over never leaves the outgoing title
+    /// playing under the next one.
+    func stopAndClose() {
+        cleanup()
+        requestRemoteDismiss()
+    }
+
+    private func requestRemoteDismiss(after delay: TimeInterval = 0) {
+        noticeDismissTask?.cancel()
+        remoteDismissTask?.cancel()
+        remoteDismissTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.noticeDismissTask = nil
+            if delay <= 0 {
+                self.activeNotice = nil
+            }
+            self.remoteDismissToken = UUID()
+            self.remoteDismissTask = nil
+        }
+    }
+
+    private func isAdminIssued(_ command: PlaybackRealtimeCommandEnvelope) -> Bool {
+        command.issuedBy?.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "admin"
+    }
+
+
+    private func makeStreamRequest(
+        session: PlaybackSessionResponse,
+        additionalHeaders: [String: String] = [:],
+        requiresHeaderAuthenticatedMedia: Bool = false,
+        allowsAuthorizedMediaOrigins: Bool = false
+    ) async -> StreamRequest? {
+        let owner = await TokenStore.shared.captureOrdinaryRequestAuth()
+        let serverUrl: String
+        let token: String?
+        if let owner {
+            serverUrl = owner.account.serverURL
+            token = owner.accessToken
+        } else {
+            // Preserve legacy transport resolution without an account snapshot;
+            // refreshable V3 loads require a captured owner in loadAether.
+            serverUrl = await SiloAPI.shared.currentServerUrl()
+            token = await SiloAPI.shared.currentAccessToken()
+        }
+        return StreamRequest.resolve(
+            rawURL: session.streamUrl,
+            serverURL: serverUrl,
+            additionalHeaders: additionalHeaders,
+            accessToken: token,
+            requiresHeaderAuthenticatedMedia: requiresHeaderAuthenticatedMedia,
+            // The caller knows the attempt's session, so a proxy URL naming a
+            // different one is rejected rather than trusted.
+            authorizedMediaOriginSessionId: allowsAuthorizedMediaOrigins
+                ? session.sessionId
+                : nil,
+            capturedAuth: owner
+        )
+    }
+
+    /// Turns a server-supplied URL (absolute or API-rooted) into an absolute URL.
+    /// Local `file://` URLs (offline downloads and their cached sidecar
+    /// subtitles) pass through untouched. v2 decisions mint every media,
+    /// subtitle and font URL under `/api/v2/`; a relative path without an API
+    /// root is refused rather than assigned a version.
+    private func resolveServerUrl(_ raw: String, serverUrl: String) -> URL? {
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://") || raw.hasPrefix("file://") {
+            return URL(string: raw)
+        }
+
+        guard !serverUrl.isEmpty, raw.hasPrefix("/api/") else { return nil }
+        return URL(string: serverUrl + raw)
+    }
+
+    private func stablePlaybackFailureToken(for message: String) -> String {
+        let lowered = message.lowercased()
+        if lowered.contains("timed out") || lowered.contains("timeout") { return "timeout" }
+        if lowered.contains("404") || lowered.contains("not found") { return "not_found" }
+        if lowered.contains("401") || lowered.contains("403") || lowered.contains("unauthorized") || lowered.contains("forbidden") {
+            return "auth"
+        }
+        if lowered.contains("cancel") { return "cancelled" }
+        if lowered.contains("decode") { return "decode" }
+        if lowered.contains("remux") || lowered.contains("mux") { return "remux" }
+        if lowered.contains("network") || lowered.contains("connection") { return "network" }
+        return "playback_error"
+    }
+
+    private func audioSelectionIndex(for track: PlayerTrack) -> Int? {
+        track.srcId ?? track.ffIndex
+    }
+
+    /// Re-registers session-created sidecars (finished AI jobs, downloaded
+    /// subtitles) with a freshly loaded engine under V3.
+    ///
+    /// Their `knownExternalSubtitles` entries were recorded for exactly this
+    /// moment, but the V3 picker-only gate skips the generic re-registration
+    /// path, so without this a quality/route replan leaves the row selected
+    /// in the menu with no Aether resource behind it.
+    private func reregisterLocallyCreatedSidecarsWithAether() {
+        var reregistered = false
+        for local in locallyRegisteredSidecarSubtitleTracks {
+            guard !aetherPlaybackController.containsSubtitle(appTrackID: local.trackId),
+                  let known = knownExternalSubtitles.first(where: {
+                      SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: $0.index) == local.trackId
+                  }),
+                  let url = resolveServerUrl(known.url, serverUrl: resolvedServerUrl) else {
+                continue
+            }
+            aetherPlaybackController.addExternalSubtitleTrack(
+                makeExternalSubtitleTrack(
+                    url: url,
+                    name: known.label,
+                    language: known.language,
+                    isForced: known.forced ?? false,
+                    isHearingImpaired: known.hearingImpaired ?? false,
+                    isDefault: known.default ?? false,
+                    formatHint: known.codec
+                ),
+                appTrackID: local.trackId
+            )
+            reregistered = true
+        }
+        guard reregistered else { return }
+        // If the local row was the active selection, the new engine load lost
+        // it; arm the existing pending path so inventory adoption reasserts
+        // the engine-side selection once the load is established. The plan
+        // cannot contest this id — it does not know the track.
+        if let selectedSubtitleId,
+           locallyRegisteredSidecarSubtitleTracks.contains(where: { $0.trackId == selectedSubtitleId }) {
+            pendingSidecarSubtitleTrackId = selectedSubtitleId
+        }
+        adoptAetherInventory()
+    }
+
+    private func loadPendingExternalSubtitles() {
+        if activePreparedProtocolV3 != nil {
+            // `subtitle.inventory` feeds the V3 picker. Loading all of its URLs
+            // into Aether gives the engine an uncommitted set of alternatives
+            // and lets language/default policy override `subtitle.artifact`.
+            // The exact selected artifact was already declared in AetherLoadSpec.
+            pendingExternalSubtitles = []
+            // A sidecar this session created itself (finished AI job or
+            // downloaded subtitle) is not in the plan, so a reload rebuilds
+            // the alias table without it while the picker still shows its
+            // row; only those tracks are re-registered here.
+            reregisterLocallyCreatedSidecarsWithAether()
+            Self.logger.info("[CMP-SUB] keeping V3 subtitle inventory picker-only")
+            return
+        }
+        let restoredFromKnownCache = pendingExternalSubtitles.isEmpty
+        let allPending = restoredFromKnownCache
+            ? knownExternalSubtitles
+            : pendingExternalSubtitles
+        let pending = allPending
+        pendingExternalSubtitles = []
+        if pending.isEmpty {
+            Self.logger.info(
+                "[CMP-SUB] no external subtitles to register route=\(self.activeRouteLabel, privacy: .public) currentTracks=\(self.subtitleTracks.count, privacy: .public)"
+            )
+        }
+
+        Self.logger.info(
+            "[CMP-SUB] resolving external subtitles count=\(pending.count, privacy: .public) route=\(self.activeRouteLabel, privacy: .public) supportsExternal=true fromKnownCache=\(restoredFromKnownCache, privacy: .public)"
+        )
+
+        var descriptors: [SidecarSubtitleDescriptor] = []
+        descriptors.reserveCapacity(pending.count)
+        for sub in pending {
+            guard let url = resolveServerUrl(sub.url, serverUrl: resolvedServerUrl) else {
+                Self.logger.warning("Skipping external subtitle with unresolved URL")
+                continue
+            }
+            descriptors.append(SidecarSubtitleDescriptor(
+                index: sub.index,
+                language: sub.language,
+                codec: sub.codec,
+                label: sub.label,
+                source: sub.source,
+                forced: sub.forced,
+                isDefault: sub.default,
+                isHearingImpaired: sub.hearingImpaired,
+                fontBundleUrl: sub.fontBundleUrl.flatMap {
+                    resolveServerUrl($0, serverUrl: resolvedServerUrl)
+                },
+                url: url
+            ))
+        }
+        if !pending.isEmpty, descriptors.isEmpty {
+            Self.logger.warning("[CMP-SUB] no external subtitle descriptors survived URL resolution")
+        }
+        Self.logger.info(
+            "[CMP-SUB] registering sidecar subtitles descriptors=\(descriptors.count, privacy: .public) route=\(self.activeRouteLabel, privacy: .public)"
+        )
+        for descriptor in descriptors {
+            let appTrackID = SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: descriptor.index)
+            aetherPlaybackController.addExternalSubtitleTrack(
+                makeExternalSubtitleTrack(
+                    url: descriptor.url,
+                    name: descriptor.label,
+                    language: descriptor.language,
+                    isForced: descriptor.forced ?? false,
+                    isHearingImpaired: descriptor.isHearingImpaired ?? false,
+                    isDefault: descriptor.isDefault ?? false,
+                    formatHint: descriptor.codec
+                ),
+                appTrackID: appTrackID,
+                fontRequest: descriptor.fontBundleUrl.map(makeSubtitleFontRequest)
+            )
+        }
+        adoptAetherInventory()
+    }
+
+    /// Sidecar track for Aether, scoped to Silo's subtitle request headers and
+    /// the active timeline offset.
+    private func makeExternalSubtitleTrack(
+        url: URL,
+        name: String?,
+        language: String?,
+        isForced: Bool,
+        isHearingImpaired: Bool,
+        isDefault: Bool,
+        formatHint: String?
+    ) -> ExternalSubtitleTrack {
+        ExternalSubtitleTrack(
+            url: url,
+            name: name,
+            language: language,
+            isForced: isForced,
+            isHearingImpaired: isHearingImpaired,
+            isDefault: isDefault,
+            httpHeaders: aetherSubtitleRequestHeaders(for: url),
+            httpRequestAuthorization: aetherPlaybackController.activeSpec?.subtitleRequestAuthorization(for: url),
+            formatHint: formatHint,
+            nativeTimelineOffsetSeconds: aetherPlaybackController.activeSpec?.timeline.timelineOffsetSeconds ?? 0
+        )
+    }
+
+    private func makeSubtitleFontRequest(_ url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.allHTTPHeaderFields = aetherSubtitleRequestHeaders(for: url)
+        return request
+    }
+
+    /// Aether interprets nil subtitle headers as "inherit every media header."
+    /// Always pass an explicit dictionary so Silo's bearer is shared only with
+    /// the active media/server origin and never with an absolute third-party
+    /// sidecar URL.
+    private func aetherSubtitleRequestHeaders(for resourceURL: URL) -> [String: String] {
+        guard let spec = aetherPlaybackController.activeSpec else { return [:] }
+        if spec.subtitleRequestAuthorization != nil {
+            return spec.refreshableSubtitleHeaders(for: resourceURL)
+        }
+        let serverOrigin = URL(string: resolvedServerUrl)
+        return AetherLoadSpec.subtitleRequestHeaders(
+            spec.options.httpHeaders,
+            resourceURL: resourceURL,
+            trustedOriginURLs: [spec.sourceURL, serverOrigin].compactMap { $0 }
+        )
+    }
+
+    /// Every audio-track change — user pick, resume of a persisted or
+    /// detail-screen choice, post-route-switch restore — reaches the backend
+    /// through here, so `reason` is required rather than defaulted: a report
+    /// that cannot tell "the user chose this" from "we restored this" cannot
+    /// answer the question these breadcrumbs exist for.
+    private func applyAudioTrackSelection(_ trackId: Int64, reason: String) {
+        recordAudioTrackSelectionBreadcrumb(trackId, reason: reason, viaServerReplan: false)
+        guard let id = Int(exactly: trackId) else { return }
+        aetherPlaybackController.selectAudioTrack(id: id)
+    }
+
+    /// Same contract as `applyAudioTrackSelection`: the one funnel every
+    /// primary-subtitle change passes through, with an explicit `reason`.
+    /// `nil` means subtitles off.
+    private func applySubtitleTrackSelection(_ trackId: Int64?, reason: String) {
+        Self.logger.info(
+            "[CMP-SUB] apply primary selection trackId=\(trackId.map(String.init) ?? "nil", privacy: .public) route=\(self.activeRouteLabel, privacy: .public)"
+        )
+        recordSubtitleTrackSelectionBreadcrumb(trackId, reason: reason, viaServerReplan: false)
+        if let trackId, SubtitleTrackIdSpace.isAILive(trackId) {
+            // Synthetic live cues are rendered by Silo's overlay and must
+            // never be forwarded into Aether's media-track id namespace.
+            aetherPlaybackController.selectSubtitleTrack(id: nil)
+        } else {
+            aetherPlaybackController.selectSubtitleTrack(id: trackId)
+        }
+    }
+
+    // MARK: - Track-selection breadcrumbs
+    //
+    // Split out of the two apply funnels because the funnels are not the only
+    // way a track change happens: when a Protocol V3 plan is active the change
+    // is executed by the *server* — the pick is sent up as a replan and comes
+    // back as a new plan — so `selectAudio`/`selectSubtitle`/`disableSubtitles`
+    // return before ever reaching an apply call. Without these helpers the only
+    // trace of a server-side track change is the bridge's replan breadcrumb,
+    // whose `reason` is the coarse classification (`audio_track_changed`) and
+    // which knows nothing about the ordinal or the subtitle source.
+    //
+    // Both are strictly side-effect free — they read state and emit, nothing
+    // else. That is the invariant that lets them be called on the replan path:
+    // recording an intent must not apply it, because applying a track locally
+    // before the server's replacement plan lands is exactly the desync these
+    // breadcrumbs exist to diagnose.
+
+    /// Records an audio pick. `viaServerReplan` distinguishes "the engine was
+    /// told to switch" from "the pick was sent to the server and playback
+    /// reloads" — a real difference in what the user sees (an instant switch
+    /// versus a rebuffer), and one no registered key expresses, so it goes in
+    /// the free-text message.
+    private func recordAudioTrackSelectionBreadcrumb(
+        _ trackId: Int64,
+        reason: String,
+        viaServerReplan: Bool
+    ) {
+        #if os(iOS) || os(tvOS)
+        // The track's title and language are user-visible content metadata,
+        // not diagnostics; the registry offers no key for them and they are
+        // deliberately not smuggled into `msg`. The ordinal is enough to
+        // correlate against the plan's selected_tracks.
+        DiagTrace.breadcrumb(
+            .essential,
+            category: .playback,
+            tag: "Player",
+            message: viaServerReplan
+                ? "audio track selected, requesting server replan"
+                : "audio track selected",
+            attrs: [
+                "reason": .string(reason),
+                "sink": .string(
+                    audioTracks.first(where: { $0.trackId == trackId })
+                        .flatMap(audioSelectionIndex(for:))
+                        .map { "audio_ordinal_\($0)" } ?? "audio_ordinal_unknown"
+                ),
+                "play_method": .string(activeRouteLabel),
+            ]
+        )
+        #endif
+    }
+
+    /// Records a primary-subtitle pick, or an explicit "off" when `trackId` is
+    /// nil. Same `viaServerReplan` contract as the audio helper.
+    private func recordSubtitleTrackSelectionBreadcrumb(
+        _ trackId: Int64?,
+        reason: String,
+        viaServerReplan: Bool
+    ) {
+        #if os(iOS) || os(tvOS)
+        // `sink` carries the track's *kind*, not its identity: whether the
+        // cues come from an embedded stream, a server sidecar, or a live AI
+        // track is the thing that explains a rendering complaint, and unlike
+        // the title it is not user content.
+        let action = trackId == nil ? "subtitles disabled" : "subtitle track selected"
+        DiagTrace.breadcrumb(
+            .essential,
+            category: .playback,
+            tag: "Player",
+            message: viaServerReplan ? "\(action), requesting server replan" : action,
+            attrs: [
+                "reason": .string(reason),
+                "sink": .string(trackId.map(Self.subtitleTrackKind) ?? "none"),
+                "play_method": .string(activeRouteLabel),
+            ]
+        )
+        #endif
+    }
+
+    /// Which subtitle source a track id names. The id space is the only
+    /// classifier available at the funnel, and it is exactly the distinction
+    /// worth recording.
+    private static func subtitleTrackKind(_ trackId: Int64) -> String {
+        if SubtitleTrackIdSpace.isAILive(trackId) { return "ai_live" }
+        if SubtitleTrackIdSpace.isSidecar(trackId) { return "sidecar" }
+        return "embedded"
+    }
+
+    private func applySecondarySubtitleTrackSelection(_ trackId: Int64?) {
+        guard let trackId else {
+            aetherPlaybackController.selectSecondarySubtitleTrack(id: nil)
+            return
+        }
+        guard !SubtitleTrackIdSpace.isAILive(trackId),
+              let track = subtitleTracks.first(where: { $0.trackId == trackId }),
+              !SubtitleCodecClassifier.isBitmap(track.codec) else {
+            selectedSecondarySubtitleId = nil
+            aetherPlaybackController.selectSecondarySubtitleTrack(id: nil)
+            return
+        }
+        registerProtocolV3SubtitleWithAetherIfNeeded(track)
+        // Only a track Aether actually holds can be rendered as the secondary
+        // one. Under V3 the plan mounts a single artifact, so an inventory row
+        // that could not be registered above has no engine id at all — showing
+        // it checked while nothing renders is worse than refusing the pick.
+        guard aetherPlaybackController.containsSubtitle(appTrackID: trackId)
+                || !SubtitleTrackIdSpace.isSidecar(trackId) else {
+            Self.logger.warning(
+                "[CMP-SUB] secondary subtitle \(trackId, privacy: .public) has no Aether track; clearing"
+            )
+            selectedSecondarySubtitleId = nil
+            aetherPlaybackController.selectSecondarySubtitleTrack(id: nil)
+            return
+        }
+        aetherPlaybackController.selectSecondarySubtitleTrack(id: trackId)
+    }
+
+    private func registerProtocolV3EmbeddedSubtitleIfAvailable(_ track: PlayerTrack, plan: PlaybackV3Plan) -> Bool {
+        guard let selection = ProtocolV3SubtitleSelection(track: track, plan: plan),
+              let streamIndex = selection.embeddedStreamIndex(for: track, in: plan),
+              let codec = track.codec else { return false }
+        return aetherPlaybackController.registerEmbeddedSubtitleTrack(
+            streamIndex: streamIndex, codec: codec, appTrackID: track.trackId
+        )
+    }
+
+    /// Prefer the open original file's embedded stream. Download an inventory
+    /// sidecar only when the current video source cannot supply that track.
+    private func registerProtocolV3SubtitleWithAetherIfNeeded(_ track: PlayerTrack) {
+        if let plan = activePreparedProtocolV3?.plan,
+           registerProtocolV3EmbeddedSubtitleIfAvailable(track, plan: plan) { return }
+        guard !aetherPlaybackController.containsSubtitle(appTrackID: track.trackId),
+              let url = protocolV3InventorySidecarURL(for: track) else {
+            return
+        }
+        aetherPlaybackController.addExternalSubtitleTrack(
+            makeExternalSubtitleTrack(
+                url: url,
+                name: track.title,
+                language: track.lang,
+                isForced: track.isForced,
+                isHearingImpaired: track.isHearingImpaired,
+                isDefault: track.isDefault,
+                formatHint: ["vtt", "ass", "ssa", "srt", "sup"].contains(url.pathExtension.lowercased())
+                    ? url.pathExtension.lowercased() : track.codec
+            ),
+            appTrackID: track.trackId,
+            fontRequest: activePreparedProtocolV3?.plan.subtitle.inventory
+                .first(where: { $0.combinedIndex == track.srcId })?
+                .fontBundleUrl.flatMap { resolveServerUrl($0, serverUrl: resolvedServerUrl) }
+                .map(makeSubtitleFontRequest)
+        )
+    }
+
+    private func applyLocalProtocolV3SubtitleSelection(_ track: PlayerTrack?, reason: String) -> Bool {
+        guard let plan = activePreparedProtocolV3?.plan,
+              protocolV3ReplanTask == nil, isAetherLoadEstablished,
+              let selection = ProtocolV3SubtitleSelection(track: track, plan: plan) else { return false }
+        let isMounted = track.map {
+            registerProtocolV3EmbeddedSubtitleIfAvailable($0, plan: plan)
+                || aetherPlaybackController.containsSubtitle(appTrackID: $0.trackId)
+        } ?? false
+        let serverCarriesSubtitleRenditions = activePreparedProtocolV3?.serverFeatures
+            .contains(PlaybackProtocolV3.hlsSubtitleRenditionsFeature) == true
+        guard selection.canApplyLocally(
+            to: plan, isMounted: isMounted, serverCarriesSubtitleRenditions: serverCarriesSubtitleRenditions
+        ) else { return false }
+        let priorSelection = localProtocolV3SubtitleSelection
+        localProtocolV3SubtitleSelection = selection
+        selectedSubtitleId = track?.trackId
+        pendingSubtitleFfIndex = nil
+        pendingSidecarSubtitleTrackId = nil
+        pendingServerRenderedSubtitleTrackId = nil
+        if let track {
+            registerProtocolV3SubtitleWithAetherIfNeeded(track)
+            guard aetherPlaybackController.containsSubtitle(appTrackID: track.trackId) else {
+                localProtocolV3SubtitleSelection = priorSelection
+                return false
+            }
+        }
+        let engineID = track.flatMap { aetherPlaybackController.aetherSubtitleID(forAppID: $0.trackId) }
+        if aetherPlaybackController.engine.activeSubtitleTrackIndex != engineID
+            || aetherPlaybackController.hasPendingHLSSubtitleRenditionSelection {
+            applySubtitleTrackSelection(track?.trackId, reason: reason)
+        }
+        lastLoadRequest = lastLoadRequest?.adoptingLocalProtocolV3SubtitleSelection(selection, plan: plan)
+        return true
+    }
+
+    /// Inventory is also published when an unrelated audio/transport property
+    /// changes. It must not restore the subtitle the old video plan selected.
+    /// After a video reload, register the current session's URL before applying
+    /// the saved renderer choice again.
+    @discardableResult
+    private func restoreLocalProtocolV3SubtitleSelection() -> Bool {
+        guard let selection = localProtocolV3SubtitleSelection,
+              let plan = activePreparedProtocolV3?.plan else { return false }
+        let trackID = selection.appTrackID(in: plan)
+        if case .track = selection, trackID == nil {
+            localProtocolV3SubtitleSelection = nil
+            return false
+        }
+        lastLoadRequest = lastLoadRequest?.adoptingLocalProtocolV3SubtitleSelection(selection, plan: plan)
+        selectedSubtitleId = trackID
+        pendingSubtitleFfIndex = nil
+        pendingSidecarSubtitleTrackId = nil
+        pendingServerRenderedSubtitleTrackId = nil
+        guard isAetherLoadEstablished else { return true }
+        let isBurnedIn = plan.subtitle.mode == PlaybackProtocolV3.SubtitleMode.burnIn
+        if isBurnedIn {
+            if trackID != nil, plan.selectedSubtitleCombinedIndex == selection.inventoryItem(in: plan)?.combinedIndex {
+                localProtocolV3SubtitleSelection = nil
+                return true
+            }
+        } else if let trackID, let track = subtitleTracks.first(where: { $0.trackId == trackID }) {
+            registerProtocolV3SubtitleWithAetherIfNeeded(track)
+        }
+        let engineID = trackID.flatMap { aetherPlaybackController.aetherSubtitleID(forAppID: $0) }
+        // The plan's in-stream rendition has no engine id until AVPlayer
+        // publishes its legible option; the controller applies the pick then.
+        let isPendingRendition = trackID.map { aetherPlaybackController.isHLSSubtitleRendition(appTrackID: $0) } == true
+        if !isBurnedIn, trackID == nil || engineID != nil || isPendingRendition {
+            // An unpublished rendition still has to reach the controller, which
+            // holds the pick until AVPlayer offers the option.
+            if aetherPlaybackController.engine.activeSubtitleTrackIndex != engineID || isPendingRendition && engineID == nil
+                || aetherPlaybackController.hasPendingHLSSubtitleRenditionSelection {
+                applySubtitleTrackSelection(trackID, reason: "restored_local_selection")
+            }
+        } else if committedProtocolV3LoadEpoch != nil {
+            // A later route may need burn-in or lack the old sidecar. Let the
+            // server resolve that choice before declaring it rendered locally.
+            attemptProtocolV3Replan(
+                position: currentTime, classification: "subtitle_track_changed",
+                message: "Applying the subtitle choice after a video route change.",
+                requeueWhenBusy: true,
+                trackTarget: .subtitle(trackId: trackID, combinedIndex: selection.inventoryItem(in: plan)?.combinedIndex)
+            )
+        }
+        return true
+    }
+
+    /// Resolved sidecar URL the active plan publishes for this picker row, or
+    /// nil when the row is not a downloadable sidecar (`burn_in_only` rows
+    /// carry no URL) or no V3 plan is active.
+    private func protocolV3InventorySidecarURL(for track: PlayerTrack) -> URL? {
+        guard let plan = activePreparedProtocolV3?.plan,
+              let combinedIndex = track.srcId,
+              let item = plan.subtitle.inventory.first(where: {
+                  $0.combinedIndex == combinedIndex
+              }),
+              item.delivery == "sidecar",
+              let raw = item.url?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        return resolveServerUrl(raw, serverUrl: resolvedServerUrl)
+    }
+
+    /// Whether a picker row can actually be rendered as the secondary
+    /// subtitle: it is either already mounted in Aether or can be mounted from
+    /// the plan inventory on demand.
+    private func canRenderAsSecondarySubtitle(_ track: PlayerTrack) -> Bool {
+        guard let plan = activePreparedProtocolV3?.plan else { return true }
+        if SubtitleTrackIdSpace.isAILive(track.trackId) { return false }
+        // AVPlayer draws the stream's rendition itself; the overlay that
+        // renders secondary subtitles never receives its cues.
+        if aetherPlaybackController.isHLSSubtitleRendition(appTrackID: track.trackId) { return false }
+        if let selection = ProtocolV3SubtitleSelection(track: track, plan: plan),
+           let streamIndex = selection.embeddedStreamIndex(for: track, in: plan),
+           let codec = track.codec,
+           aetherPlaybackController.containsEmbeddedSubtitleTrack(streamIndex: streamIndex, codec: codec) {
+            return true
+        }
+        return aetherPlaybackController.containsSubtitle(appTrackID: track.trackId)
+            || protocolV3InventorySidecarURL(for: track) != nil
+    }
+
+    // MARK: - Live AI subtitle track seam
+
+    /// Open the synthetic live AI subtitle track. Live cues always use the
+    /// primary slot; they are then streamed in via `feedLiveSubtitleCue`.
+    func openLiveSubtitleTrack() {
+        livePrimarySubtitleCues = []
+    }
+
+    /// Feed one normalized source-time cue into the app-owned overlay.
+    func feedLiveSubtitleCue(_ cue: LiveSubtitleCue) {
+        livePrimarySubtitleCues.append(cue)
+        livePrimarySubtitleCues = Self.evictingLiveSubtitleCues(
+            livePrimarySubtitleCues,
+            position: currentTime
+        )
+    }
+
+    /// Bound on retained live AI cues. A fast translator can outrun the
+    /// playhead by a wide margin, so the buffer still needs a hard cap.
+    nonisolated static let liveSubtitleCueLimit = 512
+
+    /// Trims a live cue buffer back to `limit` without dropping anything the
+    /// playhead has not reached yet.
+    ///
+    /// A plain oldest-first trim is wrong here: cues arrive as fast as the
+    /// translator emits them, not in playback lockstep, so a big batch can
+    /// push the count over the cap while every cue in the buffer is still
+    /// ahead of the playhead — and the ones evicted first would be exactly the
+    /// ones about to render. Already-passed cues (earliest end first) go
+    /// first; only if evicting all of them still leaves the buffer over the
+    /// cap do the furthest-future cues go, so the cues nearest the playhead
+    /// are always the last to be dropped.
+    static func evictingLiveSubtitleCues(
+        _ cues: [LiveSubtitleCue],
+        position: Double,
+        limit: Int = PlayerViewModel.liveSubtitleCueLimit
+    ) -> [LiveSubtitleCue] {
+        guard cues.count > limit else { return cues }
+        var overflow = cues.count - limit
+        var evicted = Set(
+            cues.indices
+                .filter { cues[$0].endTime < position }
+                .sorted { cues[$0].endMs < cues[$1].endMs }
+                .prefix(overflow)
+        )
+        overflow -= evicted.count
+        if overflow > 0 {
+            evicted.formUnion(
+                cues.indices
+                    .filter { !evicted.contains($0) }
+                    .sorted { cues[$0].startMs > cues[$1].startMs }
+                    .prefix(overflow)
+            )
+        }
+        return cues.indices.filter { !evicted.contains($0) }.map { cues[$0] }
+    }
+
+    func closeLiveSubtitleTrack() {
+        livePrimarySubtitleCues = []
+    }
+
+    /// Append a synthetic live AI subtitle row to `subtitleTracks` so the
+    /// picker can select it, and return its track id. De-dupes by id.
+    @discardableResult
+    func appendLiveSubtitleTrack(ordinal: Int, label: String?, language: String?) -> Int64 {
+        let trackId = SubtitleTrackIdSpace.makeAILiveTrackId(ordinal)
+        if !subtitleTracks.contains(where: { $0.trackId == trackId }) {
+            subtitleTracks.append(PlayerTrack(
+                trackId: trackId,
+                kind: .sub,
+                title: label,
+                lang: language,
+                codec: nil,
+                audioChannelCount: nil,
+                bitrate: nil,
+                isDefault: false,
+                isForced: false,
+                isHearingImpaired: false,
+                isExternal: false,
+                isSelected: false,
+                ffIndex: nil,
+                srcId: nil
+            ))
+        }
+        return trackId
+    }
+
+    private func applyAutoSubtitlePreferencesIfNeeded(forceReevaluation: Bool = false) {
+        guard !hasExplicitSubtitleChoice, let prefs = prefsForCurrentItem else { return }
+        if prefsResolvedForCurrentItem && !forceReevaluation {
+            return
+        }
+
+        let allSubs = subtitleTracks
+        guard !allSubs.isEmpty else {
+            prefsResolvedForCurrentItem = false
+            return
+        }
+
+        // When the playing track carries no usable language (none, blank or
+        // "und"), resolve it as the start request did: by that track's
+        // position, or, before the engine reports a track, by the one the
+        // start planned. Treating the audio as unknown here made Auto pick
+        // full subtitles where the audio already matched the subtitle
+        // language, and a next episode could keep that pick.
+        let selectedAudio = audioTracks.first(where: { $0.trackId == selectedAudioId })
+        let audioLang = selectedAudio?.normalizedLanguageCode
+            ?? PlaybackSessionBridge.startAudioLanguage(
+                version: currentSelectedVersion,
+                audioOrdinal: selectedAudio.flatMap(audioSelectionIndex(for:))
+                    ?? activePreparedProtocolV3?.plan.selectedTracks.audio?.index
+                    ?? lastLoadRequest?.preferredAudioTrackIndex
+                    ?? currentSelectedVersion?.effectiveAudioTrackIndex
+            )
+        let pick = SubtitleAutoResolver.resolve(.init(
+            preferredLanguage: prefs.preferredLanguage,
+            additionalPreferredLanguages: prefs.additionalPreferredLanguages,
+            mode: prefs.mode,
+            showForced: prefs.showForced,
+            forcedOnly: prefs.forcedOnly,
+            preferAccessibilityTracks: prefs.preferAccessibilityTracks,
+            disableWhenNoLanguageMatch: prefs.disableWhenNoLanguageMatch,
+            trackSignature: prefs.trackSignature,
+            availableSubtitles: allSubs,
+            currentAudioLanguage: audioLang,
+            sourceContainer: currentSelectedVersion?.container
+        ))
+        // An empty callback still has to clear a server-seeded automatic
+        // selection in device-settings mode, but it must not latch the
+        // resolver: embedded or sidecar tracks can arrive in a later update.
+        prefsResolvedForCurrentItem = !allSubs.isEmpty
+        applyAutoSubtitle(pick)
+    }
+
+    /// Answer AetherEngine's `systemCaptionRequest` (upstream api.md, "The
+    /// system asks for captions").
+    ///
+    /// iOS 26's Automatic Subtitles turn captions on with no read API behind
+    /// them, so the engine forwarding the ask is the only observable signal.
+    /// Aether has already deselected its own rendition by the time this lands —
+    /// a fullscreen native caption box would draw over Silo's overlay — so the
+    /// host answers by selecting its own matching track. No match is a no-op:
+    /// the contract is "select a matching track", not "turn something on".
+    private func handleSystemCaptionRequest(
+        epoch: AetherPlaybackController.LoadEpoch,
+        request: SystemCaptionRequest
+    ) {
+        // Track lists and V3 plans are per-load; a request that crossed a
+        // reload seam names a language against inventory that no longer exists.
+        guard epoch == aetherPlaybackController.activeLoadEpoch else { return }
+        guard let language = request.language, !language.isEmpty else { return }
+        guard !subtitleTracks.isEmpty else { return }
+
+        // `.always` because the system already decided captions should be on;
+        // `disableWhenNoLanguageMatch: false` keeps an unmatched language a
+        // no-op rather than clearing a selection the user can see.
+        let pick = SubtitleAutoResolver.resolve(.init(
+            preferredLanguage: language,
+            mode: .always,
+            showForced: false,
+            disableWhenNoLanguageMatch: false,
+            trackSignature: nil,
+            availableSubtitles: subtitleTracks,
+            currentAudioLanguage: audioTracks
+                .first(where: { $0.trackId == selectedAudioId })?
+                .lang,
+            sourceContainer: currentSelectedVersion?.container
+        ))
+        guard case .select(let track) = pick else { return }
+        Self.logger.info(
+            "[CMP-SUB] system caption request answered language=\(language, privacy: .public) trackId=\(track.trackId, privacy: .public)"
+        )
+        // Routed through the shared applier so a V3 session replans server-side
+        // instead of drifting from `selected_tracks`.
+        applyAutoSubtitle(.select(track))
+    }
+
+    private func reapplySystemSubtitlePolicy() {
+        guard settings.subtitleMatchesSystemAppearance, !hasExplicitSubtitleChoice else { return }
+        subtitleOrderingLanguage = settings.subtitleSystemSelectionPreferences
+            .preferredLanguages.first
+        prefsForCurrentItem = systemCaptionPrefsSnapshot()
+        prefsResolvedForCurrentItem = false
+        applyAutoSubtitlePreferencesIfNeeded(forceReevaluation: true)
+    }
+
+    private func systemCaptionPrefsSnapshot() -> PrefsSnapshot {
+        let system = settings.subtitleSystemSelectionPreferences
+        let (mode, showForced, forcedOnly): (SubtitleMode, Bool, Bool) = switch system.displayMode {
+        case .forcedOnly: (.auto, true, true)
+        case .automatic: (.auto, true, false)
+        case .alwaysOn: (.always, false, false)
+        }
+        return PrefsSnapshot(
+            preferredLanguage: system.preferredLanguages.first,
+            additionalPreferredLanguages: Array(system.preferredLanguages.dropFirst()),
+            mode: mode,
+            showForced: showForced,
+            forcedOnly: forcedOnly,
+            preferAccessibilityTracks: system.prefersAccessibilityTracks,
+            disableWhenNoLanguageMatch: true,
+            trackSignature: nil
+        )
+    }
+
+    private func serverSubtitlePrefsSnapshot(_ watchDetail: WatchDetail) -> PrefsSnapshot {
+        PrefsSnapshot(
+            preferredLanguage: watchDetail.effectiveSubtitleLanguage,
+            additionalPreferredLanguages: [],
+            mode: SubtitleMode(rawValue: watchDetail.effectiveSubtitleMode ?? ""),
+            showForced: watchDetail.showsForcedSubtitles,
+            forcedOnly: false,
+            preferAccessibilityTracks: false,
+            disableWhenNoLanguageMatch: false,
+            trackSignature: watchDetail.effectiveSubtitleTrackSignature
+        )
+    }
+
+    /// Apply a resolver verdict. `noChange` is the "leave the player
+    /// alone" case (no preference points anywhere); `disable` and
+    /// `select` actually mutate state.
+    private func applyAutoSubtitle(_ pick: SubtitleAutoSelection) {
+        if pick != .noChange {
+            // A newer automatic decision replaces one still held for a load
+            // or replan; the held one was resolved for audio that may since
+            // have changed again.
+            deferredAutoSubtitlePick = nil
+        }
+        switch pick {
+        case .noChange:
+            return
+        case .disable:
+            if replanAutomaticProtocolV3SubtitleSelection(nil) { return }
+            if selectedSubtitleId != nil {
+                selectedSubtitleId = nil
+                applySubtitleTrackSelection(nil, reason: "auto_preference")
+            }
+        case .select(let track):
+            if replanAutomaticProtocolV3SubtitleSelection(track) { return }
+            if selectedSubtitleId != track.trackId {
+                selectedSubtitleId = track.trackId
+                applySubtitleTrackSelection(track.trackId, reason: "auto_preference")
+            }
+        }
+    }
+
+    /// Caption policy uses the same local renderer path as an explicit pick.
+    /// Burn-in and unavailable artifacts still require a server plan.
+    private func replanAutomaticProtocolV3SubtitleSelection(_ track: PlayerTrack?) -> Bool {
+        if applyLocalProtocolV3SubtitleSelection(track, reason: "auto_preference") { return true }
+        guard let activePreparedProtocolV3,
+              let version = currentSelectedVersion,
+              currentWatchDetail != nil else {
+            return false
+        }
+        let combinedIndex = track.flatMap {
+            ApplePlaybackV3PlanAdapter.serverCombinedSubtitleIndex(
+                for: $0,
+                in: version,
+                inventory: activePreparedProtocolV3.plan.subtitle.inventory
+            )
+        }
+        // The plan may name the selected subtitle by stable identity alone;
+        // resolve it through the inventory so an identical pick never replans.
+        // An `off` plan can keep a stale identity, and `off` means nothing is
+        // selected regardless (mirrors `subtitlePickerTracks`).
+        let planIndex = activePreparedProtocolV3.plan.subtitle.mode == PlaybackProtocolV3.SubtitleMode.off
+            ? nil
+            : activePreparedProtocolV3.plan.selectedSubtitleCombinedIndex
+        let action = Self.automaticProtocolV3SubtitlePlanAction(
+            pickCombinedIndex: combinedIndex,
+            planCombinedIndex: planIndex,
+            loadCommitted: committedProtocolV3LoadEpoch != nil,
+            replanInFlight: protocolV3ReplanTask != nil
+        )
+        guard action != .keepPlan else {
+            return false
+        }
+        // A replan here is a full engine reload on top of a picture that is
+        // already playing, so the decision has to be visible in the log.
+        Self.logger.info(
+            "[CMP-SUB] auto policy disagrees with plan: pick=\(track.map { String($0.trackId) } ?? "off", privacy: .public) combined=\(combinedIndex.map(String.init) ?? "off", privacy: .public) planIndex=\(planIndex.map(String.init) ?? "off", privacy: .public) planMode=\(activePreparedProtocolV3.plan.subtitle.mode, privacy: .public)"
+        )
+        // Inventory arrives as soon as the engine starts loading, before the
+        // start's server transition has committed. A replan staged then rolls
+        // that transition back and retires the session the engine is opening.
+        // A replan still loading (an audio switch re-runs this pass) would
+        // reject another as busy. Hold the pick until the load commits; the
+        // owning load or replan task drains it through
+        // `reapplyDeferredAutoSubtitlePolicyIfNeeded`.
+        guard action == .replan else {
+            deferredAutoSubtitlePick = track.map(SubtitleAutoSelection.select) ?? .disable
+            return true
+        }
+
+        selectedSubtitleId = track?.trackId
+        lastLoadRequest?.preferredProtocolV3SubtitleIndex = combinedIndex
+        attemptProtocolV3Replan(
+            position: currentTime,
+            classification: "subtitle_track_changed",
+            message: "Automatic caption policy selected a different subtitle track."
+        )
+        return true
+    }
+
+    /// Replays the exact caption pick that arrived while a V3 load was still
+    /// uncommitted. Call only after the load's server transition committed.
+    /// The track is re-resolved against the current inventory by id so a
+    /// pick from a superseded inventory cannot select a row that no longer
+    /// exists. A manual subtitle choice made while the pick was held wins;
+    /// the automatic pick is dropped rather than replayed over it.
+    private func reapplyDeferredAutoSubtitlePolicyIfNeeded() {
+        guard let pick = deferredAutoSubtitlePick else { return }
+        deferredAutoSubtitlePick = nil
+        guard !isDisposed,
+              !hasExplicitSubtitleChoice,
+              activePreparedProtocolV3 != nil,
+              committedProtocolV3LoadEpoch != nil else { return }
+        switch pick {
+        case .noChange:
+            return
+        case .disable:
+            applyAutoSubtitle(.disable)
+        case .select(let deferredTrack):
+            guard let track = subtitleTracks.first(where: { $0.trackId == deferredTrack.trackId }) else {
+                return
+            }
+            applyAutoSubtitle(.select(track))
+        }
+    }
+
+    private func startProgressReporting() {
+        progressTask?.cancel()
+        progressTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !Task.isCancelled else { return }
+                guard let self else { return }
+                if let offline = self.offlinePlaybackContext {
+                    self.recordOfflineProgress(context: offline)
+                    continue
+                }
+                let result = await self.sessionBridge.reportProgress(
+                    position: self.progressReportPosition,
+                    isPaused: !self.isPlaying
+                )
+                if result == .sessionEnded {
+                    // A new load or renewal cancels this loop when it moves
+                    // to another session. A late answer about the old one
+                    // must not end the playback that replaced it.
+                    if !Task.isCancelled {
+                        self.leaveServerEndedSession()
+                    }
+                    return
+                }
+                if result == .missingSession {
+                    _ = self.attemptStaleSessionRenewal(
+                        reason: "progress",
+                        observedPosition: self.progressReportPosition
+                    )
+                } else {
+                    await self.attemptProtocolV3AuthenticationReloadAfterProgress(result)
+                }
+            }
+        }
+    }
+
+    /// Route one watch-progress sample into the offline queue. The explicit
+    /// `position` lets the terminal flushes (EOF, player close) pin the
+    /// end-state instead of relying on the last observed tick; `markCompleted`
+    /// force-latches watched on natural end even when the file's duration
+    /// never resolved.
+    private func recordOfflineProgress(
+        context: OfflinePlaybackContext,
+        position: Double? = nil,
+        markCompleted: Bool = false
+    ) {
+        let position = position ?? currentTime
+        guard position.isFinite, position >= 0 else { return }
+        let duration = duration.isFinite && duration > 0 ? duration : 0
+        let watched = markCompleted
+            || (duration > 0 && position / duration > Self.defaultWatchedFraction)
+        DownloadManager.shared.recordOfflineProgress(
+            mediaItemId: context.mediaItemId,
+            position: position,
+            duration: duration,
+            completed: watched
+        )
+    }
+
+    /// Duration the transport overlay stays on-screen after the last user
+    /// interaction before auto-hiding while playing. Matches Infuse/Apple TV.
+    /// Tests shorten it.
+    @ObservationIgnored var autoHideDelay: Duration = .seconds(5)
+
+    private func scheduleHideControls() {
+        // The HUD pins its host visible (`pinControlsVisible` in `openHUD`).
+        // Actions taken from inside it — track selection, remote play/pause —
+        // funnel through here and must not re-arm the auto-hide out from
+        // under the open HUD: on tvOS the hide swaps the press-capture sink
+        // in beneath it, splitting remote presses across two owners.
+        // `closeHUD()` calls back in after clearing the flag, which restores
+        // the normal auto-hide lifecycle.
+        if isHUDPresented {
+            pinControlsVisible()
+            return
+        }
+        hideControlsTask?.cancel()
+        showControls = true
+        let delay = autoHideDelay
+        hideControlsTask = Task { @MainActor [weak self] in
+            while true {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                #if os(iOS)
+                // A native Menu offers no isPresented hook, so the hide
+                // deadline checks for a live menu platter instead of the
+                // menus pinning the overlay: wait out an open menu, then
+                // give the overlay a fresh full window before hiding.
+                if Self.isSystemMenuPresented() {
+                    while Self.isSystemMenuPresented() {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        guard !Task.isCancelled else { return }
+                    }
+                    continue
+                }
+                #endif
+                break
+            }
+            guard let self, self.isPlaying else { return }
+            withAnimation { self.showControls = false }
+        }
+    }
+
+    #if os(iOS)
+    /// True while a UIKit menu platter is on screen. SwiftUI `Menu`s are
+    /// UIContextMenuInteraction-backed, and the presented platter lives in
+    /// a window (or a window's immediate subview) whose class name carries
+    /// "ContextMenu" — there is no public presentation hook to observe.
+    private static func isSystemMenuPresented() -> Bool {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .contains { window in
+                NSStringFromClass(type(of: window)).contains("ContextMenu")
+                    || window.subviews.contains {
+                        NSStringFromClass(type(of: $0)).contains("ContextMenu")
+                    }
+            }
+    }
+    #endif
+
+}
+
+private enum SiloControlPlayerError: LocalizedError {
+    case watchPartyControlUnavailable
+    case missingSeekPosition
+    case missingTrackId
+    case missingSpeed
+    case missingValue
+    case missingEnabledValue
+    case missingMilliseconds
+    case trackNotFound
+    case invalidVideoGravity
+    case invalidSubtitlePosition
+    case qualitySwitchInProgress
+
+    var errorDescription: String? {
+        switch self {
+        case .watchPartyControlUnavailable:
+            return "This Watch Party does not allow this playback action."
+        case .missingSeekPosition:
+            return "Missing seek position."
+        case .missingTrackId:
+            return "Missing track id."
+        case .missingSpeed:
+            return "Missing playback speed."
+        case .missingValue:
+            return "Missing setting value."
+        case .missingEnabledValue:
+            return "Missing enabled value."
+        case .missingMilliseconds:
+            return "Missing millisecond value."
+        case .trackNotFound:
+            return "Track not found."
+        case .invalidVideoGravity:
+            return "Invalid aspect setting."
+        case .invalidSubtitlePosition:
+            return "Invalid subtitle position."
+        case .qualitySwitchInProgress:
+            return "A quality change is already in progress."
+        }
+    }
+}
+
+extension PlayerViewModel {
+    @MainActor
+    func applySiloControlCommand(_ command: SiloControlCommand) throws {
+        if isWatchPartyPlayback {
+            switch command.name {
+            case .play, .pause, .playPause:
+                guard canRequestPlayPause else { throw SiloControlPlayerError.watchPartyControlUnavailable }
+            case .seek:
+                guard canRequestSeek else { throw SiloControlPlayerError.watchPartyControlUnavailable }
+            case .setPlaybackSpeed, .playNext:
+                throw SiloControlPlayerError.watchPartyControlUnavailable
+            default: break
+            }
+        }
+        switch command.name {
+        case .play:
+            handleNowPlayingPlay()
+            scheduleHideControls()
+        case .pause:
+            handleNowPlayingPause()
+            scheduleHideControls()
+        case .playPause:
+            togglePlayPause()
+        case .seek:
+            guard let seconds = command.seconds else {
+                throw SiloControlPlayerError.missingSeekPosition
+            }
+            seekTo(seconds: seconds)
+        case .stop:
+            if isWatchPartyPlayback { cleanup() }
+            aetherPlaybackController.pause()
+            requestRemoteDismiss()
+        case .selectAudioTrack:
+            guard let trackId = command.trackId else {
+                throw SiloControlPlayerError.missingTrackId
+            }
+            guard let track = audioTracks.first(where: { $0.trackId == trackId }) else {
+                throw SiloControlPlayerError.trackNotFound
+            }
+            selectAudio(track)
+        case .selectSubtitleTrack:
+            guard let trackId = command.trackId else {
+                disableSubtitles()
+                return
+            }
+            guard let track = subtitleTracks.first(where: { $0.trackId == trackId }) else {
+                throw SiloControlPlayerError.trackNotFound
+            }
+            selectSubtitle(track)
+        case .setPlaybackSpeed:
+            guard let speed = command.speed, speed.isFinite, speed > 0 else {
+                throw SiloControlPlayerError.missingSpeed
+            }
+            setPlaybackSpeed(speed)
+        case .setQuality:
+            guard let value = command.value else {
+                throw SiloControlPlayerError.missingValue
+            }
+            guard !isQualitySwitching else {
+                throw SiloControlPlayerError.qualitySwitchInProgress
+            }
+            switchQuality(value)
+        case .setVideoGravity:
+            guard let value = command.value else {
+                throw SiloControlPlayerError.missingValue
+            }
+            guard let gravity = VideoGravity(rawValue: value) else {
+                throw SiloControlPlayerError.invalidVideoGravity
+            }
+            setVideoGravity(gravity)
+        case .setSubtitleSyncMs:
+            guard let milliseconds = command.milliseconds else {
+                throw SiloControlPlayerError.missingMilliseconds
+            }
+            setSubtitleSyncMilliseconds(milliseconds)
+        case .setSubtitlePosition:
+            guard let value = command.value else {
+                throw SiloControlPlayerError.missingValue
+            }
+            guard let position = SubtitlePositionPreset(rawValue: value) else {
+                throw SiloControlPlayerError.invalidSubtitlePosition
+            }
+            setSubtitlePosition(position)
+        case .setVolume:
+            guard let volume = command.volume, volume.isFinite else {
+                throw SiloControlPlayerError.missingValue
+            }
+            applyUserVolume(Float(volume))
+        case .setMuted:
+            guard let enabled = command.enabled else {
+                throw SiloControlPlayerError.missingEnabledValue
+            }
+            applyUserMuted(enabled)
+        case .playNext:
+            playNextEpisodeNow()
+        }
+    }
+
+    @MainActor
+    func makeSiloControlPlaybackState(contentId: String?) -> SiloControlPlaybackState {
+        let liveContentId = lastLoadRequest?.contentId ?? contentId
+        let titleText = metadata.primaryTitle.isEmpty ? title : metadata.primaryTitle
+        let subtitleText = [metadata.seriesTitle, metadata.episodeTag]
+            .compactMap { value -> String? in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: " · ")
+
+        return SiloControlPlaybackState(
+            contentId: liveContentId,
+            sessionId: activePlaybackSessionId,
+            title: titleText.isEmpty ? "Loading" : titleText,
+            subtitle: subtitleText.isEmpty ? nil : subtitleText,
+            isPlaying: isPlaying,
+            isLoading: isLoading,
+            isBuffering: isBuffering,
+            currentTime: currentTime,
+            duration: duration,
+            audioTracks: makeSiloControlTracks(audioTracks),
+            subtitleTracks: makeSiloControlTracks(subtitleTracks),
+            selectedAudioTrackId: selectedAudioId,
+            selectedSubtitleTrackId: selectedSubtitleId,
+            qualityOptions: hasQualityChoice ? qualityOptions.map(makeSiloControlOption) : [],
+            activeQualityId: remoteActiveQualityId,
+            isQualitySwitching: isQualitySwitching,
+            playbackSpeed: effectivePlaybackSpeed,
+            videoGravity: settings.videoGravity.rawValue,
+            hdrEnabled: settings.hdrEnabled,
+            supportsVideoGravity: true,
+            subtitleSyncMs: settings.subtitleSyncMs,
+            subtitlePosition: settings.effectiveSubtitleAppearance.position.rawValue,
+            supportsSubtitleDelay: backendCapabilities.supportsSubtitleDelay,
+            supportsSubtitlePosition: backendCapabilities.supportsSubtitleStyling,
+            volume: Double(userVolume),
+            isMuted: userMuted,
+            hasNextEpisode: nextUpEpisode != nil,
+            nextEpisodeTitle: nextUpEpisode?.title,
+            error: error
+        )
+    }
+
+    private func makeSiloControlTracks(_ tracks: [PlayerTrack]) -> [SiloControlTrack] {
+        // Rows lead with the language, so the title also carries what tells
+        // same-language tracks apart ("English (Commentary)"): remotes show
+        // only the title.
+        zip(tracks, PlayerTrack.singleLineLabels(tracks)).map { track, title in
+            SiloControlTrack(
+                kind: track.kind.rawValue,
+                trackId: track.trackId,
+                title: title,
+                detail: track.attributesLabel
+            )
+        }
+    }
+
+    private func makeSiloControlOption(_ option: ApplePlaybackQualityOption) -> SiloControlOption {
+        SiloControlOption(
+            id: option.id,
+            label: option.labelWithBitrate,
+            detail: option.subtitle
+        )
+    }
+}
+
+// MARK: - Buffering quality
+
+extension PlayerViewModel {
+    private static let qualityReductionUnavailableWarning = "quality_reduction_unavailable"
+
+    /// Hands ``bufferingQuality`` whatever the playback facts changed. Called
+    /// on every engine event and wherever a seek, reload, reconnect, the
+    /// connection or the play intent moves.
+    private func syncBufferingQualitySignals() {
+        guard !isDisposed else { return }
+        syncSpeedTestHold()
+        if isSoftwareVideoRoute {
+            softwareSeekLanding.note(
+                seekInFlight: bufferingSeekInFlight || aetherPhase == .seeking,
+                clock: aetherPlaybackController.engine.currentTime
+            )
+        } else {
+            softwareSeekLanding.reset()
+        }
+        playingClockAdvance.note(
+            playing: aetherPlaybackController.nativeTransport?.status == .playing,
+            clock: aetherPlaybackController.engine.currentTime
+        )
+        let calls = bufferingSignals.update(bufferingSignalSnapshot)
+        if bufferingSignals.state == .playing {
+            bufferingReloadEpoch = nil
+            // The plan played: its start is over.
+            disarmStartDeadline()
+        }
+        if needsBufferingSignalPoll {
+            pollBufferingSignals()
+        } else {
+            bufferingSignalPoll?.cancel()
+            bufferingSignalPoll = nil
+        }
+        for call in calls {
+            switch call {
+            case .transportTroubleChanged(let trouble):
+                Self.logger.info("[CMP-BUFFERING] transport trouble=\(trouble, privacy: .public)")
+                bufferingQuality.transportTroubleChanged(trouble)
+            case .playing:
+                bufferingQuality.playing()
+            case .waiting(let cause):
+                Self.logger.debug("[CMP-BUFFERING] waiting cause=\(String(describing: cause), privacy: .public)")
+                // A stall seen only once the playhead has been still for a
+                // while began when the playhead stopped.
+                let startedAgoMs = cause == .network ? playheadFrozenMs ?? 0 : 0
+                bufferingQuality.waiting(cause: cause, startedAgoMs: startedAgoMs)
+            case .paused:
+                bufferingQuality.paused()
+            }
+        }
+        syncStartDeadline()
+    }
+
+    /// Speed tests wait while this player loads or plays, including while a
+    /// fresh load prepares its replacement; a paused one does not hold them
+    /// off, and resuming stops a running test.
+    private func syncSpeedTestHold() {
+        let active = freshLoadTask != nil
+            || (activeAetherLoadEpoch != nil && (aetherPlaybackController.shouldPlayWhenReady || isLoading))
+        guard active != speedTestHoldActive else { return }
+        speedTestHoldActive = active
+        BandwidthProbeScheduler.shared.videoPlayer(self, isActive: active)
+    }
+
+    private var bufferingSignalSnapshot: BufferingSignalMapper.Snapshot {
+        let monitor = ConnectionMonitor.shared
+        return BufferingSignalMapper.Snapshot(
+            hasActiveLoad: activeAetherLoadEpoch != nil && aetherPlaybackController.hasActiveLoad,
+            wantsToPlay: viewerWantsToPlay,
+            phase: aetherPhase,
+            engineBuffering: isBuffering,
+            nativeTransport: aetherPlaybackController.nativeTransport,
+            seekInFlight: bufferingSeekInFlight,
+            reloadInProgress: bufferingReplacementLoading
+                || reconnectCycle.isHandingOff
+                || aetherPlaybackController.isRestoringTransport
+                || (activeAetherLoadEpoch != nil && bufferingReloadEpoch == activeAetherLoadEpoch),
+            reachedEnd: hasReachedEndOfFile,
+            // Media trouble only: a failed API call is not a media request.
+            connectionTrouble: connectionState != .connected || !monitor.isDeviceOnline,
+            bufferedAheadMs: engineBufferedAheadMs,
+            playheadFrozen: playheadFrozenMs != nil || softwareSeekLanding.awaitsAdvance || nativeStartHeld,
+            upstreamSilent: upstreamMeter.isSilent(atMs: bufferingClock.elapsedMs),
+            readerMetered: aetherPlaybackController.upstreamBytesFetched != nil
+        )
+    }
+
+    /// The viewer means playback to run: it is not paused, and no audio
+    /// interruption (a call, Siri) holds it, on every route.
+    private var viewerWantsToPlay: Bool {
+        aetherPlaybackController.shouldPlayWhenReady && !aetherPlaybackController.isAudioSessionInterrupted
+    }
+
+    /// A replan or start in flight leaves the playing source alone until the
+    /// client swaps it; from then until its plan is adopted, the source
+    /// loading is the replacement's, not the playing plan's.
+    private var bufferingReplacementLoading: Bool {
+        (protocolV3ReplanTask != nil || freshLoadTask != nil)
+            && bufferingSourceSwapGeneration == streamLoadGeneration
+            && streamLoadGeneration != bufferingAdoptedStreamLoadGeneration
+    }
+
+    /// What the plan's media arrived at, the buffering controller's evidence
+    /// of a slow link: the reader's rate where Aether reads the origin, or on
+    /// server HLS the access log's rate on the relay hop, the closest
+    /// equivalent there. The meter leaves out what the reader receives while
+    /// another reader may share the link: its share is no evidence the link
+    /// is slow.
+    private var bufferingPlanArrivalKbps: Int? {
+        aetherPlaybackController.activeSpec?.options.nativeRemoteHLS == true
+            ? aetherPlaybackController.relayThroughputKbps
+            : upstreamMeter.throughputKbps
+    }
+
+    /// Holds the failure of the load whose missed start deadline the
+    /// buffering controller answered with a lowering, until the lowering's
+    /// plan is adopted. Internal for tests.
+    func holdStartDeadlineFailure(position: Double, classification: String, message: String) {
+        heldStartDeadlineFailure = .init(
+            loadEpoch: activeAetherLoadEpoch,
+            recovery: (position, classification, message)
+        )
+    }
+
+    /// Takes the held start-deadline failure's recovery once its lowering
+    /// was refused, failed or never adopted. It comes back only while the
+    /// load that missed its deadline is still installed and nothing else
+    /// replaces it, so that load's failure takes the usual recovery and a
+    /// start never ends on a dead player.
+    private func takeHeldStartDeadlineRecovery() -> (position: Double, classification: String, message: String)? {
+        guard let held = heldStartDeadlineFailure else { return nil }
+        heldStartDeadlineFailure = nil
+        guard !isDisposed, freshLoadTask == nil, protocolV3ReplanTask == nil, !reconnectCycle.isActive,
+              activePreparedProtocolV3 != nil, activeAetherLoadEpoch == held.loadEpoch else { return nil }
+        Self.logger.info("[CMP-BUFFERING] start-deadline lowering not adopted: failure recovery")
+        return held.recovery
+    }
+
+    /// Arms the adopted plan's start deadline where AetherEngine sets none:
+    /// direct play and the software route. Server HLS keeps the engine's.
+    /// It runs until the plan first plays, not until a first frame: AVPlayer
+    /// holds a frame ready for display before its clock moves, and on a link
+    /// far below the bitrate it can hold it there for minutes.
+    private func armStartDeadline() {
+        disarmStartDeadline()
+        guard let epoch = activeAetherLoadEpoch,
+              aetherPlaybackController.activeSpec?.options.nativeRemoteHLS == false else { return }
+        armedStartDeadline = .init(loadEpoch: epoch, deadline: PlaybackStartDeadline())
+        syncStartDeadline()
+    }
+
+    private func disarmStartDeadline() {
+        armedStartDeadline = nil
+        startDeadlineTimer?.cancel()
+        startDeadlineTimer = nil
+    }
+
+    /// The start deadline spends its budget only while the viewer wants to
+    /// play, the buffering signals show no outage, and the player is not
+    /// held for a Watch Party or an interstitial.
+    private func syncStartDeadline() {
+        guard var armed = armedStartDeadline else { return }
+        let due = armed.deadline.dueAtMs
+        armed.deadline.update(
+            viewerWantsToPlay: viewerWantsToPlay && bufferingSignals.state != .waiting(.pause),
+            outage: bufferingSignals.transportTrouble,
+            atMs: bufferingClock.elapsedMs
+        )
+        armedStartDeadline = armed
+        if armed.deadline.dueAtMs != due { scheduleStartDeadlineCheck() }
+    }
+
+    /// Checks the start deadline when it falls due, or `afterMs` from now;
+    /// while it is held, once it runs again.
+    private func scheduleStartDeadlineCheck(afterMs delay: Int? = nil) {
+        startDeadlineTimer?.cancel()
+        startDeadlineTimer = nil
+        guard let due = armedStartDeadline?.deadline.dueAtMs else { return }
+        let waitMs = delay ?? max(0, due - bufferingClock.elapsedMs)
+        startDeadlineTimer = bufferingClock.schedule(after: TimeInterval(waitMs) / 1000) { [weak self] in
+            self?.checkStartDeadline()
+        }
+    }
+
+    /// A plan whose start deadline passed before it played fails as a
+    /// server-HLS plan does when AetherEngine's deadline passes: on Auto in
+    /// "Automatically", with evidence of a slow link, the buffering
+    /// controller lowers it; otherwise it takes the failure recovery.
+    private func checkStartDeadline() {
+        startDeadlineTimer = nil
+        guard !isDisposed, let epoch = armedStartDeadline?.loadEpoch else { return }
+        guard epoch == activeAetherLoadEpoch else {
+            disarmStartDeadline()
+            return
+        }
+        syncStartDeadline()
+        guard armedStartDeadline?.deadline.hasPassed(atMs: bufferingClock.elapsedMs) == true else {
+            scheduleStartDeadlineCheck()
+            return
+        }
+        // A start, replan or reconnect in flight decides what replaces the
+        // plan; if none does, the plan has still missed its start.
+        guard freshLoadTask == nil, protocolV3ReplanTask == nil, !reconnectCycle.isActive else {
+            scheduleStartDeadlineCheck(afterMs: 1_000)
+            return
+        }
+        disarmStartDeadline()
+        Self.logger.info("[CMP-BUFFERING] start deadline passed before the plan played")
+        handleAetherFailure(PlaybackErrorInfo(kind: .noPlayableTrackWithinBudget, message: Self.startDeadlineMessage))
+        syncBufferingQualitySignals()
+    }
+
+    private static let startDeadlineMessage =
+        "Playback didn't start within \(PlaybackStartDeadline.budgetMs / 1000) seconds."
+
+    /// One telemetry tick: what the engine's reader has received from the
+    /// origin. Bytes a replacement's source receives while it loads are not
+    /// the playing plan's, and the reader's share of a link another reader
+    /// of the file may be using is not the link's rate: the device's receive
+    /// count is.
+    private func noteUpstreamTelemetry() {
+        let totalBytes = aetherPlaybackController.upstreamBytesFetched
+        let arrived = upstreamMeter.note(
+            totalBytes: totalBytes,
+            atMs: bufferingClock.elapsedMs,
+            networkKey: BandwidthProbeScheduler.shared.network.key,
+            counts: !bufferingReplacementLoading,
+            shared: aetherPlaybackController.mayShareSourceLink,
+            deviceBytes: totalBytes == nil ? nil : interfaceReceiveCounter.read()
+        )
+        if arrived { bufferingSignals.noteMediaDataArrived() }
+    }
+
+    /// A seek, scrub commit or hold-seek has not landed yet.
+    private var bufferingSeekInFlight: Bool {
+        seekTargetTime != nil || seekReplanTask != nil || isHoldSeeking
+    }
+
+    /// A video load the engine plays on its software route, which reports
+    /// no rebuffering of its own.
+    private var isSoftwareVideoRoute: Bool {
+        activeAetherLoadEpoch != nil && !isAudioOnlyAetherLoad && aetherPlaybackController.nativeTransport == nil
+    }
+
+    /// The engine's software host, or AVPlayer on the native route, reports
+    /// playing, but the clock has not moved for
+    /// `PlayerStallPresentation.frozenPlayheadThreshold` while the viewer
+    /// wants to play: it is waiting for media. The software host pauses its
+    /// clock to rebuffer without reporting it, and AVPlayer can report
+    /// `.playing` over a frame it holds while Aether's loopback server waits
+    /// on a slow origin. The renderer-wait rule then tells a starved network
+    /// from a slow decoder by what is buffered. How long the frozen playhead
+    /// has been still, in milliseconds, or nil while it moves.
+    private var playheadFrozenMs: Int? {
+        guard activeAetherLoadEpoch != nil, !isAudioOnlyAetherLoad, aetherPlaybackController.shouldPlayWhenReady,
+              let movedAt = playheadSample?.movedAt else { return nil }
+        if let native = aetherPlaybackController.nativeTransport {
+            guard native.status == .playing else { return nil }
+        } else {
+            guard aetherPhase == .playing else { return nil }
+        }
+        let still = movedAt.duration(to: .now)
+        guard still >= PlayerStallPresentation.frozenPlayheadThreshold else { return nil }
+        return still.wholeMilliseconds
+    }
+
+    /// Before the plan has run, AVPlayer reports `.playing` on a clock that
+    /// has not moved since: it holds a frame, and the start still waits.
+    private var nativeStartHeld: Bool {
+        !bufferingSignals.planHasRun
+            && aetherPlaybackController.nativeTransport?.status == .playing
+            && !playingClockAdvance.hasMoved
+    }
+
+    private var needsBufferingSignalPoll: Bool {
+        // An outage ends once media data arrives, which nothing announces.
+        if bufferingSignals.outageAwaitsData { return true }
+        switch bufferingSignals.state {
+        case .waiting(.renderer): return true
+        // A frozen clock is seen only by looking.
+        case .playing: return activeAetherLoadEpoch != nil && !isAudioOnlyAetherLoad
+        default: return false
+        }
+    }
+
+    /// Media the engine holds past its clock: on the native route what
+    /// AVPlayer and the segment cache hold, on the software route the newest
+    /// demuxed packet. On server HLS, where the engine tracks no buffered
+    /// position, it is what AVPlayer has loaded. Nil for an audio-only load,
+    /// whose buffered position mirrors the clock.
+    private var engineBufferedAheadMs: Int? {
+        guard !isAudioOnlyAetherLoad else { return nil }
+        let engine = aetherPlaybackController.engine
+        var ahead = engine.bufferedPosition - engine.currentTime
+        if let loaded = aetherPlaybackController.nativeTransport?.loadedAheadSeconds {
+            ahead = ahead.isFinite ? max(ahead, loaded) : loaded
+        }
+        return ahead.isFinite ? Int((ahead * 1000).rounded()) : nil
+    }
+
+    private func pollBufferingSignals() {
+        guard bufferingSignalPoll == nil else { return }
+        bufferingSignalPoll = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, !Task.isCancelled, !self.isDisposed else { return }
+                self.syncBufferingQualitySignals()
+            }
+        }
+    }
+
+    /// Records the AVPlayer events that only the buffering controller reads.
+    /// True when `scopedEvent` was one of them.
+    private func noteBufferingTransportEvent(_ scopedEvent: AetherPlaybackController.ScopedEvent) -> Bool {
+        switch scopedEvent.event {
+        case .nativeTransportChanged:
+            return true
+        case .itemStalled:
+            bufferingSignals.noteItemStalled()
+            return true
+        case .itemMediaRequestFailed:
+            // An outage, until media data arrives again or playback runs.
+            bufferingSignals.noteMediaRequestFailed()
+            return true
+        case .transportIntentChanged:
+            if aetherPlaybackController.isRestoringTransport { bufferingReloadEpoch = scopedEvent.epoch }
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// A plan became the playing plan: the initial start's commit, or a
+    /// replan's. Each adoption gets its own id, so a replan that returns the
+    /// same server `plan_id` still reads as a new plan.
+    /// `requestedEstimateKbps` is the estimate the request carried, for the
+    /// plan's summary, and `controllerInitiated` says whether it answers the
+    /// buffering controller's own replan.
+    private func adoptBufferingPlan(
+        _ prepared: PreparedPlayback,
+        requestedEstimateKbps: Int?,
+        controllerInitiated: Bool
+    ) {
+        guard let v3 = prepared.protocolV3 else { return }
+        adoptBufferingPlan(
+            v3,
+            sessionId: prepared.session.sessionId,
+            activeQualityId: prepared.activeQualityId,
+            requestedEstimateKbps: requestedEstimateKbps,
+            controllerInitiated: controllerInitiated
+        )
+    }
+
+    /// The owed `clear` of a Restore that a later request replaces, or nil.
+    /// Taking it drops that Restore: the request it rides on stands for it.
+    private func takeOwedBufferingLearnedLimitClear() -> String? {
+        guard owesBufferingLearnedLimitClear else { return nil }
+        owesBufferingLearnedLimitClear = false
+        deferredBufferingRestore = nil
+        return PlaybackProtocolV3.LearnedLimit.clear
+    }
+
+    /// The kept step-down estimate a replan with no estimate of its own
+    /// repeats, so a lowering holds where no learned limit applies. Only the
+    /// player's own replans on Auto carry it: the buffering controller's
+    /// replans carry their own fields, and a quality change the controller
+    /// did not send discards the estimate. Internal for tests.
+    static func keptReplanEstimateKbps(
+        operation: String,
+        issuedByBufferingQuality: Bool,
+        controller: BufferingQualityController
+    ) -> Int? {
+        guard !issuedByBufferingQuality, operation != PlaybackProtocolV3.ReplanOperation.qualityChange else {
+            return nil
+        }
+        return controller.clientReplan(operation: operation)?.bandwidthEstimateKbps
+    }
+
+    /// Internal for tests: the state of a title playing a v3 plan.
+    func installPlayingProtocolV3(watchDetail: WatchDetail, prepared: PreparedPlaybackV3) {
+        currentWatchDetail = watchDetail
+        activePreparedProtocolV3 = prepared
+    }
+
+    /// Internal for tests.
+    func adoptBufferingPlan(
+        _ v3: PreparedPlaybackV3,
+        sessionId: String,
+        activeQualityId: String,
+        requestedEstimateKbps: Int? = nil,
+        controllerInitiated: Bool = false
+    ) {
+        guard !isAudioOnlyAetherLoad else { return }
+        bufferingPlanRevision &+= 1
+        let id = "\(bufferingPlanRevision):\(v3.plan.planId)"
+        let entry = BufferingPlanEntry(id: id, prepared: v3, sessionId: sessionId)
+        bufferingAdoptedStreamLoadGeneration = streamLoadGeneration
+        bufferingReloadEpoch = nil
+        bufferingQuality.mode = settings.bufferingQualityMode
+        bufferingQuality.sendsBufferingQualityFields = v3.advertisesBufferingQuality
+        var plan = Self.bufferingPlan(id: id, prepared: v3, activeQualityId: activeQualityId)
+        plan.requestedBandwidthEstimateKbps = requestedEstimateKbps
+        Self.logger.info(
+            "[CMP-BUFFERING] plan adopted id=\(id, privacy: .public) delivered=\(plan.deliveredKbps.map(String.init) ?? "unknown", privacy: .public) quality=\(plan.quality, privacy: .public) cant_reduce=\(plan.qualityReductionUnavailable, privacy: .public)"
+        )
+        bufferingQuality.planAdopted(plan, controllerInitiated: controllerInitiated)
+        // Only now: the outgoing plan's summary, sent during the adoption,
+        // still names the entry this replaces and carries its throughput.
+        bufferingPlan = entry
+        upstreamMeter.planAdopted(networkKey: BandwidthProbeScheduler.shared.network.key)
+        // The new plan hears whether playback is already waiting.
+        bufferingSignals.planAdopted()
+        softwareSeekLanding.reset()
+        playingClockAdvance.reset()
+        armStartDeadline()
+        syncBufferingQualitySignals()
+    }
+
+    /// What the controller reads from an adopted plan. The quality is Auto,
+    /// or the server's label for the quality the viewer asked for. The rung
+    /// Lower quality steps from is the one the server names in
+    /// `active_quality`; without one, the delivered bitrate is the baseline.
+    static func bufferingPlan(
+        id: String,
+        prepared: PreparedPlaybackV3,
+        activeQualityId: String
+    ) -> BufferingQualityController.Plan {
+        let plan = prepared.plan
+        let active = ApplePlaybackQuality.protocolV3QualityId(activeQualityId)
+        let quality = active == ApplePlaybackQuality.autoId
+            ? BufferingQualityController.autoQuality
+            : plan.availableQualities.first { ApplePlaybackQuality.protocolV3QualityId($0.label) == active }?.label
+                ?? active
+        return BufferingQualityController.Plan(
+            id: id,
+            deliveredKbps: plan.effectiveRecipe.bitrateKbps ?? plan.source.bitrateKbps,
+            quality: quality,
+            activeQuality: prepared.serverFeatures.contains(PlaybackProtocolV3.planActiveQualityFeature)
+                ? plan.activeQuality
+                : nil,
+            availableQualities: plan.availableQualities.map {
+                .init(label: $0.label, bitrateKbps: $0.bitrateKbps)
+            },
+            qualityReductionUnavailable: plan.degradationWarnings.contains {
+                $0.code == qualityReductionUnavailableWarning
+            }
+        )
+    }
+
+    /// The playing plan stopped or failed with no successor; its summary is
+    /// sent now, ahead of any session stop.
+    private func endBufferingPlan() {
+        bufferingQuality.planEnded()
+        clearBufferingPlanState()
+    }
+
+    /// Other content: every decision about buffering starts over.
+    private func resetBufferingQuality() {
+        bufferingQuality.reset()
+        pendingViewerQualityChange = nil
+        heldStartDeadlineFailure = nil
+        clearBufferingPlanState()
+    }
+
+    /// The viewer's quality change is sent: any buffering pill hides, and
+    /// nothing prompts or lowers until it settles.
+    private func sendViewerQualityChange() -> UInt64 {
+        viewerQualityChangeSerial &+= 1
+        pendingViewerQualityChange = viewerQualityChangeSerial
+        bufferingQuality.pickSent()
+        return viewerQualityChangeSerial
+    }
+
+    /// The viewer's quality change `id` was adopted, and counts as a quality
+    /// change, or it was refused and changes nothing. A superseded or
+    /// settled one, or none, is ignored.
+    private func settleViewerQualityChange(_ id: UInt64?, adopted: Bool) {
+        guard let id, pendingViewerQualityChange == id else { return }
+        pendingViewerQualityChange = nil
+        if adopted {
+            bufferingQuality.qualityChanged()
+        } else {
+            bufferingQuality.pickRefused()
+        }
+    }
+
+    private func clearBufferingPlanState() {
+        bufferingSignalPoll?.cancel()
+        bufferingSignalPoll = nil
+        disarmStartDeadline()
+        deferredBufferingRestore = nil
+        pendingBufferingNotice = nil
+        bufferingPlan = nil
+        bufferingAdoptedStreamLoadGeneration = nil
+        bufferingReloadEpoch = nil
+        bufferingSignals.invalidate()
+    }
+
+    private func handleBufferingQualityOutput(_ output: BufferingQualityController.Output) {
+        switch output {
+        case .replan(let request):
+            Self.logger.info(
+                "[CMP-BUFFERING] trigger replan quality=\(request.qualityPreference, privacy: .public) estimate=\(request.bandwidthEstimateKbps.map(String.init) ?? "none", privacy: .public) source=\(request.bandwidthEstimateSource ?? "none", privacy: .public) learned_limit=\(request.learnedLimit ?? "none", privacy: .public)"
+            )
+            // Issued on the next turn: the controller is still inside the
+            // event that fired it, and the replan feeds it events of its own.
+            Task { @MainActor [weak self] in self?.issueBufferingReplan(request) }
+        case .pillShown(let kind):
+            Self.logger.info("[CMP-BUFFERING] pill shown kind=\(kind == .prompt ? "prompt" : "undo", privacy: .public)")
+        case .notice(let notice):
+            Self.logger.info("[CMP-BUFFERING] notice \(notice == .lowered ? "lowered" : "cant_lower", privacy: .public)")
+            pendingBufferingNotice = notice
+            showPendingBufferingNotice()
+        case .planSummary(let summary):
+            reportBufferingPlanSummary(summary)
+        }
+    }
+
+    /// The controller's `quality_change`, sent like the viewer's switch but
+    /// recorded as nobody's pick: the saved settings and the viewer's
+    /// in-player choice stay as they are.
+    /// Internal for tests.
+    func issueBufferingReplan(_ request: BufferingQualityController.ReplanRequest) {
+        let qualityId = ApplePlaybackQuality.protocolV3QualityId(request.qualityPreference)
+        guard !isDisposed, !isWatchPartyPlayback, activePreparedProtocolV3 != nil, freshLoadTask == nil,
+              attemptProtocolV3Replan(
+                  position: currentTime.isFinite ? max(0, currentTime) : 0,
+                  classification: "quality_changed",
+                  message: "Playback kept buffering; requesting quality \(qualityId).",
+                  operation: PlaybackProtocolV3.ReplanOperation.qualityChange,
+                  qualityPreference: qualityId,
+                  // Auto keeps the saved cap for the connection.
+                  autoBandwidthCapKbps: settings.playbackQualityAxes(onMeteredNetwork: usesMeteredQuality).bitrateKbps,
+                  bandwidthEstimateKbps: request.bandwidthEstimateKbps,
+                  bandwidthEstimateSource: request.bandwidthEstimateSource,
+                  learnedLimit: request.learnedLimit,
+                  // A lowering reports what the playing plan received so far,
+                  // or what its missed start deadline measured.
+                  observedThroughputKbps: request.observedThroughputKbps ?? upstreamMeter.linkThroughputKbps,
+                  issuedByBufferingQuality: true
+              ) else {
+            // Restore quality is the viewer's answer: it goes out once the
+            // replan or start in flight settles rather than being lost.
+            if request.isRestore, protocolV3ReplanTask != nil || freshLoadTask != nil,
+               !isDisposed, !isWatchPartyPlayback {
+                Self.logger.info("[CMP-BUFFERING] restore waits for the replan or start in flight")
+                deferredBufferingRestore = request
+                if request.learnedLimit == PlaybackProtocolV3.LearnedLimit.clear {
+                    owesBufferingLearnedLimitClear = true
+                }
+                return
+            }
+            Self.logger.info("[CMP-BUFFERING] replan not issued: player busy or unavailable")
+            bufferingQuality.replanRefused()
+            if let recovery = takeHeldStartDeadlineRecovery() {
+                attemptProtocolV3Replan(
+                    position: recovery.position,
+                    classification: recovery.classification,
+                    message: recovery.message
+                )
+            }
+            return
+        }
+        Self.logger.info("[CMP-BUFFERING] replan issued quality=\(qualityId, privacy: .public)")
+    }
+
+    private func reportBufferingPlanSummary(_ summary: BufferingQualityController.PlanSummary) {
+        guard let entry = bufferingPlan, entry.id == summary.planId else { return }
+        bufferingPlan = nil
+        var summary = summary
+        summary.throughputKbps = upstreamMeter.throughputKbps
+        Self.logger.info(
+            "[CMP-BUFFERING] plan summary id=\(summary.planId, privacy: .public) played_ms=\(summary.playedMs, privacy: .public) stalls=\(summary.stallCount, privacy: .public) stall_ms=\(summary.stallTotalMs, privacy: .public) action=\(summary.action.rawValue, privacy: .public) throughput=\(summary.throughputKbps.map(String.init) ?? "none", privacy: .public) sent=\(entry.prepared.advertisesPlanSummary, privacy: .public)"
+        )
+        recordBufferingPlanSummary(summary, of: entry, sending: true)
+    }
+
+    /// The playing plan's summary so far, kept on the device in case the app
+    /// ends before the plan does: a suspended app that is killed hears
+    /// nothing. Updated each time the app leaves the foreground.
+    private func keepRunningBufferingPlanSummary() {
+        guard let summary = bufferingQuality.runningSummary,
+              let entry = bufferingPlan, entry.id == summary.planId else { return }
+        recordBufferingPlanSummary(summary, of: entry, sending: false)
+    }
+
+    private func recordBufferingPlanSummary(
+        _ summary: BufferingQualityController.PlanSummary,
+        of entry: BufferingPlanEntry,
+        sending: Bool
+    ) {
+        PlanSummaryJournal.shared.record(sending: sending) { [sessionBridge] in
+            await sessionBridge.protocolV3PlanSummaryEntry(
+                summary, for: entry.prepared, sessionId: entry.sessionId,
+                eventId: entry.summaryEventId, planStartedAt: entry.adoptedAt
+            )
+        }
+    }
+
+    /// Keeps the controller's mode, Watch Party suspension and competing-pill
+    /// state current. Observation re-arms itself after every change, so a
+    /// pill that hides on its own timer is seen too.
+    private func observeBufferingHostInputs() {
+        guard !isDisposed else { return }
+        withObservationTracking {
+            _ = bufferingHostInputs
+            _ = presentedNotice
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in self?.observeBufferingHostInputs() }
+        }
+        syncBufferingHostInputs()
+        showPendingBufferingNotice()
+    }
+
+    /// A higher-priority pill, or a player that cannot show pills at all,
+    /// holds a buffering pill with its remaining timer.
+    private var bufferingHostInputs: (mode: BufferingQualityMode, suspended: Bool, competingPill: Bool) {
+        #if os(macOS)
+        // The Mac player draws the intro pill, but neither segment skip nor
+        // Next Up.
+        let competingPill = showIntroSkip
+        #else
+        let competingPill = showIntroSkip || showSegmentSkip || showNextUpScreen
+        #endif
+        return (settings.bufferingQualityMode, isWatchPartyPlayback, competingPill || !canShowPlayerOverlays)
+    }
+
+    /// Whether anything drawn over the picture can be seen: not in the
+    /// background, picture in picture or under a sheet, nor in a Mac player
+    /// window that can't be seen.
+    private var canShowPlayerOverlays: Bool {
+        var hidden = isPlayerSurfaceHidden || (isPlayerCoveredBySheet && playerControlsAreMounted)
+        #if os(iOS)
+        hidden = hidden || PictureInPictureCoordinator.shared.isEngaged
+        #endif
+        return !hidden
+    }
+
+    /// The iPhone and iPad controls, and the sheets they present, are on
+    /// screen: not while a load, Next Up or an error replaces them. A sheet
+    /// that went away with them covers nothing.
+    private var playerControlsAreMounted: Bool {
+        !isLoading && !showNextUpScreen && error == nil
+    }
+
+    /// The sheet over the iPhone and iPad player opened or closed.
+    func playerSheetCoversPlayer(_ covers: Bool) {
+        if covers != isPlayerCoveredBySheet {
+            Self.logger.info("[CMP-BUFFERING] sheet covers player=\(covers, privacy: .public)")
+        }
+        isPlayerCoveredBySheet = covers
+    }
+
+    /// Shows the waiting buffering notice in the information tone for 5
+    /// seconds, once the player can show it and no other notice holds the
+    /// slot. Checked again whenever either changes.
+    private func showPendingBufferingNotice() {
+        guard let notice = pendingBufferingNotice, presentedNotice == nil, canShowPlayerOverlays else { return }
+        pendingBufferingNotice = nil
+        showNotice(title: notice.text, message: "", tone: .info, symbol: notice.symbol, duration: 5)
+    }
+
+    /// Follows whether the player can show its pills: not while the app is in
+    /// the background. On a Mac the player's window reports itself
+    /// (``playerWindowVisibilityChanged(_:)``).
+    private func observeBufferingSurfaceVisibility() {
+        #if os(iOS) || os(tvOS)
+        let center = NotificationCenter.default
+        let edges: [(Notification.Name, Bool)] = [
+            (UIApplication.didEnterBackgroundNotification, true),
+            (UIApplication.willEnterForegroundNotification, false),
+        ]
+        for (name, hidden) in edges {
+            surfaceVisibilityObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.isPlayerSurfaceHidden = hidden }
+            })
+        }
+        #endif
+    }
+
+    #if os(macOS)
+    /// The Mac player's own window can or can't be seen: minimized, hidden
+    /// with the app, on another Space or covered, whatever other Silo
+    /// windows show.
+    func playerWindowVisibilityChanged(_ visible: Bool) {
+        isPlayerSurfaceHidden = !visible
+    }
+    #endif
+
+    private func syncBufferingHostInputs() {
+        let inputs = bufferingHostInputs
+        bufferingQuality.mode = inputs.mode
+        bufferingQuality.isSuspended = inputs.suspended
+        bufferingQuality.setCompetingPillVisible(inputs.competingPill)
+    }
+
+    /// The device going offline or online feeds transport trouble.
+    private func observeBufferingConnectivity() {
+        guard !isDisposed else { return }
+        let monitor = ConnectionMonitor.shared
+        withObservationTracking {
+            _ = monitor.isDeviceOnline
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.observeBufferingConnectivity()
+                self?.syncBufferingQualitySignals()
+            }
+        }
+    }
+}
+
+// MARK: - Watch Party playback boundary
+
+extension PlayerViewModel {
+    func prepareWatchParty(_ context: WatchPartyPlaybackContext, adapter: WatchPartyPlaybackAdapter) {
+        guard !isDisposed else { return }
+        watchPartyAdapter = adapter
+        watchPartyLocalPreparation = false
+        cancelWatchPartyCorrection()
+        watchPartyAppliedRate = nil
+        watchPartyReloadBudget = WatchPartyReloadBudget()
+        watchPartyInPlaceSeekTask?.cancel()
+        watchPartyInPlaceSeekTask = nil
+        watchPartyInPlaceCatchup = WatchPartyInPlaceCatchup()
+        aetherPlaybackController.requiresExplicitTransportResume = true
+        aetherPlaybackController.permitsExternalPlayback = false
+        #if os(iOS)
+        // The room takes over playback. A solo title left in Picture in
+        // Picture belongs to another view model, so end it whoever owns it.
+        PictureInPictureCoordinator.shared.endSessionForIdentityChange()
+        #endif
+        endHoldFastForward()
+        introSkipPrompt.reset()
+        resetBufferingQuality()
+        syncBufferingHostInputs()
+        cancelNextUpFlow()
+        sleepTimer.cancel()
+        var request = LoadRequest(
+            contentId: context.contentId,
+            preferredFileId: context.fileId,
+            preferredAudioTrackIndex: nil,
+            preferredSubtitleTrackIndex: nil,
+            preferredSidecarSubtitleTrackId: nil,
+            startFromBeginning: false
+        )
+        request.libraryId = context.libraryId
+        request.allowAlternateVersions = false
+        beginFreshLoad(
+            request: request,
+            progressPosition: activePlaybackSessionId == nil ? nil : progressReportPosition,
+            resumePositionOverride: context.startPosition,
+            allowNearEndResume: true
+        )
+        publishWatchPartySnapshot()
+    }
+
+    func stopWatchPartyPlayback(adapter: WatchPartyPlaybackAdapter) {
+        guard watchPartyAdapter === adapter else { return }
+        watchPartyAdapter = nil
+        cleanup()
+    }
+
+    func canSeekWatchPartyLocally(to position: Double) -> Bool {
+        // Aether ignores seeks on an ended session; moving it means a remount.
+        guard !hasReachedEndOfFile,
+              let timeline = aetherPlaybackController.activeSpec?.timeline else { return false }
+        if case .local = timeline.seekDisposition(forSourceTime: position) { return true }
+        return false
+    }
+
+    func restoreWatchPartyPlaybackIfNeeded(at position: Double) {
+        guard isWatchPartyPlayback, !isDisposed,
+              !aetherPlaybackController.engine.isSessionReady,
+              freshLoadTask == nil, protocolV3ReplanTask == nil,
+              let request = lastLoadRequest,
+              position.isFinite, position >= 0 else { return }
+        beginFreshLoad(
+            request: request,
+            progressPosition: nil,
+            resumePositionOverride: position,
+            allowNearEndResume: true,
+            origin: .recovery
+        )
+        publishWatchPartySnapshot()
+    }
+
+    /// Aether keeps an ended session terminal: it ignores seeks, and play does
+    /// not revive it. Moving a member off the end therefore takes a fresh
+    /// load at the target, mounted paused like any other party load.
+    @discardableResult
+    private func remountWatchPartyPlayback(at position: Double) -> Bool {
+        guard isWatchPartyPlayback, !isDisposed,
+              let request = lastLoadRequest,
+              position.isFinite, position >= 0 else { return false }
+        beginFreshLoad(
+            request: request,
+            progressPosition: nil,
+            resumePositionOverride: position,
+            allowNearEndResume: true,
+            origin: .recovery
+        )
+        publishWatchPartySnapshot()
+        return true
+    }
+
+    func cancelWatchPartyCorrection() {
+        watchPartyCorrectionRate = 1
+        syncWatchPartyRate()
+    }
+
+    func noteWatchPartyRoomSeekArrived(at position: Double) {
+        guard watchPartyHeldSeek?.isAnswered(byRoomSeekTo: position) == true else { return }
+        watchPartyHeldSeek?.seekArrived = true
+    }
+
+    func watchPartyRoomCommandStarts(seekingTo position: Double?) {
+        if position != nil { watchPartyInPlaceCatchup.forgetLanding() }
+        guard watchPartyHeldSeek?.isReleased(byCommandSeekingTo: position) == true else { return }
+        releaseWatchPartyHeldSeek()
+    }
+
+    /// Ends a held seek request the room will not run and puts the timeline
+    /// back on the engine, as the seek filter's timeout would.
+    func releaseWatchPartyHeldSeek() {
+        guard watchPartyHeldSeek != nil else { return }
+        watchPartyHeldSeek = nil
+        seekOriginTime = nil
+        seekTargetTime = nil
+        seekFilterTimeoutTask?.cancel()
+        seekFilterTimeoutTask = nil
+        guard isWatchPartyPlayback, !isScrubbing else { return }
+        currentTime = watchPartyPlaybackSnapshot.sourceTime
+        scrubPreviewTime = currentTime
+    }
+
+    /// Hands the member's rate to Aether while it plays. Setting a rate on a
+    /// paused Aether player starts it, which made a paused member play from
+    /// every room command, socket renewal, and seek until the command ran.
+    private func syncWatchPartyRate() {
+        guard isWatchPartyPlayback, !isDisposed, aetherPlaybackController.engine.state == .playing,
+              watchPartyAppliedRate != watchPartyCorrectionRate else { return }
+        aetherPlaybackController.setSpeed(watchPartyCorrectionRate)
+        watchPartyAppliedRate = watchPartyCorrectionRate
+    }
+
+    /// Applies a room command to a playing member: drift up to `seekBand`
+    /// converges by rate, larger drift seeks to media already buffered or
+    /// takes a budgeted load for media that is not. Returns without waiting
+    /// for a rate nudge, so the member keeps reporting meanwhile. A member
+    /// that does not correct by rate seeks in place instead of nudging.
+    func correctWatchPartyPlayback(
+        to position: Double, seekBand: Double, context: WatchPartyPlaybackContext
+    ) async throws -> WatchPartyPlaybackSnapshot {
+        guard position.isFinite, position >= 0, !isDisposed,
+              watchPartyAdapter?.context == context else { throw WatchPartyPlaybackError.invalidated }
+        let local = watchPartyPlaybackSnapshot.sourceTime
+        guard WatchPartyCorrection.seeks(drift: position - local, band: seekBand) else {
+            guard WatchPartyCorrection.correctsByRate else {
+                guard watchPartyInPlaceSeekTask == nil else { return watchPartyPlaybackSnapshot }
+                // Without rate or an in-place seek this drift would never
+                // close; the reload budget paces the rebuild, as on Android.
+                if watchPartyHeldSeek == nil, abs(position - local) > WatchPartyCorrection.inPlaceSeek,
+                   !watchPartyTargetReachableInPlace(position) {
+                    return try await loadWatchPartyCorrection(to: position, context: context)
+                }
+                return try await seekWatchPartyInPlace(drift: position - local, context: context)
+            }
+            nudgeWatchPartyPlayback(drift: position - local)
+            return watchPartyPlaybackSnapshot
+        }
+        if watchPartyTargetReachableInPlace(position) {
+            guard !WatchPartyCorrection.correctsByRate else {
+                return try await applyWatchPartyTransport(.seek(position), context: context, origin: .realign)
+            }
+            // Aimed and spaced like the in-place catch-up, so this seek's own
+            // shortfall does not draw a second one from the drift loop.
+            let led = position + watchPartyInPlaceCatchup.lead
+            let target = watchPartyTargetReachableInPlace(led) ? led : position
+            let generation = watchPartyInPlaceCatchup.generation
+            defer { noteWatchPartyInPlaceSeekFinished(context: context, generation: generation) }
+            return try await applyWatchPartyTransport(.seek(target), context: context, origin: .realign)
+        }
+        return try await loadWatchPartyCorrection(to: position, context: context)
+    }
+
+    /// Converges a playing member on the room by playback rate, with the
+    /// hysteresis in `WatchPartyCorrection.nudge`. It never seeks, and it
+    /// leaves a correction load in flight to land first. A member that does
+    /// not correct by rate takes an in-place seek instead, without holding
+    /// up the drift loop that calls this.
+    func nudgeWatchPartyPlayback(drift: Double) {
+        guard WatchPartyCorrection.correctsByRate else {
+            guard isWatchPartyPlayback, !isDisposed, watchPartyInPlaceSeekTask == nil,
+                  let context = watchPartyAdapter?.context else { return }
+            watchPartyInPlaceSeekTask = Task { [weak self] in
+                guard let self else { return }
+                _ = try? await self.seekWatchPartyInPlace(drift: drift, context: context)
+                guard !Task.isCancelled else { return }
+                self.watchPartyInPlaceSeekTask = nil
+            }
+            return
+        }
+        let snapshot = watchPartyPlaybackSnapshot
+        guard isWatchPartyPlayback, !isDisposed, !watchPartyReloadBudget.inFlight(at: Date()),
+              snapshot.isPlaying, snapshot.isReady, !snapshot.isBuffering else { return }
+        let rate = WatchPartyCorrection.nudge(drift: drift, currentRate: watchPartyCorrectionRate)
+        if rate == 1 { watchPartyReloadBudget.settle() }
+        guard rate != watchPartyCorrectionRate else { return }
+        watchPartyCorrectionRate = rate
+        syncWatchPartyRate()
+    }
+
+    /// Closes a playing member's drift with one in-place seek when it does
+    /// not correct by rate, aimed by `WatchPartyInPlaceCatchup`. Drift within
+    /// `WatchPartyCorrection.inPlaceSeek` stays, and a room position outside
+    /// the buffer is left to the server's corrections.
+    private func seekWatchPartyInPlace(
+        drift: Double, context: WatchPartyPlaybackContext
+    ) async throws -> WatchPartyPlaybackSnapshot {
+        let snapshot = watchPartyPlaybackSnapshot
+        // A held skip is the room's to move; a correction load lands first.
+        guard watchPartyHeldSeek == nil, !watchPartyReloadBudget.inFlight(at: Date()),
+              snapshot.isPlaying, snapshot.isReady, !snapshot.isBuffering else { return snapshot }
+        // Within `inPlaceSeek` this member has converged: it leaves that drift.
+        if abs(drift) <= WatchPartyCorrection.inPlaceSeek { watchPartyReloadBudget.settle() }
+        guard let led = watchPartyInPlaceCatchup.step(drift: drift, local: snapshot.sourceTime, at: Date())
+        else { return snapshot }
+        // A led target outside the buffer would rebuild the stream; the room
+        // position itself may still be in it.
+        let room = max(0, snapshot.sourceTime + drift)
+        let target: Double
+        if watchPartyTargetReachableInPlace(led) {
+            target = led
+        } else if watchPartyTargetReachableInPlace(room) {
+            target = room
+        } else {
+            return snapshot
+        }
+        // A failed seek is spaced like a landed one, so it cannot repeat on
+        // every loop tick.
+        let generation = watchPartyInPlaceCatchup.generation
+        defer { noteWatchPartyInPlaceSeekFinished(context: context, generation: generation) }
+        return try await applyWatchPartyTransport(.seek(target), context: context, origin: .realign)
+    }
+
+    /// Records the end of a correction seek, landed or failed, unless a new
+    /// selection replaced the catch-up state while it ran.
+    private func noteWatchPartyInPlaceSeekFinished(context: WatchPartyPlaybackContext, generation: UInt64) {
+        guard watchPartyAdapter?.context == context else { return }
+        watchPartyInPlaceCatchup.seekFinished(at: Date(), generation: generation)
+    }
+
+    /// Whether a seek to `position` lands in media this member already has.
+    func watchPartyTargetReachableInPlace(_ position: Double) -> Bool {
+        WatchPartyCorrection.targetBuffered(
+            position, local: watchPartyPlaybackSnapshot.sourceTime,
+            locallySeekable: canSeekWatchPartyLocally(to: position),
+            forwardBuffer: aetherPlaybackController.engine.liveTelemetry?.forwardBufferSeconds
+        )
+    }
+
+    /// A correction to media that is not buffered loads it and lands late by
+    /// the load time. While an earlier load is still loading or its backoff
+    /// runs, keep playing behind the room; the server repeats corrections
+    /// that still apply.
+    private func loadWatchPartyCorrection(
+        to position: Double, context: WatchPartyPlaybackContext
+    ) async throws -> WatchPartyPlaybackSnapshot {
+        let now = Date()
+        guard watchPartyReloadBudget.allowed(at: now) else { return watchPartyPlaybackSnapshot }
+        let aim = watchPartyReloadBudget.begin(roomPosition: position, at: now, duration: duration)
+        let generation = watchPartyReloadBudget.generation
+        let before = watchPartyPlaybackSnapshot
+        let startedAt = Date()
+        do {
+            let snapshot = try await applyWatchPartyTransport(.seek(aim), context: context, origin: .correctionLoad)
+            if watchPartyReloadBudget.generation == generation {
+                watchPartyReloadBudget.noteLoading()
+                // A refused reanchor returns too, with the old stream still
+                // playing; only a stream that moved toward the aim is this load.
+                let played = before.isPlaying ? Date().timeIntervalSince(startedAt) : 0
+                if WatchPartyReloadBudget.moved(from: before.sourceTime, played: played, to: snapshot.sourceTime, toward: aim) {
+                    watchPartyReloadBudget.noteSeekCompleted()
+                }
+            }
+            return snapshot
+        } catch is CancellationError {
+            // A newer room command cancelled the wait, not the seek, which is
+            // already loading. Let it land and measure its load time, as the
+            // web client does; `staleAfter` covers a load that never lands.
+            if watchPartyReloadBudget.generation == generation { watchPartyReloadBudget.noteLoading() }
+            throw CancellationError()
+        } catch {
+            if watchPartyReloadBudget.generation == generation { watchPartyReloadBudget.abandon(at: Date()) }
+            throw error
+        }
+    }
+
+    /// Runs on each playback clock update. The room session drives the rate
+    /// nudge; here a rate that could not reach Aether while it was paused or
+    /// rebuffering is handed over once it plays, and a correction load that is
+    /// playing records its load time as the next load's lead.
+    private func updateWatchPartyCatchup() {
+        guard isWatchPartyPlayback else { return }
+        syncWatchPartyRate()
+        guard watchPartyReloadBudget.target != nil else { return }
+        let now = Date()
+        guard watchPartyReloadBudget.inFlight(at: now) else {
+            watchPartyReloadBudget.expire(at: now)
+            return
+        }
+        let snapshot = watchPartyPlaybackSnapshot
+        if snapshot.isPlaying, snapshot.isReady, watchPartyReloadBudget.landed(at: snapshot.sourceTime) {
+            watchPartyReloadBudget.land(at: now)
+        }
+    }
+
+    var watchPartyPlaybackSnapshot: WatchPartyPlaybackSnapshot {
+        let engine = aetherPlaybackController.engine
+        let committed = activeAetherLoadEpoch != nil
+            && activeAetherLoadEpoch == committedProtocolV3LoadEpoch
+        let position = aetherPlaybackController.activeSpec?.timeline.sourcePosition(
+            forPlayerTime: engine.clock.currentTime
+        ) ?? 0
+        let transitioning = freshLoadTask != nil || protocolV3ReplanTask != nil
+        let seeking = seekReplanTask != nil || engine.playbackPhase == .seeking
+        let waitingForMedia: Bool
+        switch engine.playbackPhase {
+        case .loading, .rebuffering, .stalled: waitingForMedia = true
+        default: waitingForMedia = false
+        }
+        let readyPhase = Self.isWatchPartyReadyPhase(engine.playbackPhase)
+        return WatchPartyPlaybackSnapshot(
+            sessionId: committed ? activePlaybackSessionId : nil,
+            fileId: committed ? currentSelectedVersion?.fileId : nil,
+            sourceTime: position,
+            duration: duration,
+            isPlaying: engine.state == .playing,
+            isBuffering: isBuffering || waitingForMedia || transitioning || watchPartyLocalPreparation
+                || aetherPlaybackController.isTransportInterrupted,
+            isReady: committed && !isDisposed && engine.isSessionReady && readyPhase
+                && !transitioning && !seeking && !isBuffering && !watchPartyLocalPreparation
+                && !aetherPlaybackController.isTransportInterrupted,
+            isSeeking: seeking,
+            isEnded: hasReachedEndOfFile
+        )
+    }
+
+    /// Phases in which a member reports to the room and takes its commands.
+    /// Aether parks a finished stream in `.ended`. To the room that member is
+    /// paused and still movable: a room seek remounts it. Leaving `.ended` out
+    /// stopped the member's reports and refused every command, so nothing
+    /// could move it again.
+    nonisolated static func isWatchPartyReadyPhase(_ phase: PlaybackPhase) -> Bool {
+        switch phase {
+        case .playing, .paused, .ended: return true
+        case .idle, .loading, .seeking, .rebuffering, .stalled, .error: return false
+        }
+    }
+
+    private func publishWatchPartySnapshot() {
+        guard isWatchPartyPlayback else { return }
+        watchPartyAdapter?.update(watchPartyPlaybackSnapshot)
+    }
+
+    /// `origin` says why a seek happens and what it does to a correction
+    /// load in flight; see `WatchPartySeekOrigin`.
+    func applyWatchPartyTransport(
+        _ action: WatchPartyPlaybackAction,
+        context: WatchPartyPlaybackContext,
+        origin: WatchPartySeekOrigin = .room
+    ) async throws -> WatchPartyPlaybackSnapshot {
+        guard !isDisposed, watchPartyAdapter?.context == context,
+              watchPartyPlaybackSnapshot.sessionId != nil else {
+            throw WatchPartyPlaybackError.invalidated
+        }
+        switch action {
+        case .play:
+            // A play keeps a catch-up the correction just started, as on the
+            // web client; a new room command cancels it before it executes.
+            guard !watchPartyLocalPreparation, !aetherPlaybackController.isTransportInterrupted else {
+                throw WatchPartyPlaybackError.notReady
+            }
+            // A room play without a seek would only prod a terminal stream,
+            // or revive a dead one at the position it dropped. Stay paused at
+            // the end; the room's next seek remounts this member.
+            if hasReachedEndOfFile { break }
+            // The room wants this member playing, so the rate may start it.
+            // A stopped member starts at 1x and the drift loop nudges from
+            // there. A member already playing at its rate is left alone: on
+            // the software path every rate write re-times the audio clock.
+            if aetherPlaybackController.engine.state != .playing { watchPartyCorrectionRate = 1 }
+            if aetherPlaybackController.engine.state != .playing || watchPartyAppliedRate != watchPartyCorrectionRate {
+                aetherPlaybackController.setSpeed(watchPartyCorrectionRate)
+                watchPartyAppliedRate = watchPartyCorrectionRate
+            }
+            aetherPlaybackController.play()
+        case .pause:
+            cancelWatchPartyCorrection()
+            aetherPlaybackController.pause()
+        case .seek(let position):
+            cancelWatchPartyCorrection()
+            switch origin {
+            case .room:
+                watchPartyReloadBudget.abandon(at: Date())
+                watchPartyReloadBudget.settle()
+            case .realign:
+                watchPartyReloadBudget.retire(at: Date())
+            case .correctionLoad:
+                break
+            }
+            guard position.isFinite, position >= 0 else { throw WatchPartyPlaybackError.notReady }
+            if hasReachedEndOfFile {
+                guard remountWatchPartyPlayback(at: position) else { throw WatchPartyPlaybackError.notReady }
+            } else {
+                commitSeek(to: position, source: "watchParty", roomCommand: true)
+            }
+            // The UI position is optimistic. Wait for the existing seek/replan
+            // machinery, then sample Aether's source clock for the room ack.
+            for _ in 0..<600 {
+                try Task.checkCancellation()
+                guard !isDisposed, watchPartyAdapter?.context == context else {
+                    throw WatchPartyPlaybackError.invalidated
+                }
+                if seekReplanTask == nil && protocolV3ReplanTask == nil && freshLoadTask == nil { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            guard seekReplanTask == nil, protocolV3ReplanTask == nil, freshLoadTask == nil else {
+                throw WatchPartyPlaybackError.notReady
+            }
+        }
+        guard !isDisposed, watchPartyAdapter?.context == context else {
+            throw WatchPartyPlaybackError.invalidated
+        }
+        let snapshot = watchPartyPlaybackSnapshot
+        watchPartyAdapter?.update(snapshot)
+        return snapshot
+    }
+
+    fileprivate func pauseForLocalPreparation() {
+        cancelWatchPartyCorrection()
+        watchPartyLocalPreparation = isWatchPartyPlayback
+        aetherPlaybackController.pause()
+        publishWatchPartySnapshot()
+    }
+
+    fileprivate func resumeAfterLocalPreparation() {
+        watchPartyLocalPreparation = false
+        if !isWatchPartyPlayback { aetherPlaybackController.play() }
+        publishWatchPartySnapshot()
+        // A party member does not resume locally; the room brings it back to
+        // the shared position and play state.
+        if isWatchPartyPlayback { watchPartyAdapter?.onResyncRequired?() }
+    }
+}
+
+// MARK: - Live AI subtitle coordinator adapters
+
+/// `LivePlaybackControls` over the VM's playback transport. The coordinator is
+/// the single owner of pause/resume intent during a live job; this adapter
+/// just forwards. Holds the VM weakly so a torn-down player can't be revived
+/// by a late coordinator call.
+@MainActor
+private final class LiveSubtitlePlaybackAdapter: LivePlaybackControls {
+    private weak var owner: PlayerViewModel?
+
+    init(owner: PlayerViewModel) { self.owner = owner }
+
+    func pause() { owner?.pauseForLocalPreparation() }
+    func play() { owner?.resumeAfterLocalPreparation() }
+    var isPlaying: Bool { owner?.isPlaying ?? false }
+}
+
+/// `LiveSubtitleSink` over the VM's live-track primitives, selection plumbing,
+/// completion handoff, and notice surface. Owns the per-`track_key`
+/// normalized `LiveSubtitleTrack` converters and the `track_key → ordinal`
+/// mapping before publishing source-time cues to Silo's overlay.
+@MainActor
+private final class LiveSubtitleSinkAdapter: LiveSubtitleSink {
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.cubbiestream.kyro",
+        category: "LiveSubtitle"
+    )
+
+    private weak var owner: PlayerViewModel?
+
+    /// How many fed cues still get a `[AI-LIVE-DIAG]` line. Bounded so the log
+    /// shows the opening cues' timing (cue start vs playhead vs the shift) — the
+    /// thing that tells us whether streamed cues land at the playhead — without
+    /// spamming a line per cue. Reset when a new live track is installed.
+    private var diagCueLogBudget = 0
+
+    /// One cue converter per live `track_key` (holds dedupe state).
+    private var converters: [String: LiveSubtitleTrack] = [:]
+    /// `track_key → live-track ordinal`. Assigned monotonically; typically 0
+    /// (one live job at a time), but stable per key so re-entrancy is safe.
+    private var ordinals: [String: Int] = [:]
+    private var nextOrdinal = 0
+    /// The currently installed live track id (for selection / close).
+    private var installedTrackId: Int64?
+    /// The `track_key` of the currently installed live track.
+    private var installedTrackKey: String?
+
+    init(owner: PlayerViewModel) { self.owner = owner }
+
+    func installLiveTrack(trackKey: String, label: String?, language: String?) {
+        guard let owner else { return }
+        let ordinal: Int
+        if let existing = ordinals[trackKey] {
+            ordinal = existing
+        } else {
+            ordinal = nextOrdinal
+            nextOrdinal += 1
+            ordinals[trackKey] = ordinal
+        }
+        converters[trackKey] = LiveSubtitleTrack()
+        diagCueLogBudget = 5
+        let trackId = owner.installLiveSubtitleTrackRow(
+            ordinal: ordinal,
+            label: label ?? "AI subtitles",
+            language: language
+        )
+        installedTrackId = trackId
+        installedTrackKey = trackKey
+    }
+
+    func feedCue(_ cue: PlaybackRealtimeSubtitleCue) {
+        guard let owner, let key = installedTrackKey else { return }
+        // Realtime cue timestamps are already absolute Silo source time.
+        guard var converter = converters[key] else { return }
+        let converted = converter.makeCue(start: cue.start, end: cue.end, text: cue.text)
+        converters[key] = converter // persist dedupe state (value type)
+        guard let converted else { return }
+        if diagCueLogBudget > 0 {
+            diagCueLogBudget -= 1
+            let playheadMs = Int64(owner.currentTime * 1000.0)
+            Self.logger.info(
+                "[AI-LIVE-DIAG] feed cue start=\(cue.start, privacy: .public) startMs=\(converted.startMs, privacy: .public) durMs=\(converted.durationMs, privacy: .public) playheadMs=\(playheadMs, privacy: .public) Δms=\(converted.startMs - playheadMs, privacy: .public) textLen=\(converted.text.count, privacy: .public)"
+            )
+        }
+        owner.feedLiveSubtitleCue(converted)
+    }
+
+    func selectLive(trackKey: String) {
+        guard let owner, let trackId = installedTrackId, installedTrackKey == trackKey else { return }
+        owner.selectLiveSubtitleTrack(trackId: trackId)
+    }
+
+    func closeLiveTrack(trackKey: String) {
+        guard let owner else { return }
+        if let trackId = installedTrackId, installedTrackKey == trackKey {
+            owner.closeLiveSubtitleTrackRow(trackId: trackId)
+            installedTrackId = nil
+            installedTrackKey = nil
+        }
+        converters[trackKey] = nil
+    }
+
+    func closeLiveTrackAfterPersistedSelected(trackKey: String) {
+        guard let owner else { return }
+        // Hand the live track id to the VM to close AFTER the persisted track is
+        // selected (seamless swap). Clear our own bookkeeping now: from the
+        // coordinator's perspective this track is finished, and the VM owns the
+        // deferred row removal + live-cue teardown from here.
+        if let trackId = installedTrackId, installedTrackKey == trackKey {
+            owner.armDeferredLiveSubtitleClose(trackId: trackId)
+            installedTrackId = nil
+            installedTrackKey = nil
+        }
+        converters[trackKey] = nil
+    }
+
+    func restorePriorSelection(_ selection: Int64?) {
+        owner?.restoreLiveSubtitleSelection(selection)
+    }
+
+    func registerPersisted(subtitleId: Int) {
+        // Route through the controller's shared, latched handoff so the
+        // websocket and poller never double-register the track.
+        owner?.subtitleAI.completeLivePersistedHandoff(subtitleId: subtitleId)
+    }
+
+    func showPreparingNotice() {
+        owner?.showLiveSubtitlePreparingNotice()
+    }
+
+    func hidePreparingNotice() {
+        owner?.dismissLiveSubtitlePreparingNotice()
+    }
+
+    func showFailureNotice(_ message: String) {
+        owner?.showLiveSubtitleFailureNotice(message)
+    }
+}

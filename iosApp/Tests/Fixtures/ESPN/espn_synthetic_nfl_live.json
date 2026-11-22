@@ -1,0 +1,136 @@
+{
+  "events": [
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "NFL Net"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": {
+                "current": 99
+              },
+              "homeAway": "home",
+              "id": "1",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "3-5",
+                  "type": "total"
+                }
+              ],
+              "score": "17",
+              "team": {
+                "abbreviation": "ATL",
+                "color": "a71930",
+                "displayName": "Atlanta Falcons",
+                "id": "1",
+                "location": "Atlanta",
+                "logo": "https://a.espncdn.com/i/teamlogos/nfl/500/scoreboard/atl.png",
+                "name": "Falcons",
+                "shortDisplayName": "Falcons"
+              }
+            },
+            {
+              "curatedRank": {
+                "current": 99
+              },
+              "homeAway": "away",
+              "id": "4",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "5-2",
+                  "type": "total"
+                }
+              ],
+              "score": "14",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "fb4f14",
+                "displayName": "Cincinnati Bengals",
+                "id": "4",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/nfl/500/scoreboard/cin.png",
+                "name": "Bengals",
+                "shortDisplayName": "Bengals"
+              }
+            }
+          ],
+          "date": "2026-11-08T14:30Z",
+          "id": "401873038",
+          "notes": [
+            {
+              "headline": "NFL Madrid Game"
+            }
+          ],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "7:41",
+            "period": 3,
+            "type": {
+              "completed": false,
+              "description": "In Progress",
+              "detail": "7:41 - 3rd Quarter",
+              "id": "2",
+              "name": "STATUS_IN_PROGRESS",
+              "shortDetail": "7:41 - 3rd",
+              "state": "in"
+            }
+          },
+          "venue": {
+            "fullName": "Santiago Bernabéu"
+          }
+        }
+      ],
+      "date": "2026-11-08T14:30Z",
+      "id": "401873038",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "7:41",
+        "period": 3,
+        "type": {
+          "completed": false,
+          "description": "In Progress",
+          "detail": "7:41 - 3rd Quarter",
+          "id": "2",
+          "name": "STATUS_IN_PROGRESS",
+          "shortDetail": "7:41 - 3rd",
+          "state": "in"
+        }
+      },
+      "week": {
+        "number": 9
+      }
+    }
+  ],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "reg",
+          "id": "2",
+          "name": "Regular Season",
+          "type": 2
+        },
+        "year": 2026
+      }
+    }
+  ],
+  "week": {
+    "number": 9
+  }
+}

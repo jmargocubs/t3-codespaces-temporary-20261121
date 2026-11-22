@@ -19,3 +19,24 @@ final class CryptoBoundaryTests: XCTestCase {
     XCTAssertEqual(SecretRedactor.redact("Authorization: Bearer synthetic-secret"), "[REDACTED]")
   }
 }
+
+#if canImport(Security)
+final class AppleKeychainCredentialStoreTests: XCTestCase {
+  func testCredentialCRUDAndMissingValue() async throws {
+    let store = AppleKeychainCredentialStore(service: "com.kyro.tests.\(UUID().uuidString)")
+    let key = "provider:synthetic-account:access-token"
+    let missing = try await store.read(key)
+    XCTAssertNil(missing)
+    let secret = Data("fixture-only-credential".utf8)
+    try await store.write(secret, for: key)
+    let saved = try await store.read(key)
+    XCTAssertEqual(saved, secret)
+    try await store.write(Data("rotated".utf8), for: key)
+    let rotated = try await store.read(key)
+    XCTAssertEqual(rotated, Data("rotated".utf8))
+    try await store.remove(key)
+    let removed = try await store.read(key)
+    XCTAssertNil(removed)
+  }
+}
+#endif

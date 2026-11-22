@@ -1,0 +1,23 @@
+// Which Kyro app this branch builds. Included by the iOS app and its extensions so the app and
+// every process that shares its Keychain and App Group agree on one identity.
+//
+// This file is the Kyro Labs identity (branch `kyro/labs`). Stable Kyro (Build 110) keeps its
+// own names in `KyroAppIdentity.stable`; nothing here may equal a stable value. The pairing with
+// `KyroAppIdentity.labs` is enforced by `Tests/KyroLabsIdentityTests.swift`.
+//
+// `Local.xcconfig` is included after this file, so a contributor's override still wins. Overriding
+// SILO_IOS_BUNDLE_ID back to a stable value on a Labs checkout would break Labs's isolation.
+
+KYRO_APP_VARIANT = labs
+KYRO_DISPLAY_NAME = Kyro Labs
+KYRO_APP_ICON_NAME = KyroLabsAppIcon
+KYRO_APP_GROUP = group.com.cubbiestream.kyrolabs
+KYRO_KEYCHAIN_GROUP = com.cubbiestream.kyrolabs.shared
+KYRO_URL_SCHEME = kyrolabs
+KYRO_URL_NAME = com.cubbiestream.kyro.labs
+
+SILO_IOS_BUNDLE_ID = com.cubbiestream.kyro.labs
+SILO_NOTIFICATION_SERVICE_BUNDLE_ID = com.cubbiestream.kyro.labs.NotificationService
+SILO_DOWNLOADS_ACTIVITY_BUNDLE_ID = com.cubbiestream.kyro.labs.DownloadsActivity
+SILO_IOS_ENTITLEMENTS = SiloLabs.entitlements
+SILO_NOTIFICATION_SERVICE_ENTITLEMENTS = NotificationService/NotificationService.labs.entitlements

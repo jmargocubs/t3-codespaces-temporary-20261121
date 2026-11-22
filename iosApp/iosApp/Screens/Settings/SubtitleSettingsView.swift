@@ -1,0 +1,412 @@
+#if !os(tvOS)
+import SwiftUI
+
+/// Subtitle preferences sub-screen — a native grouped list. The
+/// language / behavior / forced trio is profile-wide on the server;
+/// the appearance block saves for the profile too, unless this device
+/// keeps its own ("Only on This Device").
+struct SubtitleSettingsView: View {
+    let viewModel: SettingsViewModel
+
+    var body: some View {
+        List {
+            profileBackedSection
+            if AICapabilities.shared.metadataEnabled {
+                metadataLanguageSection
+            }
+            if viewModel.prefs.hasHeldChanges {
+                HeldSettingChangesSection(
+                    retry: { await viewModel.prefs.retryHeldChanges() },
+                    discard: { await viewModel.prefs.discardHeldChanges() }
+                )
+            }
+            appearanceSection
+        }
+        .settingsListChrome()
+        .navigationTitle("Subtitles")
+        .siloNavigationTitleDisplayMode(.inline)
+        .siloToolbarColorSchemeDark()
+    }
+
+    // MARK: - Metadata language (server-backed, AI-gated)
+
+    @ViewBuilder
+    private var metadataLanguageSection: some View {
+        Section {
+            Picker(
+                "Metadata Language",
+                selection: Binding(
+                    get: { viewModel.prefs.preferredMetadataLanguage },
+                    set: { value in Task { await viewModel.prefs.setPreferredMetadataLanguage(value) } }
+                )
+            ) {
+                Text(
+                    SettingPresentationMetadata.definitions[.catalogMetadataLanguage]?.unsetLabel
+                        ?? "Library default"
+                ).tag(PlaybackPrefSentinel.none)
+                ForEach(viewModel.metadataLanguageOptions) { option in
+                    Text(option.label).tag(option.code)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+        } header: {
+            Text("Metadata")
+                .foregroundStyle(Color.siloSecondaryText)
+        } footer: {
+            Text("Translates descriptions and taglines into your preferred language when available. Titles are never translated.")
+                .foregroundStyle(Color.siloSecondaryText)
+        }
+        .disabled(viewModel.prefs.serverUpgradeRequired)
+        .listRowBackground(Color.siloGroupedCell)
+    }
+
+    // MARK: - Profile prefs (server-backed)
+
+    @ViewBuilder
+    private var profileBackedSection: some View {
+        Section {
+            Picker(
+                "Language",
+                selection: Binding(
+                    get: { viewModel.prefs.subtitleLanguage },
+                    set: { value in Task { await viewModel.prefs.setSubtitleLanguage(value) } }
+                )
+            ) {
+                Text(
+                    SettingPresentationMetadata.definitions[.playbackSubtitleLanguage]?.unsetLabel
+                        ?? "None"
+                ).tag(PlaybackPrefSentinel.none)
+                ForEach(viewModel.subtitleLanguageOptions) { option in
+                    Text(option.label).tag(option.code)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+
+            Picker(
+                "Behavior",
+                selection: Binding(
+                    get: { viewModel.prefs.subtitleMode },
+                    set: { value in Task { await viewModel.prefs.setSubtitleMode(value) } }
+                )
+            ) {
+                ForEach(SubtitleMode.allCases, id: \.rawValue) { mode in
+                    Text(mode.displayLabel).tag(mode.rawValue)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+
+            Toggle(
+                "Show Forced Subtitles",
+                isOn: Binding(
+                    get: { viewModel.prefs.showForcedSubtitles == "on" },
+                    set: { isOn in Task { await viewModel.prefs.setShowForcedSubtitles(isOn) } }
+                )
+            )
+            .foregroundStyle(Color.siloOnSurface)
+            .tint(.siloSwitchOn)
+        } header: {
+            Text("Profile")
+                .foregroundStyle(Color.siloSecondaryText)
+        } footer: {
+            VStack(alignment: .leading, spacing: 6) {
+                if viewModel.subtitleMatchesSystemAppearance {
+                    Text("Language, display behavior, forced captions, and CC/SDH preference follow this device's Accessibility settings.")
+                } else if viewModel.prefs.serverUpgradeRequired {
+                    Text(ProfilePrefsEditor.serverUpgradeMessage)
+                        .foregroundStyle(Color.siloError)
+                } else {
+                    Text("Used to pick a matching track when one is available. Forced subtitles cover foreign-language dialogue even when subtitles are off or set to auto.")
+                    if let overrideMessage = viewModel.prefs.subtitleProfileOverrideMessage {
+                        Text("Override active — \(overrideMessage)")
+                            .foregroundStyle(Color.siloWarning)
+                    }
+                }
+                if let state = viewModel.prefs.saveState,
+                   !(viewModel.prefs.serverUpgradeRequired && state == .serverUpgradeRequired) {
+                    saveStateView(state)
+                }
+            }
+            .foregroundStyle(Color.siloSecondaryText)
+        }
+        .disabled(viewModel.prefs.serverUpgradeRequired || viewModel.subtitleMatchesSystemAppearance)
+        .listRowBackground(Color.siloGroupedCell)
+    }
+
+    // MARK: - Appearance (profile, with an optional device override)
+
+    private var manualEditingDisabled: Bool {
+        viewModel.subtitleMatchesSystemAppearance
+    }
+
+    @ViewBuilder
+    private var appearanceSection: some View {
+        Section {
+            SubtitleAppearancePreview(appearance: viewModel.effectiveSubtitleAppearance)
+                .listRowInsets(EdgeInsets())
+        } header: {
+            Text("Appearance")
+                .foregroundStyle(Color.siloSecondaryText)
+        } footer: {
+            if !manualEditingDisabled && viewModel.subtitleAppearance.isLowLegibilityRisk {
+                Text("Low legibility — very transparent or dark text without a box or outline can be hard to read.")
+                    .foregroundStyle(Color.siloError)
+            }
+        }
+        .listRowBackground(Color.siloGroupedCell)
+
+        Section {
+            Toggle(
+                "Use Device Settings",
+                isOn: Binding(
+                    get: { viewModel.subtitleMatchesSystemAppearance },
+                    set: { viewModel.setSubtitleMatchesSystemAppearance($0) }
+                )
+            )
+            .foregroundStyle(Color.siloOnSurface)
+            .tint(.siloSwitchOn)
+
+            Toggle(
+                "Only on This Device",
+                isOn: Binding(
+                    get: { viewModel.subtitleUsesDeviceAppearanceOverride },
+                    set: { enabled in
+                        Task { await viewModel.setSubtitleDeviceOverrideEnabled(enabled) }
+                    }
+                )
+            )
+            .foregroundStyle(Color.siloOnSurface)
+            .tint(.siloSwitchOn)
+            .disabled(manualEditingDisabled)
+        } footer: {
+            VStack(alignment: .leading, spacing: 6) {
+                if viewModel.subtitleMatchesSystemAppearance {
+                    Text("Following this device's caption language, display behavior, CC/SDH preference, font, colors, opacity, edges, size, and caption window from Accessibility → Subtitles & Captioning.")
+                } else if viewModel.subtitleUsesDeviceAppearanceOverride {
+                    Text("Saved only on this device. Other devices use the profile's settings.")
+                } else {
+                    Text("Saved for this profile on all devices.")
+                }
+                if viewModel.subtitleMatchesSystemAppearance {
+                    Text("Subtitles with built-in styling follow each device caption option's Video Overrides Style choice.")
+                } else {
+                    Text("Subtitles with their own built-in styling keep their original appearance; image-based subtitles keep their authored fonts and colors but follow the size, position, and background settings.")
+                }
+            }
+            .foregroundStyle(Color.siloSecondaryText)
+        }
+        .listRowBackground(Color.siloGroupedCell)
+
+        Section {
+            Picker("Font Size", selection: appearanceBinding(\.fontSize)) {
+                ForEach(SubtitleFontSizePreset.allCases) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+
+            Picker("Font Family", selection: appearanceBinding(\.fontFamily)) {
+                ForEach(SubtitleFontFamilyPreset.allCases) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+
+            ColorChoicePicker(
+                title: "Font Color",
+                colors: SubtitleAppearance.fontColors,
+                selection: appearanceBinding(\.fontColor)
+            )
+
+            if viewModel.offersSubtitleTextOpacity {
+                PercentField(
+                    label: "Opacity",
+                    accessibilityLabelText: "Text Opacity",
+                    min: 1,
+                    value: viewModel.subtitleAppearance.textOpacity
+                ) { newValue in
+                    var next = viewModel.subtitleAppearance
+                    if next.textOpacity == newValue { return }
+                    next.textOpacity = newValue
+                    Task { await viewModel.setSubtitleAppearance(next) }
+                }
+                .foregroundStyle(Color.siloOnSurface)
+            }
+
+            Toggle("Text Outline", isOn: appearanceBinding(\.textOutline))
+                .foregroundStyle(Color.siloOnSurface)
+                .tint(.siloSwitchOn)
+
+            ColorChoicePicker(
+                title: "Outline Color",
+                colors: SubtitleAppearance.outlineColors,
+                selection: appearanceBinding(\.textOutlineColor)
+            )
+            .disabled(!viewModel.subtitleAppearance.textOutline)
+            .opacity(viewModel.subtitleAppearance.textOutline ? 1 : 0.45)
+        } header: {
+            Text("Text")
+                .foregroundStyle(Color.siloSecondaryText)
+        }
+        .listRowBackground(Color.siloGroupedCell)
+        .disabled(manualEditingDisabled)
+        .opacity(manualEditingDisabled ? 0.45 : 1)
+
+        Section {
+            Picker("Style", selection: backgroundStyleBinding) {
+                ForEach(SubtitleBackgroundStylePreset.selectableCases) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+
+            opacityRow
+                .disabled(viewModel.subtitleAppearance.backgroundStyle != .box)
+                .opacity(viewModel.subtitleAppearance.backgroundStyle == .box ? 1 : 0.45)
+
+            ColorChoicePicker(
+                title: "Color",
+                colors: SubtitleAppearance.backgroundColors,
+                selection: appearanceBinding(\.backgroundColor)
+            )
+            .disabled(viewModel.subtitleAppearance.backgroundStyle != .box)
+            .opacity(viewModel.subtitleAppearance.backgroundStyle == .box ? 1 : 0.45)
+        } header: {
+            Text("Background")
+                .foregroundStyle(Color.siloSecondaryText)
+        }
+        .listRowBackground(Color.siloGroupedCell)
+        .disabled(manualEditingDisabled)
+        .opacity(manualEditingDisabled ? 0.45 : 1)
+
+        Section {
+            Picker("Position", selection: appearanceBinding(\.position)) {
+                ForEach(SubtitlePositionPreset.allCases) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .foregroundStyle(Color.siloOnSurface)
+            .settingsPickerStyle()
+        } header: {
+            Text("Layout")
+                .foregroundStyle(Color.siloSecondaryText)
+        }
+        .listRowBackground(Color.siloGroupedCell)
+        .disabled(manualEditingDisabled)
+        .opacity(manualEditingDisabled ? 0.45 : 1)
+    }
+
+    /// Choosing Box with a fully transparent background would render
+    /// nothing; give it the default opacity so the choice takes effect.
+    private var backgroundStyleBinding: Binding<SubtitleBackgroundStylePreset> {
+        Binding(
+            get: { viewModel.subtitleAppearance.backgroundStyle },
+            set: { newValue in
+                var next = viewModel.subtitleAppearance
+                if next.backgroundStyle == newValue { return }
+                next.backgroundStyle = newValue
+                if newValue == .box && next.backgroundOpacity == 0 {
+                    next.backgroundOpacity = SubtitleAppearance.default.backgroundOpacity
+                }
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    private var opacityRow: some View {
+        PercentField(
+            label: "Opacity",
+            accessibilityLabelText: "Background Opacity",
+            min: 0,
+            value: viewModel.subtitleAppearance.backgroundOpacity
+        ) { newValue in
+            var next = viewModel.subtitleAppearance
+            if next.backgroundOpacity == newValue { return }
+            next.backgroundOpacity = newValue
+            Task { await viewModel.setSubtitleAppearance(next) }
+        }
+        .foregroundStyle(Color.siloOnSurface)
+    }
+
+    private func appearanceBinding<Value: Equatable>(
+        _ keyPath: WritableKeyPath<SubtitleAppearance, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { viewModel.subtitleAppearance[keyPath: keyPath] },
+            set: { newValue in
+                var next = viewModel.subtitleAppearance
+                if next[keyPath: keyPath] == newValue { return }
+                next[keyPath: keyPath] = newValue
+                Task { await viewModel.setSubtitleAppearance(next) }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func saveStateView(_ state: ProfilePrefsEditor.PrefSaveState) -> some View {
+        switch state {
+        case .saving:
+            Text("Saving…")
+        case .saved:
+            Text("Saved")
+        case .failed(let message):
+            Text("Couldn't save: \(message)")
+                .foregroundStyle(Color.siloError)
+        case .serverUpgradeRequired:
+            Text(ProfilePrefsEditor.serverUpgradeMessage)
+                .foregroundStyle(Color.siloError)
+        case .held:
+            Text("Not saved. Try again or discard the change below.")
+                .foregroundStyle(Color.siloWarning)
+        }
+    }
+}
+
+// MARK: - Color choice row
+
+/// A named-color picker rendered as a standard row so every option gets a
+/// full-size tap target.
+private struct ColorChoicePicker: View {
+    let title: String
+    let colors: [(hex: String, label: String)]
+    @Binding var selection: String
+
+    var body: some View {
+        Picker(selection: normalizedSelection) {
+            ForEach(colors, id: \.hex) { color in
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(Color(hex: color.hex))
+                        .frame(width: 22, height: 22)
+                        .overlay(
+                            Circle()
+                                .stroke(Color.siloSecondaryText.opacity(0.35), lineWidth: 1)
+                        )
+                    Text(color.label)
+                }
+                .tag(color.hex)
+            }
+        } label: {
+            Text(title)
+                .foregroundStyle(Color.siloOnSurface)
+        }
+        .settingsPickerStyle()
+    }
+
+    /// Stored hex values may differ in case from the option list.
+    private var normalizedSelection: Binding<String> {
+        Binding(
+            get: {
+                colors.first(where: { $0.hex.caseInsensitiveCompare(selection) == .orderedSame })?.hex
+                    ?? selection.lowercased()
+            },
+            set: { selection = $0 }
+        )
+    }
+}
+#endif

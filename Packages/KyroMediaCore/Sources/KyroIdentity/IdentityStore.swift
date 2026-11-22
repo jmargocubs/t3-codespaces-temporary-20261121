@@ -61,6 +61,10 @@ public struct IdentityStore: Sendable {
     let state = try await database.load(State.self, key: key) ?? State()
     return state.profiles.filter { includeDeleted || $0.tombstonedAt == nil }
   }
+  public func hasPIN(for profile: KyroProfileID) async throws -> Bool {
+    let state = try await database.load(State.self, key: key) ?? State()
+    return state.pins[profile.description] != nil
+  }
   public func delete(_ id: KyroProfileID, at date: Date = Date()) async throws {
     try await update { state in
       guard let index = state.profiles.firstIndex(where: { $0.id == id }) else {

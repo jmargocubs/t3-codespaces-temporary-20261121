@@ -1,0 +1,506 @@
+{
+  "events": [
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "MLB.TV"
+              ]
+            },
+            {
+              "names": [
+                "Padres.TV"
+              ]
+            },
+            {
+              "names": [
+                "Reds.TV"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": null,
+              "homeAway": "home",
+              "id": "17",
+              "linescores": [
+                {
+                  "displayValue": "0",
+                  "period": 1,
+                  "value": 0
+                },
+                {
+                  "displayValue": "1",
+                  "period": 2,
+                  "value": 1
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "67-73",
+                  "type": "total"
+                }
+              ],
+              "score": "3",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "c6011f",
+                "displayName": "Cincinnati Reds",
+                "id": "17",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/cin.png",
+                "name": "Reds",
+                "shortDisplayName": "Reds"
+              }
+            },
+            {
+              "curatedRank": null,
+              "homeAway": "away",
+              "id": "25",
+              "linescores": [
+                {
+                  "displayValue": "2",
+                  "period": 1,
+                  "value": 2
+                },
+                {
+                  "displayValue": "0",
+                  "period": 2,
+                  "value": 0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "73-67",
+                  "type": "total"
+                }
+              ],
+              "score": "4",
+              "team": {
+                "abbreviation": "SD",
+                "color": "2f241d",
+                "displayName": "San Diego Padres",
+                "id": "25",
+                "location": "San Diego",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/sd.png",
+                "name": "Padres",
+                "shortDisplayName": "Padres"
+              }
+            }
+          ],
+          "date": "2026-09-02T16:40Z",
+          "id": "401816775",
+          "notes": [],
+          "situation": {
+            "outs": 2
+          },
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 7,
+            "type": {
+              "completed": false,
+              "description": "Top 7th",
+              "detail": "Top 7th",
+              "id": "x",
+              "name": "STATUS_IN_PROGRESS",
+              "shortDetail": "Top 7th",
+              "state": "in"
+            }
+          },
+          "venue": {
+            "fullName": "Great American Ball Park"
+          }
+        }
+      ],
+      "date": "2026-09-02T16:40Z",
+      "id": "syn-mlb-live",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 7,
+        "type": {
+          "completed": false,
+          "description": "Top 7th",
+          "detail": "Top 7th",
+          "id": "x",
+          "name": "STATUS_IN_PROGRESS",
+          "shortDetail": "Top 7th",
+          "state": "in"
+        }
+      },
+      "week": null
+    },
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "MLB.TV"
+              ]
+            },
+            {
+              "names": [
+                "Padres.TV"
+              ]
+            },
+            {
+              "names": [
+                "Reds.TV"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": null,
+              "homeAway": "home",
+              "id": "17",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "67-73",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "c6011f",
+                "displayName": "Cincinnati Reds",
+                "id": "17",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/cin.png",
+                "name": "Reds",
+                "shortDisplayName": "Reds"
+              }
+            },
+            {
+              "curatedRank": null,
+              "homeAway": "away",
+              "id": "25",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "73-67",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "SD",
+                "color": "2f241d",
+                "displayName": "San Diego Padres",
+                "id": "25",
+                "location": "San Diego",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/sd.png",
+                "name": "Padres",
+                "shortDisplayName": "Padres"
+              }
+            }
+          ],
+          "date": "2026-09-03T23:05Z",
+          "id": "401816775",
+          "notes": [],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 0,
+            "type": {
+              "completed": false,
+              "description": "Postponed",
+              "detail": "Postponed",
+              "id": "x",
+              "name": "STATUS_POSTPONED",
+              "shortDetail": "Postponed",
+              "state": "post"
+            }
+          },
+          "venue": {
+            "fullName": "Great American Ball Park"
+          }
+        }
+      ],
+      "date": "2026-09-03T23:05Z",
+      "id": "syn-mlb-postponed",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 0,
+        "type": {
+          "completed": false,
+          "description": "Postponed",
+          "detail": "Postponed",
+          "id": "x",
+          "name": "STATUS_POSTPONED",
+          "shortDetail": "Postponed",
+          "state": "post"
+        }
+      },
+      "week": null
+    },
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "MLB.TV"
+              ]
+            },
+            {
+              "names": [
+                "Padres.TV"
+              ]
+            },
+            {
+              "names": [
+                "Reds.TV"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": null,
+              "homeAway": "home",
+              "id": "17",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "67-73",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "c6011f",
+                "displayName": "Cincinnati Reds",
+                "id": "17",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/cin.png",
+                "name": "Reds",
+                "shortDisplayName": "Reds"
+              }
+            },
+            {
+              "curatedRank": null,
+              "homeAway": "away",
+              "id": "25",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "73-67",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "SD",
+                "color": "2f241d",
+                "displayName": "San Diego Padres",
+                "id": "25",
+                "location": "San Diego",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/sd.png",
+                "name": "Padres",
+                "shortDisplayName": "Padres"
+              }
+            }
+          ],
+          "date": "2026-09-04T17:05Z",
+          "id": "401816775",
+          "notes": [],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 0,
+            "type": {
+              "completed": false,
+              "description": "9/4 - 1:05 PM EDT",
+              "detail": "9/4 - 1:05 PM EDT",
+              "id": "x",
+              "name": "STATUS_SCHEDULED",
+              "shortDetail": "9/4 - 1:05 PM EDT",
+              "state": "pre"
+            }
+          },
+          "venue": {
+            "fullName": "Great American Ball Park"
+          }
+        }
+      ],
+      "date": "2026-09-04T17:05Z",
+      "id": "syn-mlb-dh-game1",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 0,
+        "type": {
+          "completed": false,
+          "description": "9/4 - 1:05 PM EDT",
+          "detail": "9/4 - 1:05 PM EDT",
+          "id": "x",
+          "name": "STATUS_SCHEDULED",
+          "shortDetail": "9/4 - 1:05 PM EDT",
+          "state": "pre"
+        }
+      },
+      "week": null
+    },
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "MLB.TV"
+              ]
+            },
+            {
+              "names": [
+                "Padres.TV"
+              ]
+            },
+            {
+              "names": [
+                "Reds.TV"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": null,
+              "homeAway": "home",
+              "id": "17",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "67-73",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "c6011f",
+                "displayName": "Cincinnati Reds",
+                "id": "17",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/cin.png",
+                "name": "Reds",
+                "shortDisplayName": "Reds"
+              }
+            },
+            {
+              "curatedRank": null,
+              "homeAway": "away",
+              "id": "25",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "73-67",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "SD",
+                "color": "2f241d",
+                "displayName": "San Diego Padres",
+                "id": "25",
+                "location": "San Diego",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/sd.png",
+                "name": "Padres",
+                "shortDisplayName": "Padres"
+              }
+            }
+          ],
+          "date": "2026-09-04T23:10Z",
+          "id": "401816775",
+          "notes": [],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 0,
+            "type": {
+              "completed": false,
+              "description": "9/4 - 7:10 PM EDT",
+              "detail": "9/4 - 7:10 PM EDT",
+              "id": "x",
+              "name": "STATUS_SCHEDULED",
+              "shortDetail": "9/4 - 7:10 PM EDT",
+              "state": "pre"
+            }
+          },
+          "venue": {
+            "fullName": "Great American Ball Park"
+          }
+        }
+      ],
+      "date": "2026-09-04T23:10Z",
+      "id": "syn-mlb-dh-game2",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 0,
+        "type": {
+          "completed": false,
+          "description": "9/4 - 7:10 PM EDT",
+          "detail": "9/4 - 7:10 PM EDT",
+          "id": "x",
+          "name": "STATUS_SCHEDULED",
+          "shortDetail": "9/4 - 7:10 PM EDT",
+          "state": "pre"
+        }
+      },
+      "week": null
+    }
+  ],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "post",
+          "id": "3",
+          "name": "Postseason",
+          "type": 3
+        },
+        "year": 2026
+      }
+    }
+  ],
+  "week": null
+}

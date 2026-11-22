@@ -1,0 +1,277 @@
+#if os(tvOS)
+import SwiftUI
+
+/// tvOS poster card on the cached Nuke renderer. `.nativeCard` uses the system
+/// `.card` lift and parallax; `.ring` uses a white ring and scale to match the
+/// episode and cast rails. The caption below highlights on focus.
+struct TVMediaCard: View {
+    let title: String
+    let posterUrl: String
+    var posterThumbhash: String? = nil
+    var episodeWatchState: EpisodeWatchState? = nil
+    var imageIsEpisodeStill: Bool? = nil
+    /// Catalog type; picks the mark shown when the poster is missing.
+    var mediaType: String? = nil
+    var year: Int? = nil
+    /// Optional second caption line rendered in place of the year (same
+    /// type treatment) — e.g. "Book 3" on audiobook series rails.
+    var subtitle: String? = nil
+    var userState: MediaItemUserState? = nil
+    /// Data for optional overlay badges. `nil` skips overlay rendering;
+    /// callers without per-item OverlaySummary should leave it off.
+    var overlayData: OverlayData? = nil
+    let action: () -> Void
+    /// Remote Play/Pause shortcut. When nil, the card does not intercept the
+    /// command (used for non-playable containers such as series).
+    var playAction: (() -> Void)? = nil
+    /// Width of the poster. Defaults to the theme's standard poster size.
+    /// Override with a smaller value in space-constrained grids (e.g. the
+    /// Library tab where the alphabet rail forces cards to shrink).
+    var cardWidth: CGFloat = SiloTheme.posterCardWidth
+    var aspect: MediaCardAspect = .poster
+    var prefersDefaultFocus: Bool = false
+    var defaultFocusNamespace: Namespace.ID? = nil
+    /// Focus visual. `.nativeCard` keeps tvOS's `.card` lift + parallax
+    /// (library grids, search). `.ring` matches the white-ring + scale
+    /// treatment of the episode and cast rails so the detail-page
+    /// "Recommended / More Like This" rail reads consistently with its
+    /// neighbours instead of using the subtler native lift.
+    var focusTreatment: FocusTreatment = .nativeCard
+    /// Optional external focus hook so a parent rail can make this card a
+    /// `.defaultFocus` target on d-pad entry. The focusable element is the
+    /// inner Button, so the binding is applied there — a `.focused` on the
+    /// card's outer VStack silently no-ops. Mirrors `MediaCard.focusedItemId`.
+    var focusBinding: FocusState<String?>.Binding? = nil
+    var focusContentId: String? = nil
+    /// Catalog identity for the long-press favorite/watchlist menu.
+    /// `nil` (or a nil `userState`) leaves the card without a menu.
+    var contentId: String? = nil
+
+    enum FocusTreatment {
+        case nativeCard
+        case ring
+    }
+
+    @FocusState private var isFocused: Bool
+    @State private var personalState = MediaCardPersonalState()
+    @State private var uiCustomization = UICustomizationPreferences.shared
+    @EnvironmentObject private var overlayStore: OverlayPrefsStore
+
+    private static let captionSpacing: CGFloat = 16
+
+    private var resolvedCardWidth: CGFloat { artworkSize.width }
+    private var cardHeight: CGFloat { artworkSize.height }
+    private var artworkSize: CGSize { Self.artworkSize(cardWidth: cardWidth, aspect: aspect) }
+
+    /// How far the focused poster extends below its frame: the native lift,
+    /// or half of what the ring style's scale adds.
+    private var focusedPosterOverhang: CGFloat {
+        switch focusTreatment {
+        case .nativeCard: TVCardCaption.cardLiftOverhang
+        case .ring: (TVCardFocusButtonStyle().scale - 1) / 2 * cardHeight
+        }
+    }
+
+    /// The size a card of `cardWidth` draws its artwork at, at the current
+    /// card-size setting.
+    static func artworkSize(cardWidth: CGFloat, aspect: MediaCardAspect) -> CGSize {
+        let width = cardWidth * UICustomizationPreferences.shared.cardPresentation.posterSize.scale
+        switch aspect {
+        case .poster: return CGSize(width: width, height: width * 1.5)
+        case .square: return CGSize(width: width, height: width)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Self.captionSpacing) {
+            posterButton
+                .mediaStateContextMenu(hasPersonalActions ? stateMenu : nil)
+            if uiCustomization.cardPresentation.caption.showsTitle {
+                caption.tvCardCaptionFocus(
+                    isFocused: isFocused,
+                    posterOverhang: focusedPosterOverhang,
+                    spacing: Self.captionSpacing
+                )
+            }
+        }
+        .frame(width: resolvedCardWidth)
+        .mediaActionFeedback(personalState.feedback)
+        .onChange(of: userState) { _, _ in
+            personalState.reset()
+        }
+    }
+
+    // MARK: - Favorite / watchlist context actions
+
+    private var hasPersonalActions: Bool {
+        contentId != nil && userState != nil
+    }
+
+    private var isFavorite: Bool { personalState.isFavorite(userState) }
+
+    private var isInWatchlist: Bool { personalState.inWatchlist(userState) }
+
+    private var isPlayed: Bool { personalState.isPlayed(userState) }
+
+    private var hidesEpisodeStill: Bool {
+        guard var state = episodeWatchState else { return false }
+        state.played = isPlayed
+        return EpisodeSpoilerPreferences.shared.settings.hidesImage(for: state, isEpisodeStill: imageIsEpisodeStill)
+    }
+
+    private var stateMenu: MediaStateMenuItems {
+        MediaStateMenuItems(
+            isWatched: isPlayed,
+            isFavorite: isFavorite,
+            inWatchlist: isInWatchlist,
+            isUpdating: personalState.feedback.isUpdating,
+            onToggleWatched: aspect != .square ? toggleWatched : nil,
+            onToggleFavorite: togglePersonalFavorite,
+            onToggleWatchlist: togglePersonalWatchlist
+        )
+    }
+
+    private func toggleWatched() {
+        guard let contentId else { return }
+        personalState.toggleWatched(from: userState, via: .catalog(contentId: contentId))
+    }
+
+    private func togglePersonalFavorite() {
+        guard let contentId else { return }
+        personalState.toggleFavorite(contentId: contentId, from: userState)
+    }
+
+    private func togglePersonalWatchlist() {
+        guard let contentId else { return }
+        personalState.toggleWatchlist(contentId: contentId, from: userState)
+    }
+
+    @ViewBuilder
+    private var posterButton: some View {
+        switch focusTreatment {
+        case .nativeCard:
+            wired(Button(action: action) { posterImage }.buttonStyle(.card))
+        case .ring:
+            // The ring is the focus cue; the style suppresses the system halo.
+            wired(
+                Button(action: action) {
+                    posterImage.tvFocusRing(
+                        isFocused: isFocused,
+                        cornerRadius: SiloTheme.cornerRadius,
+                        lineWidth: 4
+                    )
+                }
+                .buttonStyle(TVCardFocusButtonStyle(
+                    unfocusedShadowOpacity: 0,
+                    unfocusedShadowRadius: 0,
+                    unfocusedShadowY: 0
+                ))
+            )
+        }
+    }
+
+    /// Focus and accessibility wiring, attached directly to the styled
+    /// Button: a `.focused` on a wrapping container silently no-ops.
+    private func wired(_ button: some View) -> some View {
+        button
+            .focused($isFocused)
+            .applyDefaultFocusIfNeeded(prefersDefaultFocus, namespace: defaultFocusNamespace)
+            .tvFocused(focusBinding, equals: focusContentId)
+            .applyTVCardPlayPauseAction(playAction)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityDescription)
+    }
+
+    // MARK: - Subviews
+
+    private var posterImage: some View {
+        ZStack(alignment: .topTrailing) {
+            AsyncImageView(
+                url: posterUrl,
+                thumbhash: posterThumbhash,
+                targetSize: CGSize(width: resolvedCardWidth, height: cardHeight),
+                contentMode: .fill,
+                placeholderStyle: .artwork,
+                placeholderSymbol: ArtworkPlaceholderSymbol.forMediaType(mediaType)
+            )
+            .episodeSpoilerBlur(hidesEpisodeStill)
+            .frame(width: resolvedCardWidth, height: cardHeight)
+            .clipShape(RoundedRectangle(cornerRadius: SiloTheme.cornerRadius))
+
+            if let overlayData, overlayStore.enabled {
+                CardOverlays(data: overlayData, prefs: overlayStore.prefs, variant: .poster)
+                    .frame(width: resolvedCardWidth, height: cardHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: SiloTheme.cornerRadius))
+            }
+
+            if isPlayed {
+                watchedBadge
+                    .padding(12)
+            }
+        }
+        .frame(width: resolvedCardWidth, height: cardHeight)
+    }
+
+    // Plex-style: centered title with year directly underneath in a
+    // lighter weight + dimmer color. Single-line truncation keeps the
+    // caption a uniform two-row block across the whole grid.
+    private var caption: some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.siloPosterTitle)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .tvCardTitleFocus(isFocused: isFocused)
+                .frame(width: resolvedCardWidth, alignment: .center)
+
+            if uiCustomization.cardPresentation.caption.showsMetadata,
+               let secondLine = subtitle ?? year.map(String.init) {
+                Text(secondLine)
+                    .font(.siloPosterMetadata)
+                    .tvCardSubtitleFocus(isFocused: isFocused)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(width: resolvedCardWidth, alignment: .center)
+                    .clipped()
+            }
+        }
+        .multilineTextAlignment(.center)
+        .frame(width: resolvedCardWidth, alignment: .center)
+    }
+
+    private var watchedBadge: some View {
+        ZStack {
+            Circle()
+                .fill(Color.siloOnSurface)
+                .frame(width: 40, height: 40)
+                .shadow(color: .black.opacity(0.3), radius: 4)
+            Image(systemName: "checkmark")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundColor(Color.siloBackground)
+        }
+    }
+
+    private var accessibilityDescription: String {
+        let secondLine = subtitle ?? year.map(String.init)
+        var components = [title]
+        if let secondLine {
+            components.append(secondLine)
+        }
+        if isPlayed {
+            components.append("Watched")
+        }
+        return components.joined(separator: ", ")
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func applyTVCardPlayPauseAction(_ action: (() -> Void)?) -> some View {
+        if let action {
+            self.onPlayPauseCommand(perform: action)
+        } else {
+            self
+        }
+    }
+}
+#endif

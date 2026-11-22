@@ -1,0 +1,248 @@
+{
+  "events": [
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "NFL Net"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": {
+                "current": 99
+              },
+              "homeAway": "home",
+              "id": "1",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "3-5",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "ATL",
+                "color": "a71930",
+                "displayName": "Atlanta Falcons",
+                "id": "1",
+                "location": "Atlanta",
+                "logo": "https://a.espncdn.com/i/teamlogos/nfl/500/scoreboard/atl.png",
+                "name": "Falcons",
+                "shortDisplayName": "Falcons"
+              }
+            },
+            {
+              "curatedRank": {
+                "current": 99
+              },
+              "homeAway": "away",
+              "id": "4",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "5-2",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "fb4f14",
+                "displayName": "Cincinnati Bengals",
+                "id": "4",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/nfl/500/scoreboard/cin.png",
+                "name": "Bengals",
+                "shortDisplayName": "Bengals"
+              }
+            }
+          ],
+          "date": "2026-11-08T14:30Z",
+          "id": "401873038",
+          "notes": [
+            {
+              "headline": "NFL Madrid Game"
+            }
+          ],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 0,
+            "type": {
+              "completed": false,
+              "description": "Scheduled",
+              "detail": "Sun, November 8th at 9:30 AM EST",
+              "id": "1",
+              "name": "STATUS_SCHEDULED",
+              "shortDetail": "11/8 - 9:30 AM EST",
+              "state": "pre"
+            }
+          },
+          "venue": {
+            "fullName": "Santiago Bernabéu"
+          }
+        }
+      ],
+      "date": "2026-11-08T14:30Z",
+      "id": "401873038",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 0,
+        "type": {
+          "completed": false,
+          "description": "Scheduled",
+          "detail": "Sun, November 8th at 9:30 AM EST",
+          "id": "1",
+          "name": "STATUS_SCHEDULED",
+          "shortDetail": "11/8 - 9:30 AM EST",
+          "state": "pre"
+        }
+      },
+      "week": {
+        "number": 9
+      }
+    },
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "Fox"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": {
+                "current": 99
+              },
+              "homeAway": "home",
+              "id": "11",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "2-6",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "IND",
+                "color": "003b75",
+                "displayName": "Indianapolis Colts",
+                "id": "11",
+                "location": "Indianapolis",
+                "logo": "https://a.espncdn.com/i/teamlogos/nfl/500/scoreboard/ind.png",
+                "name": "Colts",
+                "shortDisplayName": "Colts"
+              }
+            },
+            {
+              "curatedRank": {
+                "current": 99
+              },
+              "homeAway": "away",
+              "id": "6",
+              "linescores": [],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "3-5",
+                  "type": "total"
+                }
+              ],
+              "score": "0",
+              "team": {
+                "abbreviation": "DAL",
+                "color": "002a5c",
+                "displayName": "Dallas Cowboys",
+                "id": "6",
+                "location": "Dallas",
+                "logo": "https://a.espncdn.com/i/teamlogos/nfl/500/scoreboard/dal.png",
+                "name": "Cowboys",
+                "shortDisplayName": "Cowboys"
+              }
+            }
+          ],
+          "date": "2026-11-08T18:00Z",
+          "id": "401873040",
+          "notes": [],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 0,
+            "type": {
+              "completed": false,
+              "description": "Scheduled",
+              "detail": "Sun, November 8th at 1:00 PM EST",
+              "id": "1",
+              "name": "STATUS_SCHEDULED",
+              "shortDetail": "11/8 - 1:00 PM EST",
+              "state": "pre"
+            }
+          },
+          "venue": {
+            "fullName": "Lucas Oil Stadium"
+          }
+        }
+      ],
+      "date": "2026-11-08T18:00Z",
+      "id": "401873040",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 0,
+        "type": {
+          "completed": false,
+          "description": "Scheduled",
+          "detail": "Sun, November 8th at 1:00 PM EST",
+          "id": "1",
+          "name": "STATUS_SCHEDULED",
+          "shortDetail": "11/8 - 1:00 PM EST",
+          "state": "pre"
+        }
+      },
+      "week": {
+        "number": 9
+      }
+    }
+  ],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "reg",
+          "id": "2",
+          "name": "Regular Season",
+          "type": 2
+        },
+        "year": 2026
+      }
+    }
+  ],
+  "week": {
+    "number": 9
+  }
+}

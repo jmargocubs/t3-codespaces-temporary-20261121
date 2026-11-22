@@ -1,0 +1,1812 @@
+import Foundation
+
+@Observable
+@MainActor
+class ItemDetailViewModel {
+    let libraryId: Int?
+
+    init(
+        libraryId: Int? = nil,
+        descriptionTranslation: DescriptionTranslationCoordinator? = nil,
+        seasonDescriptionTranslation: DescriptionTranslationCoordinator? = nil
+    ) {
+        self.libraryId = libraryId
+        self.descriptionTranslation = descriptionTranslation ?? DescriptionTranslationCoordinator()
+        self.seasonDescriptionTranslation = seasonDescriptionTranslation ?? DescriptionTranslationCoordinator()
+    }
+
+    var detail: ItemDetail?
+    var error: ErrorState?
+
+    // Catalog metadata and the hierarchy finish independently. An empty array
+    // is only an empty result after its request has succeeded.
+    enum HierarchyLoadState { case idle, loading, loaded, failed }
+    var seasonsLoadState: HierarchyLoadState = .idle
+    var episodesLoadFailed = false
+    private var failedEpisodeSeasonNumber: Int?
+    private var seasonsLoadGeneration = 0
+    private var detailLoadGeneration = 0
+
+    /// Also invalidates unstructured retry tasks when the route disappears.
+    func cancelDetailLoading() {
+        detailLoadGeneration += 1
+        _ = beginDetailWrite()
+        seasonsLoadGeneration += 1
+        episodeLoadGeneration += 1
+        episodePersonalListRefreshGeneration += 1
+        if seasonsLoadState == .loading { seasonsLoadState = .idle }
+        isLoadingEpisodes = false
+    }
+
+    var isLoadingSeriesHierarchy: Bool {
+        if seasons.isEmpty {
+            return seasonsLoadState == .idle || seasonsLoadState == .loading
+        }
+        return isLoadingEpisodes
+            || (selectedSeason == nil && seasonsLoadState == .loading)
+    }
+
+    var seriesLoadErrorMessage: String? {
+        if seasonsLoadState == .failed { return "Couldn't load seasons." }
+        if episodesLoadFailed { return "Couldn't load episodes." }
+        return nil
+    }
+
+    func retrySeriesHierarchy(
+        fetchSeasons: (@Sendable (String) async throws -> SeasonsResponse)? = nil,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)? = nil
+    ) async {
+        guard let seriesId = seriesContentId else { return }
+        if seasonsLoadState == .failed || selectedSeason == nil {
+            let hadSelection = selectedSeason != nil
+            let selectionGeneration = episodeLoadGeneration
+            await loadSeasons(
+                seriesId: seriesId,
+                autoSelectInitial: !hadSelection,
+                fetchSeasons: fetchSeasons,
+                fetchEpisodes: fetchEpisodes
+            )
+            // A cold retry already loads its episode page. A warm retry may
+            // need to recover both failures, unless the user selected elsewhere.
+            guard hadSelection, !Task.isCancelled, seasonsLoadState == .loaded,
+                  selectionGeneration == episodeLoadGeneration else { return }
+        }
+        if episodesLoadFailed,
+           let target = seasons.first(where: { $0.seasonNumber == failedEpisodeSeasonNumber })
+                    ?? selectedSeason {
+            await selectSeason(target, forceRefresh: true, fetchEpisodes: fetchEpisodes)
+        }
+    }
+
+    // Series-specific state
+    var seasons: [Season] = [] {
+        didSet {
+            #if os(tvOS)
+            updateSeriesEpisodeWindow()
+            #endif
+        }
+    }
+    var selectedSeason: Season? {
+        didSet {
+            #if os(tvOS)
+            updateSeriesEpisodeWindow()
+            #endif
+        }
+    }
+    /// Season to open on (from an episode/season link or Continue Watching)
+    /// instead of the default pick. Cleared once that season's page loads or
+    /// the user picks another.
+    @ObservationIgnored var initialResumeSeasonNumber: Int?
+    var episodes: [EpisodeListItem] = []
+    /// Route-scoped pages already loaded while browsing seasons. This keeps
+    /// chip taps and iPad page swipes instant when the user comes back to a
+    /// season, while `ResponseCache` remains the longer-lived cold-start tier.
+    var episodesBySeason: [Int: [EpisodeListItem]] = [:] {
+        didSet {
+            #if os(tvOS)
+            updateSeriesEpisodeWindow()
+            #endif
+        }
+    }
+    var episodeFavoriteStates: [String: Bool] = [:]
+    var episodeWatchlistStates: [String: Bool] = [:]
+    var isLoadingEpisodes = false
+    private var isUpdatingEpisodeWatched = false
+
+    /// Protects local context-menu updates from older favorite lookups that
+    /// finish after the user has already changed an episode's state.
+    private var episodePersonalListMutationVersions: [String: Int] = [:]
+    private var episodePersonalListRefreshGeneration = 0
+    #if os(tvOS)
+    /// Favorite lookups are below-fold decoration. Keep their bounded fanout
+    /// out of the detail screen's initial metadata wave and cancel stale work
+    /// when the user moves to another season.
+    @ObservationIgnored
+    private var episodePersonalListRefreshTask: Task<Void, Never>?
+    #endif
+    /// Cancels publication from an older season request after the user has
+    /// already moved to another page.
+    private var episodeLoadGeneration = 0
+    /// Per season, how many description-translator reads have been
+    /// published. Such a read always began after every load still in flight
+    /// (otherwise its generation check fails), so a load that sees this move
+    /// carries the older page and leaves the published one alone.
+    private var translatedEpisodePublications: [Int: Int] = [:]
+    #if !os(tvOS)
+    /// Warms the other seasons' pages, nearest first, once the selected
+    /// season is known, so a later chip tap is served from memory without
+    /// slowing first paint.
+    @ObservationIgnored
+    private var seasonEpisodePrefetchTask: Task<Void, Never>?
+    #endif
+    /// Season whose episodes are actually painted. Used to roll back an
+    /// optimistic chip/page selection if its request fails.
+    private var loadedSeasonNumber: Int?
+    /// Bumped by explicit season choices, not by automatic refreshes. A
+    /// playback return that finishes loading after one leaves it alone.
+    @ObservationIgnored private var seasonChoiceGeneration = 0
+
+    /// Bumped by every writer of `detail` + `CacheKey.itemDetail`, so a load
+    /// that started earlier but finishes later cannot publish over a newer
+    /// payload.
+    ///
+    /// The race this closes: an entry `loadDetail` on a cache hit fetches the
+    /// pre-refresh catalog payload and then suspends inside
+    /// ``enrichPlaybackMetadata(for:contentId:)`` (a whole `/watch` round
+    /// trip); the trailer poll publishes its newer, trailers-bearing payload
+    /// meanwhile; the older load resumes and overwrites `detail` and the
+    /// cache with the trailer-less item — the run reports `.found` and no
+    /// rail appears.
+    private var detailGeneration = 0
+    /// Playback metadata is useful for the selectors, but it must never hold
+    /// the whole first render behind a second network round-trip. The catalog
+    /// payload paints immediately; this task upgrades it in place afterward.
+    @ObservationIgnored
+    private var playbackEnrichmentTask: Task<Void, Never>?
+
+    // User actions
+    var isFavorite = false
+    var inWatchlist = false
+    var isWatched = false
+    /// Invalidates favorite/watchlist lookups that began before a local
+    /// mutation. Without this, a slow entry load can overwrite an optimistic
+    /// button tap and put the stale pair back into `ResponseCache`.
+    private var userStateMutationGeneration = 0
+    /// Bumped by every watched change to this page's item, so an older
+    /// toggle's response cannot reassert or roll back over a newer one.
+    private var watchedToggleGeneration = 0
+    /// Owner captured when the detail load began. Membership reads and
+    /// favorite/watchlist/watched writes from this page run under it, so a
+    /// tap after a profile or server switch is refused instead of landing on
+    /// the replacement owner.
+    @ObservationIgnored
+    private var personalStateOwner: CapturedOrdinaryRequestAuth?
+    /// A failed or unconfirmed favorite/watchlist/watched change on this page.
+    var personalStateNotice: PersonalStateNotice?
+
+    #if os(tvOS)
+    // tvOS pre-play selector state. ItemDetailCache retains this view model
+    // while the user enters playback or navigates to another item, so manual
+    // Version / Audio / Subtitle picks survive those round trips instead of
+    // being reset every time the detail task restarts. The phone page keeps
+    // its own per-visit copies in ItemDetailPhoneContent.
+    var preferredVersionFileId: Int?
+    var preferredAudioTrackIndex: Int?
+    var preferredSubtitleTrackIndex: Int?
+    /// Distinguishes a selector choice from a server-derived launch seed so
+    /// enabling device caption settings can discard only the latter.
+    var preferredSubtitleTrackWasManuallySelected = false
+    var preferredNextUpFileId: Int?
+    var preferredNextUpAudioTrackIndex: Int?
+    var preferredNextUpSubtitleTrackIndex: Int?
+    #endif
+
+    // Track the series contentId for season/episode loading
+    private var seriesContentId: String?
+
+    // MARK: Description translation
+
+    /// On-view translation of the page's own description (movie, series,
+    /// audiobook). See `ItemDetailViewModel+DescriptionTranslation`.
+    let descriptionTranslation: DescriptionTranslationCoordinator
+    /// On-view translation of the selected season's episode descriptions on
+    /// a series page: the season's job covers its episodes.
+    let seasonDescriptionTranslation: DescriptionTranslationCoordinator
+
+    /// - Parameter preserveSeasonSelection: keep the season the user is
+    ///   currently browsing instead of re-running the auto-select. Set by
+    ///   background reloads that happen *while* the page is on screen (the
+    ///   trailer fetch's found-path), where snapping the episode rail back to
+    ///   the preferred initial season would yank the ground out from under
+    ///   the user — under focus, on tvOS. Entry loads and the player-dismiss
+    ///   reload leave it false: there, re-picking the season is the point.
+    func loadDetail(
+        contentId: String,
+        preserveSeasonSelection: Bool = false,
+        coalescesMetadataRequests: Bool = true,
+        fetchDetail: (@Sendable (String) async throws -> ItemDetail)? = nil
+    ) async {
+        guard !Task.isCancelled else { return }
+        detailLoadGeneration += 1
+        let loadGeneration = detailLoadGeneration
+        if let detail, detail.contentId != contentId {
+            seasonsLoadGeneration += 1
+            episodeLoadGeneration += 1
+            self.detail = nil
+            seriesContentId = nil
+            seasons = []
+            selectedSeason = nil
+            episodes = []
+            episodesBySeason = [:]
+            loadedSeasonNumber = nil
+            seasonsLoadState = .idle
+            episodesLoadFailed = false
+            isLoadingEpisodes = false
+        }
+        if detail?.contentId != contentId {
+            #if !os(tvOS)
+            seasonEpisodePrefetchTask?.cancel()
+            seasonEpisodePrefetchTask = nil
+            #endif
+        }
+
+        // Stage 1 — hydrate from cache synchronously so the view paints
+        // the last-known detail immediately. Anything missing (e.g.
+        // first-ever visit) leaves the corresponding fields nil and the
+        // view falls back to its skeleton.
+        hydrateFromCache(contentId: contentId)
+
+        #if os(tvOS)
+        // Home / library focus may already have warmed this Series hierarchy.
+        // Start its silent refresh now, alongside the catalog refresh, instead
+        // of waiting for that otherwise-redundant item request to finish first.
+        let cachedDetailForRelatedStructure = detail?.contentId == contentId
+            ? detail
+            : nil
+        async let cachedRelatedStructureLoad: Void = loadRelatedStructureFromCacheIfAvailable(
+            cachedDetailForRelatedStructure,
+            contentId: contentId,
+            preserveSeasonSelection: preserveSeasonSelection,
+            coalescesMetadataRequests: coalescesMetadataRequests
+        )
+        #endif
+
+        // Claimed before the fetch, so "newer" means "started later" — a
+        // trailer-found adopt that begins while this request is in flight
+        // supersedes it even though it publishes first.
+        let generation = beginDetailWrite()
+
+        #if !os(tvOS)
+        // Continue Watching already identifies the series and season. Start
+        // that structure alongside the catalog instead of serializing all
+        // three requests.
+        let resumeSeason = preserveSeasonSelection ? nil : initialResumeSeasonNumber
+        async let resumeStructure = loadContinueWatchingStructure(
+            contentId: contentId,
+            seasonNumber: resumeSeason,
+            detailGeneration: generation
+        )
+        #endif
+
+        error = nil
+
+        do {
+            let userStateGeneration = userStateMutationGeneration
+            personalStateOwner = await TokenStore.shared.captureOrdinaryRequestAuth()
+
+            let item: ItemDetail
+            if let fetchDetail {
+                item = try await fetchDetail(contentId)
+            } else if coalescesMetadataRequests {
+                item = try await MetadataRequestPool.shared.itemDetail(contentId: contentId, libraryId: libraryId)
+            } else {
+                item = try await SiloAPI.shared.itemDetail(contentId: contentId, libraryId: libraryId)
+            }
+            // The v2 detail carries the viewer's flags, so favorite and
+            // watchlist need no extra round trips. Independent of the detail
+            // payload, so it still applies to a superseded load; an absent
+            // `user_state` keeps whatever was hydrated from cache.
+            if let userState = item.userState,
+               !Task.isCancelled, loadGeneration == detailLoadGeneration,
+               userStateMutationGeneration == userStateGeneration {
+                isFavorite = userState.isFavorite
+                inWatchlist = userState.inWatchlist
+                ResponseCache.shared.set(
+                    UserItemState(isFavorite: userState.isFavorite, inWatchlist: userState.inWatchlist),
+                    for: CacheKey.itemUserState(contentId)
+                )
+            }
+            let enriched = await adoptDetail(
+                item,
+                contentId: contentId,
+                generation: generation,
+                coalescesMetadataRequest: coalescesMetadataRequests
+            )
+
+            // Superseded: a newer payload is already on screen. Deriving
+            // watched state or the season/episode structure from this older
+            // copy would undo parts of it (and re-run the season auto-select
+            // under the user).
+            guard let enriched else { return }
+
+            // A Watched tap made while this request was in flight wins.
+            if userStateMutationGeneration == userStateGeneration {
+                isWatched = enriched.userData?.played ?? false
+            }
+
+            #if os(tvOS)
+            if cachedDetailForRelatedStructure != nil {
+                await cachedRelatedStructureLoad
+            } else {
+                await loadRelatedStructure(
+                    for: enriched,
+                    contentId: contentId,
+                    preserveSeasonSelection: preserveSeasonSelection,
+                    coalescesMetadataRequests: coalescesMetadataRequests
+                )
+            }
+            #else
+            if resumeSeason != nil {
+                let didLoadResumeStructure = await resumeStructure
+                // The catalog and hierarchy must both succeed before consuming
+                // the entry intent. A catalog error retries loadDetail directly.
+                if didLoadResumeStructure, !Task.isCancelled,
+                   generation == detailGeneration,
+                   initialResumeSeasonNumber == resumeSeason {
+                    initialResumeSeasonNumber = nil
+                }
+                if !Task.isCancelled, generation == detailGeneration,
+                   let selectedSeason {
+                    // Secondary seasons/favorites stay outside the resume
+                    // page's initial metadata wave.
+                    startEpisodePagePrefetch(
+                        seriesId: contentId, seasons: seasons, selectedSeason: selectedSeason
+                    )
+                    await refreshEpisodePersonalListStates(for: episodes)
+                }
+            } else {
+                await loadRelatedStructure(
+                    for: enriched,
+                    contentId: contentId,
+                    preserveSeasonSelection: preserveSeasonSelection,
+                    coalescesMetadataRequests: coalescesMetadataRequests
+                )
+            }
+            #endif
+        } catch let err {
+            guard !Task.isCancelled, loadGeneration == detailLoadGeneration else { return }
+            if detail == nil {
+                self.error = ErrorState(err)
+            }
+        }
+    }
+
+    /// Claim the right to publish into `detail`, invalidating any write that
+    /// claimed earlier and hasn't landed yet.
+    private func beginDetailWrite() -> Int {
+        playbackEnrichmentTask?.cancel()
+        playbackEnrichmentTask = nil
+        detailGeneration += 1
+        return detailGeneration
+    }
+
+    /// Publish a payload the caller re-fetched itself, taking the generation
+    /// with it so an in-flight load can't land its older copy afterwards.
+    /// Used by the description translator, which polls the catalog directly
+    /// and (deliberately) skips playback enrichment.
+    func publishRefetchedDetail(_ item: ItemDetail, contentId: String) {
+        _ = beginDetailWrite()
+        detail = item
+        ResponseCache.shared.set(item, for: CacheKey.itemDetail(contentId, libraryId: libraryId))
+    }
+
+    /// Publish and cache the catalog payload immediately, then fill in
+    /// playback-only fields from `/watch/{id}` in the background so a cold
+    /// visit paints after one request.
+    ///
+    /// Returns `nil` — publishing nothing — when a newer write claimed the
+    /// slot before this catalog payload arrived.
+    private func adoptDetail(
+        _ item: ItemDetail,
+        contentId: String,
+        generation: Int,
+        coalescesMetadataRequest: Bool = true
+    ) async -> ItemDetail? {
+        guard !Task.isCancelled, generation == detailGeneration else { return nil }
+
+        #if os(tvOS)
+        // Non-blocking: the movie cast portraits join the already-installed
+        // shared image pipeline as soon as the existing catalog payload lands.
+        // No metadata request or navigation gate is added here.
+        PosterImageCache.prefetchVisibleMovieCast(for: item)
+        #endif
+
+        let initial: ItemDetail
+        if supportsPlaybackMetadata(item),
+           let cachedWatchDetail: WatchDetail = ResponseCache.shared.get(
+               CacheKey.itemWatchDetail(contentId, libraryId: libraryId)
+           ) {
+            initial = applyingPlaybackMetadata(cachedWatchDetail, to: item)
+        } else {
+            initial = item
+        }
+
+        detail = initial
+        ResponseCache.shared.set(initial, for: CacheKey.itemDetail(contentId, libraryId: libraryId))
+
+        guard supportsPlaybackMetadata(item) else { return initial }
+
+        playbackEnrichmentTask = Task { [weak self] in
+            guard let self,
+                  let enriched = await self.enrichPlaybackMetadata(
+                      for: item,
+                      contentId: contentId,
+                      coalescesMetadataRequest: coalescesMetadataRequest
+                  ),
+                  !Task.isCancelled,
+                  generation == self.detailGeneration else { return }
+
+            self.detail = enriched
+            ResponseCache.shared.set(enriched, for: CacheKey.itemDetail(contentId, libraryId: libraryId))
+            self.playbackEnrichmentTask = nil
+        }
+
+        return initial
+    }
+
+    /// Load the season / episode structure a detail payload implies.
+    ///
+    /// Only Series owns the season list and episode browser.
+    private func loadRelatedStructure(
+        for enriched: ItemDetail,
+        contentId: String,
+        preserveSeasonSelection: Bool,
+        coalescesMetadataRequests: Bool = true
+    ) async {
+        if enriched.type == "series" {
+            seriesContentId = contentId
+            let keepSeason = preserveSeasonSelection ? selectedSeason?.seasonNumber : nil
+            let selectionGeneration = episodeLoadGeneration
+            await loadSeasons(
+                seriesId: contentId,
+                autoSelectInitial: keepSeason == nil,
+                coalescesMetadataRequest: coalescesMetadataRequests
+            )
+            if let keepSeason, selectionGeneration == episodeLoadGeneration, !Task.isCancelled {
+                // Re-point at the freshly-loaded instance of the same
+                // season so its progress counters are current, without
+                // re-fetching the episode rail the user is looking at.
+                selectedSeason = seasons.first(where: { $0.seasonNumber == keepSeason })
+                    ?? selectedSeason
+            }
+        }
+    }
+
+    #if os(tvOS)
+    private func loadRelatedStructureFromCacheIfAvailable(
+        _ cachedDetail: ItemDetail?,
+        contentId: String,
+        preserveSeasonSelection: Bool,
+        coalescesMetadataRequests: Bool
+    ) async {
+        guard let cachedDetail else { return }
+        await loadRelatedStructure(
+            for: cachedDetail,
+            contentId: contentId,
+            preserveSeasonSelection: preserveSeasonSelection,
+            coalescesMetadataRequests: coalescesMetadataRequests
+        )
+    }
+    #endif
+
+    /// Adopt a detail payload the caller already has in hand, taking the
+    /// same path a `loadDetail` response would — enrichment, cache write,
+    /// watched flag, season/episode structure — minus the catalog fetch that
+    /// produced it and the favorite/watchlist round trips, which nothing
+    /// about a background refresh invalidates. The watched flag is skipped
+    /// when this page changed it after `watchedGeneration` was captured: the
+    /// payload may predate that change.
+    ///
+    /// Enrichment failing is not fatal here: it returns the payload
+    /// untouched, so the new trailers still render.
+    ///
+    /// Claiming a generation is what stops an entry `loadDetail` that is
+    /// still suspended in enrichment from landing its older, trailer-less
+    /// payload on top of this one afterwards.
+    private func apply(
+        item: ItemDetail,
+        contentId: String,
+        preserveSeasonSelection: Bool,
+        watchedGeneration: Int
+    ) async {
+        let generation = beginDetailWrite()
+        guard let enriched = await adoptDetail(
+            item,
+            contentId: contentId,
+            generation: generation
+        ) else { return }
+        if userStateMutationGeneration == watchedGeneration {
+            isWatched = enriched.userData?.played ?? false
+        }
+        await loadRelatedStructure(
+            for: enriched,
+            contentId: contentId,
+            preserveSeasonSelection: preserveSeasonSelection
+        )
+    }
+
+    /// Paint every cached fragment the screen knows how to render so a
+    /// returning visit never starts from a blank state.
+    func hydrateFromCache(contentId: String) {
+        if detail == nil,
+           let cached: ItemDetail = ResponseCache.shared.get(CacheKey.itemDetail(contentId, libraryId: libraryId)) {
+            #if os(tvOS)
+            // Start a disk/memory-cache promotion before the cached detail is
+            // published into the first body evaluation.
+            PosterImageCache.prefetchVisibleMovieCast(for: cached)
+            #endif
+            detail = cached
+            isWatched = cached.userData?.played ?? false
+
+            if cached.type == "series" {
+                seriesContentId = contentId
+            }
+        }
+        if let state: UserItemState = ResponseCache.shared.get(CacheKey.itemUserState(contentId)) {
+            isFavorite = state.isFavorite
+            inWatchlist = state.inWatchlist
+        }
+        if let seriesId = seriesContentId,
+           seasons.isEmpty,
+           let cached: SeasonsResponse = ResponseCache.shared.get(CacheKey.itemSeasons(seriesId, libraryId: libraryId)) {
+            seasons = cached.seasons.sortedForDisplay()
+            seasonsLoadState = .loaded
+        }
+        if let detail, let seriesId = seriesContentId, selectedSeason == nil {
+            if detail.type == "series" {
+                #if !os(tvOS)
+                if let initialResumeSeasonNumber {
+                    // A stale cache cannot decide that the requested season
+                    // is missing. Wait for the authoritative hierarchy before
+                    // offering playback from a fallback season.
+                    selectedSeason = seasons.first { $0.seasonNumber == initialResumeSeasonNumber }
+                    if selectedSeason == nil { isLoadingEpisodes = true }
+                } else {
+                    selectedSeason = preferredInitialSeason(seasons: seasons)
+                }
+                #else
+                selectedSeason = preferredInitialSeason(seasons: seasons)
+                #endif
+            }
+            // Both platforms can paint a warmed hierarchy on the first frame,
+            // including a successful empty page. Refresh it silently afterward.
+            if let seasonNumber = selectedSeason?.seasonNumber,
+               episodes.isEmpty,
+               let cached: EpisodesResponse = ResponseCache.shared.get(
+                   CacheKey.itemEpisodes(seriesId: seriesId, seasonNumber: seasonNumber, libraryId: libraryId)
+               ) {
+                let sorted = cached.sortedEpisodes
+                episodes = sorted
+                episodesBySeason[seasonNumber] = sorted
+                loadedSeasonNumber = seasonNumber
+            }
+        }
+    }
+
+    private func enrichPlaybackMetadata(
+        for item: ItemDetail,
+        contentId: String,
+        coalescesMetadataRequest: Bool
+    ) async -> ItemDetail? {
+        do {
+            let watchDetail: WatchDetail
+            if coalescesMetadataRequest {
+                watchDetail = try await MetadataRequestPool.shared.watchDetail(contentId: contentId, libraryId: libraryId)
+            } else {
+                watchDetail = try await SiloAPI.shared.watchDetail(contentId: contentId, libraryId: libraryId)
+            }
+            ResponseCache.shared.set(watchDetail, for: CacheKey.itemWatchDetail(contentId, libraryId: libraryId))
+            return applyingPlaybackMetadata(watchDetail, to: item)
+        } catch {
+            return nil
+        }
+    }
+
+    private func supportsPlaybackMetadata(_ item: ItemDetail) -> Bool {
+        item.type != "series" && item.type != "season" && item.type != "episode"
+    }
+
+    private func applyingPlaybackMetadata(
+        _ watchDetail: WatchDetail,
+        to item: ItemDetail
+    ) -> ItemDetail {
+        ItemDetail(
+                contentId: item.contentId,
+                type: item.type,
+                status: item.status,
+                title: item.title,
+                sortTitle: item.sortTitle,
+                originalTitle: item.originalTitle,
+                originalLanguage: item.originalLanguage,
+                showStatus: item.showStatus,
+                year: item.year,
+                overview: item.overview,
+                tagline: item.tagline,
+                runtime: item.runtime,
+                contentRating: item.contentRating,
+                advisoryAge: item.advisoryAge,
+                advisorySource: item.advisorySource,
+                genres: item.genres,
+                ratingImdb: item.ratingImdb,
+                ratingTmdb: item.ratingTmdb,
+                ratingRtCritic: item.ratingRtCritic,
+                ratingRtAudience: item.ratingRtAudience,
+                ratings: item.ratings,
+                imdbId: item.imdbId,
+                tmdbId: item.tmdbId,
+                tvdbId: item.tvdbId,
+                cast: item.cast,
+                crew: item.crew,
+                studios: item.studios,
+                networks: item.networks,
+                countries: item.countries,
+                releaseDate: item.releaseDate,
+                firstAirDate: item.firstAirDate,
+                lastAirDate: item.lastAirDate,
+                posterIsEpisodeStill: item.posterIsEpisodeStill,
+                backdropIsEpisodeStill: item.backdropIsEpisodeStill,
+                posterUrl: item.posterUrl,
+                posterThumbhash: item.posterThumbhash,
+                backdropUrl: item.backdropUrl,
+                backdropThumbhash: item.backdropThumbhash,
+                logoUrl: item.logoUrl,
+                seasonCount: item.seasonCount,
+                seriesId: item.seriesId,
+                seriesTitle: item.seriesTitle,
+                seasonNumber: item.seasonNumber,
+                episodeNumber: item.episodeNumber,
+                episodeCount: item.episodeCount,
+                airDate: item.airDate,
+                isSpecials: item.isSpecials,
+                userData: item.userData,
+                versions: watchDetail.versions,
+                playbackVariants: item.playbackVariants,
+                subtitles: watchDetail.subtitles,
+                intro: watchDetail.intro,
+                credits: watchDetail.credits,
+                effectiveSubtitleLanguage: watchDetail.effectiveSubtitleLanguage,
+                hasWatchDetailSubtitlePolicy: true,
+                effectiveSubtitleMode: watchDetail.effectiveSubtitleMode,
+                effectiveShowForcedSubtitles: watchDetail.effectiveShowForcedSubtitles,
+                effectiveSubtitleTrackSignature: watchDetail.effectiveSubtitleTrackSignature,
+                overlaySummary: item.overlaySummary,
+                audiobook: item.audiobook,
+                pendingTranslationLanguage: item.pendingTranslationLanguage,
+                // Catalog-only fields: the watch detail knows nothing about
+                // them, so they must be carried across or the trailers rail
+                // would disappear the moment enrichment succeeds.
+                videos: item.videos,
+                extras: item.extras,
+                machineTranslatedFields: item.machineTranslatedFields,
+                themes: item.themes
+            )
+    }
+
+    // MARK: - Trailer fetch
+
+    /// Manual "Find Trailers" driver, created on first use and wired to the
+    /// live API plus this view model's own reload.
+    ///
+    /// `@ObservationIgnored` because the UI binds to the coordinator's own
+    /// `@Observable` phase, not through this view model — and because the
+    /// accessor below writes the slot on first read, which must not count as
+    /// a state mutation during a view update.
+    @ObservationIgnored
+    private var trailerFetchStorage: TrailerFetchCoordinator?
+
+    /// The item the in-flight run started on. Pins the whole run to one id:
+    /// the closures below resolve `detail?.contentId` when they run, so
+    /// without this a view model reused for another item mid-poll (tvOS
+    /// keeps them cached) would poll the *new* item against the *old*
+    /// item's baseline counts and could report a false "found".
+    @ObservationIgnored
+    private var trailerFetchContentId: String?
+
+    var trailerFetch: TrailerFetchCoordinator {
+        if let trailerFetchStorage { return trailerFetchStorage }
+        // The closures resolve `contentId` when they run rather than
+        // capturing it here, so a view model that gets reused for another
+        // item can never address the old one — and the pin makes them fail
+        // outright rather than quietly switch items mid-run.
+        let coordinator = TrailerFetchCoordinator(
+            request: { [weak self] in
+                let contentId = try self?.pinnedTrailerFetchContentId()
+                guard let contentId else { throw ItemDetailViewModelError.noItemLoaded }
+                return try await SiloAPI.shared.requestTrailersRefresh(contentId: contentId)
+            },
+            fetchDetail: { [weak self, libraryId] in
+                let contentId = try self?.pinnedTrailerFetchContentId()
+                guard let contentId else { throw ItemDetailViewModelError.noItemLoaded }
+                return try await SiloAPI.shared.itemDetail(contentId: contentId, libraryId: libraryId)
+            }
+        )
+        trailerFetchStorage = coordinator
+        return coordinator
+    }
+
+    /// The loaded item's id, but only while it is still the item the trailer
+    /// run started on. Throws otherwise, which the coordinator treats as a
+    /// transient failure (the poll keeps its baseline and settles out).
+    private func pinnedTrailerFetchContentId() throws -> String {
+        guard let contentId = detail?.contentId,
+              contentId == trailerFetchContentId else {
+            throw ItemDetailViewModelError.noItemLoaded
+        }
+        return contentId
+    }
+
+    /// Whether the "Find Trailers" action applies to what's on screen. The
+    /// server only ever populates videos for movies and series.
+    var supportsTrailerFetch: Bool {
+        detail?.type == "movie" || detail?.type == "series"
+    }
+
+    /// - Parameter remoteVideosDisplayable: false when the caller's rail
+    ///   cannot render remote (YouTube) cards — tvOS with no YouTube app
+    ///   installed. iOS and macOS always can, so they leave it at true.
+    func startTrailerFetch(remoteVideosDisplayable: Bool = true) {
+        guard let contentId = detail?.contentId, supportsTrailerFetch else { return }
+        trailerFetchContentId = contentId
+        // Captured once per run: a resumed poll reuses this closure, and the
+        // payload it finds may have been read before a later watched change.
+        let watchedGeneration = userStateMutationGeneration
+        trailerFetch.start(
+            baseline: detail,
+            remoteVideosDisplayable: remoteVideosDisplayable
+        ) { [weak self] found in
+            guard let self else { return }
+            // Apply the payload the coordinator already observed the trailers
+            // in, rather than fetching the same item a second time: a
+            // transient failure there would leave the page on the old detail
+            // even though the run has reported success. This lands while the
+            // page is on screen, so the season the user is browsing must
+            // survive it.
+            guard found.contentId == contentId else {
+                // Shouldn't happen (the run is pinned to one id), but a
+                // mismatched payload must never be written under this id.
+                await self.loadDetail(
+                    contentId: contentId,
+                    preserveSeasonSelection: true,
+                    coalescesMetadataRequests: false
+                )
+                return
+            }
+            await self.apply(
+                item: found,
+                contentId: contentId,
+                preserveSeasonSelection: true,
+                watchedGeneration: watchedGeneration
+            )
+        }
+    }
+
+    /// Stop the poll when the page leaves the nav stack: the coordinator's
+    /// task is not owned by SwiftUI's `.task` lifetime and would otherwise
+    /// keep this view model alive and mutating.
+    func stopTrailerFetch() {
+        trailerFetchStorage?.stop()
+    }
+
+    /// Pick the poll back up when the page returns — e.g. the user played
+    /// the movie mid-fetch, which cancelled it. No-op unless a poll was
+    /// actually interrupted, and never re-POSTs (the slot is already spent).
+    func resumeTrailerFetchIfNeeded() {
+        trailerFetchStorage?.resumeIfInterrupted()
+    }
+
+    // MARK: - Seasons
+
+    #if !os(tvOS)
+    /// Resume-only entry: one request wave, with no alternate page or scroll
+    /// implementation. Cached content stays painted during revalidation, and
+    /// an intervening season tap wins over this initial selection.
+    @discardableResult
+    func loadContinueWatchingStructure(
+        contentId: String,
+        seasonNumber: Int?,
+        detailGeneration expectedDetailGeneration: Int? = nil,
+        fetchSeasons: (@Sendable (String) async throws -> SeasonsResponse)? = nil,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)? = nil
+    ) async -> Bool {
+        guard let seasonNumber, !Task.isCancelled else { return false }
+        let translationPublications = translatedEpisodePublications[seasonNumber, default: 0]
+        seriesContentId = contentId
+        seasonsLoadGeneration += 1
+        let hierarchyGeneration = seasonsLoadGeneration
+        episodeLoadGeneration += 1
+        seasonsLoadState = .loading
+        episodesLoadFailed = false
+        let selectionGeneration = episodeLoadGeneration
+        defer {
+            if hierarchyGeneration == seasonsLoadGeneration, seasonsLoadState == .loading {
+                seasonsLoadState = .idle
+            }
+            if hierarchyGeneration == seasonsLoadGeneration,
+               selectionGeneration == episodeLoadGeneration, isLoadingEpisodes {
+                isLoadingEpisodes = false
+            }
+        }
+        if episodes.isEmpty, !isLoadingEpisodes { isLoadingEpisodes = true }
+        let fetchSeasons = fetchSeasons ?? { [libraryId] in
+            try await MetadataRequestPool.shared.seasons(seriesId: $0, libraryId: libraryId)
+        }
+        let fetchEpisodes = fetchEpisodes ?? { [libraryId] in
+            try await MetadataRequestPool.shared.episodes(seriesId: $0, seasonNumber: $1, libraryId: libraryId)
+        }
+        async let episodeResponse = try? fetchEpisodes(contentId, seasonNumber)
+        let seasonResponse = try? await fetchSeasons(contentId)
+        guard !Task.isCancelled,
+              expectedDetailGeneration == nil || expectedDetailGeneration == detailGeneration,
+              hierarchyGeneration == seasonsLoadGeneration,
+              selectionGeneration == episodeLoadGeneration else { return false }
+
+        seasonsLoadState = seasonResponse == nil ? .failed : .loaded
+        if let seasonResponse {
+            ResponseCache.shared.set(seasonResponse, for: CacheKey.itemSeasons(contentId, libraryId: libraryId))
+            let sorted = seasonResponse.seasons.sortedForDisplay()
+            if seasons != sorted { seasons = sorted }
+        }
+        let target = seasons.first { $0.seasonNumber == seasonNumber }
+            ?? preferredInitialSeason(seasons: seasons)
+        guard let target else {
+            if seasonResponse != nil {
+                selectedSeason = nil
+                episodes = []
+                episodesBySeason = [:]
+                loadedSeasonNumber = nil
+            }
+            return false
+        }
+        if selectedSeason != target { selectedSeason = target }
+
+        if target.seasonNumber != seasonNumber {
+            // The requested season is missing; fall back to preferredInitialSeason.
+            await selectSeason(target, forceRefresh: true)
+            return seasonResponse != nil && !Task.isCancelled
+                && (expectedDetailGeneration == nil || expectedDetailGeneration == detailGeneration)
+                && selectedSeason?.seasonNumber == target.seasonNumber
+                && loadedSeasonNumber == target.seasonNumber
+        }
+
+        if isLoadingEpisodes != episodes.isEmpty { isLoadingEpisodes = episodes.isEmpty }
+        let response = await episodeResponse
+        guard !Task.isCancelled,
+              expectedDetailGeneration == nil || expectedDetailGeneration == detailGeneration,
+              hierarchyGeneration == seasonsLoadGeneration,
+              selectionGeneration == episodeLoadGeneration else { return false }
+        if let response, translatedEpisodePublications[seasonNumber, default: 0] == translationPublications {
+            ResponseCache.shared.set(response, for: CacheKey.itemEpisodes(
+                seriesId: contentId, seasonNumber: seasonNumber,
+                libraryId: libraryId
+            ))
+            let sorted = response.sortedEpisodes
+            if episodesBySeason[seasonNumber] != sorted { episodesBySeason[seasonNumber] = sorted }
+            if episodes != sorted { episodes = sorted }
+            loadedSeasonNumber = seasonNumber
+        }
+        episodesLoadFailed = response == nil
+        failedEpisodeSeasonNumber = response == nil ? seasonNumber : nil
+        if isLoadingEpisodes { isLoadingEpisodes = false }
+        return seasonResponse != nil && response != nil
+    }
+    #endif
+
+    func loadSeasons(
+        seriesId: String,
+        autoSelectInitial: Bool = true,
+        coalescesMetadataRequest: Bool = true,
+        fetchSeasons: (@Sendable (String) async throws -> SeasonsResponse)? = nil,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)? = nil
+    ) async {
+        guard !Task.isCancelled else { return }
+        seriesContentId = seriesId
+        seasonsLoadGeneration += 1
+        let generation = seasonsLoadGeneration
+        let previousLoadState = seasonsLoadState
+        seasonsLoadState = .loading
+        if autoSelectInitial { episodesLoadFailed = false }
+        let selectionGeneration = episodeLoadGeneration
+        defer {
+            if generation == seasonsLoadGeneration, seasonsLoadState == .loading {
+                seasonsLoadState = previousLoadState == .loading ? .idle : previousLoadState
+            }
+            // Cold episode routes start loading before hierarchy resolution.
+            // Failure or an empty hierarchy must end that initial wait, but
+            // must not clear a newer selection or a parallel episode refresh.
+            if generation == seasonsLoadGeneration, autoSelectInitial,
+               selectionGeneration == episodeLoadGeneration, isLoadingEpisodes {
+                isLoadingEpisodes = false
+            }
+        }
+        do {
+            let response: SeasonsResponse
+            if let fetchSeasons {
+                response = try await fetchSeasons(seriesId)
+            } else if coalescesMetadataRequest {
+                response = try await MetadataRequestPool.shared.seasons(seriesId: seriesId, libraryId: libraryId)
+            } else {
+                response = try await SiloAPI.shared.seasons(seriesId: seriesId, libraryId: libraryId)
+            }
+            guard !Task.isCancelled, generation == seasonsLoadGeneration else { return }
+            ResponseCache.shared.set(response, for: CacheKey.itemSeasons(seriesId, libraryId: libraryId))
+            seasons = response.seasons.sortedForDisplay()
+            seasonsLoadState = .loaded
+            if seasons.isEmpty, selectionGeneration == episodeLoadGeneration,
+               autoSelectInitial || detail?.type == "series" {
+                episodeLoadGeneration += 1
+                selectedSeason = nil
+                episodes = []
+                episodesBySeason = [:]
+                loadedSeasonNumber = nil
+                isLoadingEpisodes = false
+                episodesLoadFailed = false
+            }
+            if autoSelectInitial, selectionGeneration == episodeLoadGeneration,
+               let target = preferredInitialSeason(seasons: seasons) {
+                #if !os(tvOS)
+                startEpisodePagePrefetch(
+                    seriesId: seriesId,
+                    seasons: seasons,
+                    selectedSeason: target
+                )
+                #endif
+                await selectSeason(
+                    target,
+                    forceRefresh: true,
+                    coalescesMetadataRequest: coalescesMetadataRequest,
+                    fetchEpisodes: fetchEpisodes
+                )
+                if !Task.isCancelled, generation == seasonsLoadGeneration,
+                   !episodesLoadFailed, loadedSeasonNumber == target.seasonNumber {
+                    initialResumeSeasonNumber = nil
+                }
+            }
+        } catch {
+            guard !Task.isCancelled, generation == seasonsLoadGeneration else { return }
+            seasonsLoadState = .failed
+        }
+    }
+
+    #if !os(tvOS)
+    /// Stop background season warming when its detail page leaves the screen.
+    /// Unlike SwiftUI `.task`, this task has an explicit view-model lifetime.
+    func stopEpisodePagePrefetch() {
+        seasonEpisodePrefetchTask?.cancel()
+        seasonEpisodePrefetchTask = nil
+    }
+
+    /// Warm cached pages synchronously and missing pages two at a time. The
+    /// chosen season continues through `loadEpisodes` normally; everything
+    /// else lands only in route memory + ResponseCache and never mutates the
+    /// selected chip, painted episode list, or loading state.
+    private func startEpisodePagePrefetch(
+        seriesId: String,
+        seasons: [Season],
+        selectedSeason: Season
+    ) {
+        seasonEpisodePrefetchTask?.cancel()
+
+        let selectedIndex = seasons.firstIndex(where: { $0.id == selectedSeason.id }) ?? 0
+        let prioritized = seasons.enumerated()
+            .filter { $0.element.seasonNumber != selectedSeason.seasonNumber }
+            .sorted { lhs, rhs in
+                abs(lhs.offset - selectedIndex) < abs(rhs.offset - selectedIndex)
+            }
+            .map(\.element)
+
+        var missing: [Season] = []
+        for season in prioritized {
+            guard episodesBySeason[season.seasonNumber] == nil else { continue }
+            let key = CacheKey.itemEpisodes(
+                seriesId: seriesId,
+                seasonNumber: season.seasonNumber,
+                libraryId: libraryId
+            )
+            if let cached: EpisodesResponse = ResponseCache.shared.get(key) {
+                episodesBySeason[season.seasonNumber] = cached.sortedEpisodes
+            } else {
+                missing.append(season)
+            }
+        }
+
+        guard !missing.isEmpty else { return }
+        seasonEpisodePrefetchTask = Task { [weak self, libraryId] in
+            for batchStart in stride(from: 0, to: missing.count, by: 2) {
+                guard !Task.isCancelled else { return }
+                let batchEnd = min(batchStart + 2, missing.count)
+                let batch = Array(missing[batchStart..<batchEnd])
+                let fetched = await withTaskGroup(
+                    of: (seasonNumber: Int, response: EpisodesResponse?).self
+                ) { group in
+                    for season in batch {
+                        group.addTask {
+                            // Through the pool, so a chip tap on a season still
+                            // in flight joins this request instead of sending its own.
+                            let response = try? await MetadataRequestPool.shared.episodes(
+                                seriesId: seriesId,
+                                seasonNumber: season.seasonNumber,
+                                libraryId: libraryId
+                            )
+                            return (season.seasonNumber, response)
+                        }
+                    }
+
+                    var results: [(Int, EpisodesResponse?)] = []
+                    for await result in group {
+                        results.append(result)
+                    }
+                    return results
+                }
+
+                guard !Task.isCancelled,
+                      let self,
+                      self.seriesContentId == seriesId else { return }
+
+                for (seasonNumber, response) in fetched {
+                    guard let response else { continue }
+                    ResponseCache.shared.set(
+                        response,
+                        for: CacheKey.itemEpisodes(
+                            seriesId: seriesId,
+                            seasonNumber: seasonNumber,
+                            libraryId: libraryId
+                        )
+                    )
+                    if self.episodesBySeason[seasonNumber] == nil {
+                        self.episodesBySeason[seasonNumber] = response.sortedEpisodes
+                    }
+                }
+            }
+
+            guard !Task.isCancelled, let self, self.seriesContentId == seriesId else { return }
+            self.seasonEpisodePrefetchTask = nil
+        }
+    }
+    #endif
+
+    /// Season to auto-land on: the requested resume season, then one with an
+    /// episode in progress, then the first partially watched season, then the
+    /// first unplayed numbered season (Specials only once every numbered
+    /// season is played), then the first season.
+    func preferredInitialSeason(seasons: [Season]) -> Season? {
+        if let initialResumeSeasonNumber,
+           let requested = seasons.first(where: { $0.seasonNumber == initialResumeSeasonNumber }) {
+            return requested
+        }
+        return seasons.preferredResumeSeason()
+    }
+
+    func selectSeason(
+        _ season: Season,
+        forceRefresh: Bool = false,
+        coalescesMetadataRequest: Bool = true,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)? = nil
+    ) async {
+        guard !Task.isCancelled else { return }
+        // An explicit chip/page selection supersedes the one-shot resume intent.
+        // Automatic hierarchy refreshes must retain it until the catalog succeeds.
+        if !forceRefresh {
+            initialResumeSeasonNumber = nil
+            seasonChoiceGeneration += 1
+        }
+        let fallbackSeasonNumber = loadedSeasonNumber ?? selectedSeason?.seasonNumber
+        selectedSeason = season
+        guard let seriesId = seriesContentId else { return }
+
+        if !forceRefresh, let cached = episodesBySeason[season.seasonNumber] {
+            // Invalidate any older in-flight request before publishing the
+            // cached page. Otherwise it could finish later and replace this
+            // selection with stale content.
+            episodeLoadGeneration += 1
+            #if os(tvOS)
+            cancelDeferredEpisodePersonalListStateRefresh()
+            #endif
+            episodes = cached
+            loadedSeasonNumber = season.seasonNumber
+            isLoadingEpisodes = false
+            episodesLoadFailed = false
+            return
+        }
+
+        await loadEpisodes(
+            seriesId: seriesId,
+            seasonNumber: season.seasonNumber,
+            fallbackSeasonNumber: fallbackSeasonNumber,
+            coalescesMetadataRequest: coalescesMetadataRequest,
+            fetchEpisodes: fetchEpisodes
+        )
+    }
+
+    /// Select the season that holds the episode to land on after the player
+    /// closes, and return that episode. `nil` keeps the page's selection.
+    func prepareSeriesPlaybackReturn(
+        _ playback: SeriesPlaybackReturn,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)? = nil
+    ) async -> String? {
+        guard detail?.type == "series", detail?.contentId == playback.seriesContentId else { return nil }
+        if let contentId = playback.episodeToSelect(in: loadedSeriesEpisodes) { return contentId }
+
+        let ordered = SeriesEpisodeWindow.orderedSeasons(seasons)
+        guard let playedIndex = ordered.firstIndex(where: { $0.seasonNumber == playback.seasonNumber }) else {
+            return nil
+        }
+        if !loadedSeriesEpisodes.contains(where: { $0.contentId == playback.episodeContentId }) {
+            // Autoplay can carry playback into a season the page is not showing.
+            guard await selectSeasonForPlaybackReturn(ordered[playedIndex], fetchEpisodes: fetchEpisodes) else {
+                return nil
+            }
+            if let contentId = playback.episodeToSelect(in: loadedSeriesEpisodes) { return contentId }
+        }
+        guard playback.completed else { return nil }
+
+        // A finished season finale continues with the next regular season.
+        // After the last one, stay on the finished finale.
+        guard let next = ordered[(playedIndex + 1)...].first(where: {
+            $0.episodeCount > 0 && !($0.isSpecials == true || $0.seasonNumber == 0)
+        }) else {
+            return loadedSeriesEpisodes.contains(where: { $0.contentId == playback.episodeContentId })
+                ? playback.episodeContentId : nil
+        }
+        guard await selectSeasonForPlaybackReturn(next, fetchEpisodes: fetchEpisodes),
+              let first = episodes.first,
+              first.seasonNumber == next.seasonNumber else { return nil }
+        return first.contentId
+    }
+
+    /// Select `season` with its page already in hand. A forced `selectSeason`
+    /// publishes nothing when a concurrent refresh supersedes its request,
+    /// which would drop the return. Returns whether `season` is selected.
+    private func selectSeasonForPlaybackReturn(
+        _ season: Season,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)?
+    ) async -> Bool {
+        guard let seriesId = seriesContentId else { return false }
+        let choiceGeneration = seasonChoiceGeneration
+        if episodesBySeason[season.seasonNumber] == nil {
+            let response: EpisodesResponse
+            do {
+                if let fetchEpisodes {
+                    response = try await fetchEpisodes(seriesId, season.seasonNumber)
+                } else {
+                    response = try await MetadataRequestPool.shared.episodes(
+                        seriesId: seriesId, seasonNumber: season.seasonNumber, libraryId: libraryId
+                    )
+                }
+            } catch {
+                return false
+            }
+            guard !Task.isCancelled, seriesContentId == seriesId else { return false }
+            ResponseCache.shared.set(
+                response,
+                for: CacheKey.itemEpisodes(seriesId: seriesId, seasonNumber: season.seasonNumber, libraryId: libraryId)
+            )
+            if episodesBySeason[season.seasonNumber] == nil {
+                episodesBySeason[season.seasonNumber] = response.sortedEpisodes
+            }
+            // The user chose a season while this page loaded; keep their choice.
+            guard choiceGeneration == seasonChoiceGeneration else { return false }
+        }
+        // The page is in memory, so this publishes it synchronously.
+        await selectSeason(season)
+        return !Task.isCancelled && selectedSeason?.seasonNumber == season.seasonNumber
+    }
+
+    /// Episodes the Series page can select without loading another season.
+    private var loadedSeriesEpisodes: [EpisodeListItem] {
+        #if os(tvOS)
+        seriesEpisodeWindow.episodes
+        #else
+        episodes
+        #endif
+    }
+
+    #if os(tvOS)
+    /// Apply a known episode route before the first Series render or fetch.
+    /// A cold visit then requests this season directly; a warm visit paints it.
+    func prepareInitialSeriesSeason(_ number: Int, seriesId: String) {
+        episodeLoadGeneration += 1
+        cancelDeferredEpisodePersonalListStateRefresh()
+        initialResumeSeasonNumber = number
+        seriesContentId = seriesId
+        selectedSeason = seasons.first { $0.seasonNumber == number }
+        let cached: EpisodesResponse? = ResponseCache.shared.get(
+            CacheKey.itemEpisodes(seriesId: seriesId, seasonNumber: number, libraryId: libraryId)
+        )
+        if let page = episodesBySeason[number] ?? cached?.sortedEpisodes {
+            episodesBySeason[number] = page
+            episodes = page
+            loadedSeasonNumber = number
+            isLoadingEpisodes = false
+        } else {
+            episodes = []
+            isLoadingEpisodes = true
+        }
+    }
+
+    private(set) var seriesEpisodeWindow = SeriesEpisodeWindow(
+        episodes: [], previousSeason: nil, nextSeason: nil
+    )
+
+    /// Bumped when watched changes drop neighbouring pages, so the Series rail
+    /// reloads them.
+    private(set) var episodePagesRevision = 0
+
+    private func updateSeriesEpisodeWindow() {
+        seriesEpisodeWindow = SeriesEpisodeWindow.snapshot(
+            seasons: seasons, selected: selectedSeason?.seasonNumber, pages: episodesBySeason
+        )
+    }
+
+    /// Crossing a loaded season boundary is synchronous. Invalidate older
+    /// requests without starting another fetch or discarding the focused card.
+    func activateLoadedSeriesEpisode(_ contentId: String) {
+        guard let episode = seriesEpisodeWindow.episodes.first(where: { $0.contentId == contentId }),
+              selectedSeason?.seasonNumber != episode.seasonNumber,
+              let season = seasons.first(where: { $0.seasonNumber == episode.seasonNumber }),
+              let page = episodesBySeason[episode.seasonNumber] else { return }
+        episodeLoadGeneration += 1
+        seasonChoiceGeneration += 1
+        cancelDeferredEpisodePersonalListStateRefresh()
+        selectedSeason = season
+        episodes = page
+        loadedSeasonNumber = season.seasonNumber
+        isLoadingEpisodes = false
+    }
+    #endif
+
+    func loadEpisodes(
+        seriesId: String,
+        seasonNumber: Int,
+        refreshFavoriteStates: Bool = true,
+        fallbackSeasonNumber: Int? = nil,
+        coalescesMetadataRequest: Bool = true,
+        fetchEpisodes: (@Sendable (String, Int) async throws -> EpisodesResponse)? = nil
+    ) async {
+        guard !Task.isCancelled else { return }
+        #if os(tvOS)
+        cancelDeferredEpisodePersonalListStateRefresh()
+        #endif
+        episodeLoadGeneration += 1
+        let generation = episodeLoadGeneration
+        let translationPublications = translatedEpisodePublications[seasonNumber, default: 0]
+        episodesLoadFailed = false
+        failedEpisodeSeasonNumber = nil
+        defer {
+            if generation == episodeLoadGeneration { isLoadingEpisodes = false }
+        }
+        let key = CacheKey.itemEpisodes(seriesId: seriesId, seasonNumber: seasonNumber, libraryId: libraryId)
+
+        // Hydrate this page from either route memory or ResponseCache, then
+        // refresh silently. Never leave the previous season's rows under a
+        // newly-selected chip.
+        var cachedEpisodes = episodesBySeason[seasonNumber]
+        if cachedEpisodes == nil,
+           let cached: EpisodesResponse = ResponseCache.shared.get(key) {
+            let sorted = cached.sortedEpisodes
+            episodesBySeason[seasonNumber] = sorted
+            cachedEpisodes = sorted
+        }
+
+        let shouldPublish = selectedSeason == nil || selectedSeason?.seasonNumber == seasonNumber
+        if shouldPublish, let cachedEpisodes {
+            episodes = cachedEpisodes
+            loadedSeasonNumber = seasonNumber
+            isLoadingEpisodes = false
+        } else if shouldPublish {
+            episodes = []
+            isLoadingEpisodes = true
+        }
+
+        do {
+            let response: EpisodesResponse
+            if let fetchEpisodes {
+                response = try await fetchEpisodes(seriesId, seasonNumber)
+            } else if coalescesMetadataRequest {
+                response = try await MetadataRequestPool.shared.episodes(
+                    seriesId: seriesId,
+                    seasonNumber: seasonNumber,
+                    libraryId: libraryId
+                )
+            } else {
+                response = try await SiloAPI.shared.episodes(
+                    seriesId: seriesId,
+                    seasonNumber: seasonNumber,
+                    libraryId: libraryId
+                )
+            }
+            guard !Task.isCancelled, generation == episodeLoadGeneration else { return }
+            // A translated read of this page published meanwhile is newer.
+            let isSuperseded = translatedEpisodePublications[seasonNumber, default: 0] != translationPublications
+            let sorted = response.sortedEpisodes
+            if !isSuperseded {
+                ResponseCache.shared.set(response, for: key)
+                episodesBySeason[seasonNumber] = sorted
+            }
+            if selectedSeason == nil || selectedSeason?.seasonNumber == seasonNumber {
+                if !isSuperseded { episodes = sorted }
+                loadedSeasonNumber = seasonNumber
+                isLoadingEpisodes = false
+            }
+        } catch {
+            guard !Task.isCancelled, generation == episodeLoadGeneration else { return }
+            episodesLoadFailed = true
+            failedEpisodeSeasonNumber = seasonNumber
+            if selectedSeason == nil || selectedSeason?.seasonNumber == seasonNumber {
+                if cachedEpisodes == nil,
+                   let fallbackSeasonNumber,
+                   let fallbackEpisodes = episodesBySeason[fallbackSeasonNumber],
+                   let fallbackSeason = seasons.first(where: {
+                       $0.seasonNumber == fallbackSeasonNumber
+                   }) {
+                    selectedSeason = fallbackSeason
+                    episodes = fallbackEpisodes
+                    loadedSeasonNumber = fallbackSeasonNumber
+                }
+                isLoadingEpisodes = false
+            }
+        }
+
+        if refreshFavoriteStates,
+           generation == episodeLoadGeneration,
+           (selectedSeason?.seasonNumber == seasonNumber || selectedSeason == nil) {
+            let loadedEpisodes = episodesBySeason[seasonNumber] ?? episodes
+            #if os(tvOS)
+            if detail?.type != "series" {
+                scheduleEpisodePersonalListStateRefresh(
+                    for: loadedEpisodes,
+                    episodeLoadGeneration: generation
+                )
+            }
+            #else
+            await refreshEpisodePersonalListStates(for: loadedEpisodes)
+            #endif
+        }
+    }
+
+    #if os(tvOS)
+    /// Series needs personal-list state for the card whose context menu can open.
+    /// Loading a long season must not start one request per episode.
+    func refreshSeriesEpisodePersonalLists(contentId: String) async {
+        let mutationVersion = episodePersonalListMutationVersions[contentId, default: 0]
+        let owner = await currentPersonalStateOwner()
+        let api = SiloAPI.shared.apiV2Client
+        do {
+            // Episodes carry `user_data` but no `user_state`, so each card
+            // still reads its two memberships.
+            async let favorite = api.personalMembership(id: contentId, watchlist: false, auth: owner)
+            async let watchlist = api.personalMembership(id: contentId, watchlist: true, auth: owner)
+            let state = try await (favorite, watchlist)
+            guard !Task.isCancelled,
+                  episodePersonalListMutationVersions[contentId, default: 0] == mutationVersion else { return }
+            episodeFavoriteStates[contentId] = state.0
+            episodeWatchlistStates[contentId] = state.1
+        } catch {
+            // Preserve the last known value on a transient failure.
+        }
+    }
+
+    private func scheduleEpisodePersonalListStateRefresh(
+        for episodes: [EpisodeListItem],
+        episodeLoadGeneration: Int
+    ) {
+        guard !episodes.isEmpty else { return }
+
+        episodePersonalListRefreshTask = Task(priority: .utility) { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1_100))
+            guard !Task.isCancelled,
+                  let self,
+                  self.episodeLoadGeneration == episodeLoadGeneration else { return }
+
+            await self.refreshEpisodePersonalListStates(for: episodes)
+            guard !Task.isCancelled,
+                  self.episodeLoadGeneration == episodeLoadGeneration else { return }
+            self.episodePersonalListRefreshTask = nil
+        }
+    }
+
+    func cancelDeferredEpisodePersonalListStateRefresh() {
+        episodePersonalListRefreshTask?.cancel()
+        episodePersonalListRefreshTask = nil
+        episodePersonalListRefreshGeneration += 1
+    }
+    #endif
+
+    private func refreshEpisodePersonalListStates(for episodes: [EpisodeListItem]) async {
+        let maxConcurrent = 6
+        episodePersonalListRefreshGeneration += 1
+        let generation = episodePersonalListRefreshGeneration
+        let mutationVersionsAtStart = episodePersonalListMutationVersions
+        let owner = await currentPersonalStateOwner()
+        let api = SiloAPI.shared.apiV2Client
+        var states: [String: (favorite: Bool?, watchlist: Bool?)] = [:]
+
+        // Query in small batches so a long season cannot fan out an
+        // unbounded number of requests against the server.
+        for batchStart in stride(from: 0, to: episodes.count, by: maxConcurrent) {
+            guard !Task.isCancelled,
+                  generation == episodePersonalListRefreshGeneration else { return }
+            let batchEnd = min(batchStart + maxConcurrent, episodes.count)
+            let batch = Array(episodes[batchStart..<batchEnd])
+            let batchStates = await withTaskGroup(of: (String, Bool?, Bool?).self) { group in
+                for episode in batch {
+                    group.addTask {
+                        async let isFavorite = try? api.personalMembership(
+                            id: episode.contentId, watchlist: false, auth: owner
+                        )
+                        async let inWatchlist = try? api.personalMembership(
+                            id: episode.contentId, watchlist: true, auth: owner
+                        )
+                        return await (episode.contentId, isFavorite, inWatchlist)
+                    }
+                }
+
+                var results: [String: (favorite: Bool?, watchlist: Bool?)] = [:]
+                for await (contentId, isFavorite, inWatchlist) in group {
+                    results[contentId] = (isFavorite, inWatchlist)
+                }
+                return results
+            }
+            guard !Task.isCancelled,
+                  generation == episodePersonalListRefreshGeneration else { return }
+            states.merge(batchStates) { _, refreshed in refreshed }
+        }
+
+        let currentIds = Set(self.episodes.map(\.contentId))
+        guard generation == episodePersonalListRefreshGeneration,
+              currentIds == Set(episodes.map(\.contentId)) else { return }
+
+        var mergedStates = episodeFavoriteStates.filter { currentIds.contains($0.key) }
+        var mergedWatchlistStates = episodeWatchlistStates.filter { currentIds.contains($0.key) }
+        for (contentId, state) in states {
+            guard episodePersonalListMutationVersions[contentId]
+                    == mutationVersionsAtStart[contentId] else { continue }
+            if let favorite = state.favorite { mergedStates[contentId] = favorite }
+            if let watchlist = state.watchlist { mergedWatchlistStates[contentId] = watchlist }
+        }
+        episodeFavoriteStates = mergedStates
+        episodeWatchlistStates = mergedWatchlistStates
+    }
+
+    // MARK: - User Actions
+
+    /// Owner for this page's membership reads and writes: the one captured
+    /// when the detail load began, or the current one before any load.
+    private func currentPersonalStateOwner() async -> CapturedOrdinaryRequestAuth? {
+        if let personalStateOwner { return personalStateOwner }
+        return await TokenStore.shared.captureOrdinaryRequestAuth()
+    }
+
+    /// Sends one favorite, watchlist or watched change under the page owner.
+    /// Only `.applied` means the server took it; nothing is ever re-sent.
+    private func dispatchPersonalState(
+        _ target: PersonalStateTarget,
+        contentId: String,
+        to included: Bool
+    ) async -> PersonalStateOutcome {
+        let owner = await currentPersonalStateOwner()
+        return await PersonalStateSync.outcome {
+            guard let owner else { throw HTTPError.requestIdentityChanged }
+            try await PersonalStateSync.set(target, contentId: contentId, to: included, owner: owner)
+        }
+    }
+
+    func toggleFavorite() async {
+        guard let contentId = detail?.contentId else { return }
+        userStateMutationGeneration += 1
+        let requested = !isFavorite
+        isFavorite = requested
+        writeBackUserState(contentId: contentId)
+        let outcome = await dispatchPersonalState(.favorite, contentId: contentId, to: requested)
+        if outcome == .applied {
+            invalidateRelatedCaches(contentId: contentId)
+        } else {
+            if isFavorite == requested { isFavorite = !requested }
+            ResponseCache.shared.remove(CacheKey.itemUserState(contentId))
+            personalStateNotice = PersonalStateNotice(outcome)
+        }
+    }
+
+    func toggleWatchlist() async {
+        guard let contentId = detail?.contentId else { return }
+        userStateMutationGeneration += 1
+        let requested = !inWatchlist
+        inWatchlist = requested
+        writeBackUserState(contentId: contentId)
+        let outcome = await dispatchPersonalState(.watchlist, contentId: contentId, to: requested)
+        if outcome == .applied {
+            invalidateRelatedCaches(contentId: contentId)
+        } else {
+            if inWatchlist == requested { inWatchlist = !requested }
+            ResponseCache.shared.remove(CacheKey.itemUserState(contentId))
+            personalStateNotice = PersonalStateNotice(outcome)
+        }
+    }
+
+    /// Mark the detail item (and, for series/seasons, its leaf episodes)
+    /// as watched or unwatched through POST / DELETE
+    /// `/api/v2/watched/{id}`; the server resolves the targets.
+    ///
+    /// A detail load that may have read `played` before this change cannot
+    /// revert it. A load that began before the server confirmed skips its
+    /// watched write if it lands afterwards, and the confirmed value is
+    /// re-asserted over a load that landed while the write was in flight.
+    func toggleWatched(
+        send: ((_ contentId: String, _ watched: Bool) async -> PersonalStateOutcome)? = nil
+    ) async {
+        guard let contentId = detail?.contentId else { return }
+        userStateMutationGeneration += 1
+        watchedToggleGeneration += 1
+        let toggleGeneration = watchedToggleGeneration
+        let requested = !isWatched
+        isWatched = requested
+        let outcome: PersonalStateOutcome
+        if let send {
+            outcome = await send(contentId, requested)
+        } else {
+            outcome = await dispatchPersonalState(.watched, contentId: contentId, to: requested)
+        }
+        if outcome == .applied {
+            if detail?.contentId == contentId, toggleGeneration == watchedToggleGeneration {
+                userStateMutationGeneration += 1
+                isWatched = requested
+            }
+            let isSeries = detail?.type == "series" && detail?.contentId == contentId
+            #if os(tvOS)
+            if isSeries {
+                // The stale-detail reload below must keep the season on screen,
+                // not re-pick the first unwatched one.
+                initialResumeSeasonNumber = selectedSeason?.seasonNumber ?? initialResumeSeasonNumber
+            }
+            #endif
+            invalidateRelatedCaches(contentId: contentId)
+            if isSeries {
+                await refreshWatchedSeries(seriesId: contentId)
+            }
+        } else {
+            if toggleGeneration == watchedToggleGeneration, isWatched == requested {
+                isWatched = !requested
+            }
+            personalStateNotice = PersonalStateNotice(outcome)
+        }
+    }
+
+    /// Series overview action: mutate the season currently selected in the
+    /// pill row, not the whole series. The server already fans a season
+    /// mutation out to its episodes; refreshing the season + episode payloads
+    /// keeps every checkmark and next-up calculation consistent afterward.
+    func toggleSelectedSeasonWatched() async {
+        guard let selectedSeason else { return }
+        let outcome = await setSeasonWatched(
+            selectedSeason,
+            played: !(selectedSeason.userData?.played ?? false)
+        )
+        personalStateNotice = PersonalStateNotice(outcome)
+    }
+
+    /// Capture the menu's season rather than consulting selection after the
+    /// request: the user can keep browsing while a watched update is in flight.
+    func setSeasonWatched(_ season: Season, played: Bool) async -> PersonalStateOutcome {
+        guard let seriesId = seriesContentId, !isUpdatingEpisodeWatched else { return .skipped }
+        isUpdatingEpisodeWatched = true
+        defer { isUpdatingEpisodeWatched = false }
+        let outcome = await dispatchPersonalState(.watched, contentId: season.contentId, to: played)
+        guard outcome == .applied else { return outcome }
+        invalidateRelatedCaches(contentId: season.contentId, seriesId: seriesId)
+        await refreshWatchedSeason(
+            seriesId: seriesId,
+            seasonNumber: season.seasonNumber
+        )
+        return .applied
+    }
+
+    func setEpisodeWatched(contentId: String, played: Bool, seasonNumber: Int? = nil) async -> PersonalStateOutcome {
+        guard !isUpdatingEpisodeWatched else { return .skipped }
+        isUpdatingEpisodeWatched = true
+        defer { isUpdatingEpisodeWatched = false }
+        let seriesId = seriesContentId
+        let affectedSeasonNumber = seasonNumber
+            ?? episodesBySeason.values.lazy.flatMap { $0 }.first { $0.contentId == contentId }?.seasonNumber
+            ?? selectedSeason?.seasonNumber
+        let outcome = await dispatchPersonalState(.watched, contentId: contentId, to: played)
+        guard outcome == .applied else { return outcome }
+        if contentId == detail?.contentId {
+            userStateMutationGeneration += 1
+            watchedToggleGeneration += 1
+            isWatched = played
+        }
+        invalidateRelatedCaches(contentId: contentId, seriesId: seriesId)
+        if let seriesId, let affectedSeasonNumber {
+            await refreshWatchedSeason(
+                seriesId: seriesId,
+                seasonNumber: affectedSeasonNumber
+            )
+        }
+        return .applied
+    }
+
+    /// A series change reaches every season. Drop the other seasons' pages and
+    /// cached reads so whichever loads them next (a chip tap, the iOS page
+    /// prefetch, the tvOS rail's neighbour load) fetches the new state, then
+    /// refresh the selected season like a season change.
+    private func refreshWatchedSeries(seriesId: String) async {
+        guard seriesContentId == seriesId, !Task.isCancelled,
+              let selectedNumber = selectedSeason?.seasonNumber else { return }
+        #if !os(tvOS)
+        // A page read before the write must not land after this refresh.
+        stopEpisodePagePrefetch()
+        #endif
+        for season in seasons where season.seasonNumber != selectedNumber {
+            ResponseCache.shared.remove(CacheKey.itemEpisodes(
+                seriesId: seriesId, seasonNumber: season.seasonNumber, libraryId: libraryId
+            ))
+        }
+        episodesBySeason = episodesBySeason.filter { $0.key == selectedNumber }
+        #if os(tvOS)
+        // Restarts the rail's neighbour load, cancelling any read begun before the write.
+        episodePagesRevision &+= 1
+        #endif
+        await refreshWatchedSeason(seriesId: seriesId, seasonNumber: selectedNumber)
+    }
+
+    private func refreshWatchedSeason(seriesId: String, seasonNumber: Int) async {
+        guard seriesContentId == seriesId, !Task.isCancelled else { return }
+        #if !os(tvOS)
+        stopEpisodePagePrefetch()
+        #endif
+        // A cached offscreen page must not resurrect its old checkmarks when
+        // the user returns. The visible page remains painted until refreshed.
+        if selectedSeason?.seasonNumber == seasonNumber {
+            episodeLoadGeneration += 1
+        }
+        episodesBySeason[seasonNumber] = nil
+        await loadSeasons(
+            seriesId: seriesId,
+            autoSelectInitial: false,
+            coalescesMetadataRequest: false
+        )
+        guard seriesContentId == seriesId, !Task.isCancelled else { return }
+        if let selectedId = selectedSeason?.id,
+           let refreshed = seasons.first(where: { $0.id == selectedId }) {
+            selectedSeason = refreshed
+        }
+        if seasonsLoadState == .loaded, detail?.type == "series" {
+            let nonemptySeasons = seasons.filter { $0.episodeCount > 0 }
+            isWatched = !nonemptySeasons.isEmpty
+                && nonemptySeasons.allSatisfy { $0.userData?.played == true }
+        }
+        if selectedSeason?.seasonNumber == seasonNumber {
+            await loadEpisodes(
+                seriesId: seriesId,
+                seasonNumber: seasonNumber,
+                refreshFavoriteStates: false,
+                coalescesMetadataRequest: false
+            )
+        }
+    }
+
+    /// The series whose seasons and episodes this page loads.
+    var loadedSeriesContentId: String? { seriesContentId }
+
+    /// Taken before the description translator re-reads a season page, so
+    /// ``publishTranslatedEpisodes(_:seriesId:seasonNumber:readGeneration:)``
+    /// can tell whether a newer load started while the read was in flight.
+    var episodeReadGeneration: Int { episodeLoadGeneration }
+
+    /// Publish a season page the description translator re-read, without the
+    /// loading or error states a visible refresh shows. Returns false, and
+    /// publishes nothing, when an episode load or a watched refresh started
+    /// after the read began: that load owns the page and carries newer
+    /// personal state. The generation is not bumped, since it also gates
+    /// season selection and hierarchy loads already in flight.
+    func publishTranslatedEpisodes(
+        _ response: EpisodesResponse,
+        seriesId: String,
+        seasonNumber: Int,
+        readGeneration: Int
+    ) -> Bool {
+        guard seriesContentId == seriesId, episodeLoadGeneration == readGeneration else { return false }
+        translatedEpisodePublications[seasonNumber, default: 0] += 1
+        ResponseCache.shared.set(
+            response,
+            for: CacheKey.itemEpisodes(seriesId: seriesId, seasonNumber: seasonNumber, libraryId: libraryId)
+        )
+        let sorted = response.sortedEpisodes
+        episodesBySeason[seasonNumber] = sorted
+        guard selectedSeason?.seasonNumber == seasonNumber else { return true }
+        episodes = sorted
+        loadedSeasonNumber = seasonNumber
+        isLoadingEpisodes = false
+        episodesLoadFailed = false
+        return true
+    }
+
+    func setEpisodeFavorite(contentId: String, isFavorite: Bool) async -> PersonalStateOutcome {
+        let outcome = await dispatchPersonalState(.favorite, contentId: contentId, to: isFavorite)
+        guard outcome == .applied else { return outcome }
+        if contentId == detail?.contentId {
+            userStateMutationGeneration += 1
+            self.isFavorite = isFavorite
+            writeBackUserState(contentId: contentId)
+        } else {
+            // Reload combined user state on the next visit rather than
+            // writing a potentially stale sibling flag to the cache.
+            ResponseCache.shared.remove(CacheKey.itemUserState(contentId))
+        }
+        episodePersonalListMutationVersions[contentId, default: 0] += 1
+        episodeFavoriteStates[contentId] = isFavorite
+        invalidateRelatedCaches(contentId: contentId)
+        return .applied
+    }
+
+    func setEpisodeWatchlist(contentId: String, inWatchlist: Bool) async -> PersonalStateOutcome {
+        let outcome = await dispatchPersonalState(.watchlist, contentId: contentId, to: inWatchlist)
+        guard outcome == .applied else { return outcome }
+        if contentId == detail?.contentId {
+            userStateMutationGeneration += 1
+            self.inWatchlist = inWatchlist
+            writeBackUserState(contentId: contentId)
+        } else {
+            ResponseCache.shared.remove(CacheKey.itemUserState(contentId))
+        }
+        episodePersonalListMutationVersions[contentId, default: 0] += 1
+        episodeWatchlistStates[contentId] = inWatchlist
+        invalidateRelatedCaches(contentId: contentId)
+        return .applied
+    }
+
+    private func writeBackUserState(contentId: String) {
+        ResponseCache.shared.set(
+            UserItemState(isFavorite: isFavorite, inWatchlist: inWatchlist),
+            for: CacheKey.itemUserState(contentId)
+        )
+    }
+
+    /// Tell adjacent caches that a mutation invalidated derived state
+    /// (e.g. parent series progress when a child episode is marked
+    /// watched), through the same `PersonalStateSync.invalidateItemState`
+    /// the card watched toggle uses. The next visit fetches fresh; painted content
+    /// keeps showing in the meantime via the existing `detail` binding. An
+    /// episode page's series is the fallback parent.
+    /// The shared call also makes a mounted Home re-read its Continue
+    /// Watching and Next Up rows.
+    private func invalidateRelatedCaches(contentId: String, seriesId: String? = nil) {
+        PersonalStateSync.invalidateItemState(contentId: contentId, seriesId: seriesId ?? detail?.seriesId)
+    }
+}
+
+/// Failures raised by the view model's own coordinator wiring rather than by
+/// the API layer.
+enum ItemDetailViewModelError: LocalizedError {
+    case noItemLoaded
+
+    var errorDescription: String? {
+        switch self {
+        case .noItemLoaded:
+            return "No item is loaded."
+        }
+    }
+}
+
+/// User-state pair cached alongside an item detail so a returning view
+/// renders the correct favorite / watchlist buttons before the detail
+/// read returns its `user_state`.
+struct UserItemState {
+    let isFavorite: Bool
+    let inWatchlist: Bool
+}
+
+private extension EpisodesResponse {
+    var sortedEpisodes: [EpisodeListItem] {
+        episodes.sorted { $0.episodeNumber < $1.episodeNumber }
+    }
+}

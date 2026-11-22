@@ -1,0 +1,825 @@
+#if os(tvOS)
+import SwiftUI
+import Nuke
+import NukeUI
+
+/// Shared 1920×1080 detail metrics. These are deliberately separate from the
+/// root Skyline metrics: the detail experience has its own approved rhythm,
+/// while Home and Browse keep their existing layout untouched.
+enum TVDetailLayout {
+    static let horizontalInset: CGFloat = 100
+    static let heroHeight: CGFloat = 690
+    /// Shared title baseline for every detail page. Sits low enough that the
+    /// first rail below the 690pt hero bottoms out just above the safe area.
+    static let heroTopInset: CGFloat = 116
+    static let heroContentWidth: CGFloat = 1_080
+    static let bodySectionSpacing: CGFloat = 64
+    static let sectionHeaderSpacing: CGFloat = 14
+    static let pageBottomPadding: CGFloat = 140
+
+    /// At the Large card size the Series episode rail's two-line caption runs
+    /// past the bottom of the pinned first screen, so the Series hero gives up
+    /// this much of its empty top inset and the season row and rail move up.
+    static func seriesHeroLift(for posterSize: CardPosterSize) -> CGFloat {
+        posterSize == .large ? 32 : 0
+    }
+}
+
+/// Fully opaque page surface sampled from the title artwork. The base tint is
+/// composited over black, so the art's fade blends into the same dim tint as
+/// before; the accent and shadow washes from the root landings carry Home's
+/// colors around it. Artwork itself lives inside the scrolling hero and
+/// therefore leaves the screen naturally as the viewer moves down.
+struct TVDetailPageSurface<Content: View>: View {
+    let backdropURL: String?
+    @ViewBuilder let content: () -> Content
+
+    private static var fallbackTints: HeroBackdropPalette.Tints {
+        .flat(Color(red: 0.04, green: 0.12, blue: 0.14))
+    }
+
+    @State private var sampledTints = Self.fallbackTints
+
+    var body: some View {
+        ZStack {
+            Color.black
+            sampledTints.base.opacity(0.42)
+            TVBackdropTintWash(tints: sampledTints, includesBase: false)
+            content()
+        }
+        .ignoresSafeArea()
+        .task(id: backdropURL) {
+            guard let rawURL = backdropURL,
+                  let url = URL(string: rawURL) else {
+                sampledTints = Self.fallbackTints
+                return
+            }
+
+            if let cached = HeroBackdropPalette.cachedTints(for: url) {
+                sampledTints = cached
+            }
+            if let tints = await HeroBackdropPalette.tints(for: url),
+               !Task.isCancelled {
+                sampledTints = tints
+            }
+        }
+    }
+}
+
+/// Full-bleed detail hero: backdrop on the right, and a left editorial column
+/// (eyebrow, title or logo, facts + ratings + genres, synopsis, credit,
+/// playback readout) above the action row. Sized so the first rail peeks
+/// below the fold.
+struct TVDetailHero<Actions: View, BelowSynopsis: View>: View {
+    let title: String
+    let logoUrl: String?
+    let backdropUrl: String?
+    let backdropThumbhash: String?
+    /// Optional short editorial line placed in a capsule above the title
+    /// (e.g. "New Episode Friday", "Continuing Series"). Hidden when nil.
+    let eyebrow: String?
+    /// Source/genre labels shown under the title. Optional outlined rating
+    /// and advisory-age chips lead the metadata, followed by dot-separated text.
+    let sourceTokens: [String]
+    let ratingChip: String?
+    var overlayData: OverlayData? = nil
+    /// Short description shown in the hero. Clamped to 3 lines.
+    let overview: String?
+    /// On-view translation status drawn inside the synopsis block.
+    var synopsisStatus: DescriptionTranslationStatus? = nil
+    /// Inline facts row shown above the action buttons. Mixes plain text
+    /// (year / runtime / maturity) and outlined quality chips
+    /// (4K / HDR / ATMOS / CC).
+    let factsLine: [TVHeroFactToken]
+    /// External ratings in server order, shown inline after the facts and
+    /// before the genre labels. The row stays on one line: entries that
+    /// don't fit drop from the end.
+    var ratings: [DisplayRating] = []
+    /// Optional credit line ("Starring …" / "Directed by …") under the synopsis.
+    let starringText: String?
+    /// Non-interactive playback readout shown directly below the credits. It
+    /// reserves a stable slot while an episode's playback detail is loading,
+    /// so changing carousel focus never moves the persistent action row.
+    let playbackSummary: TVPlaybackSelectionSummary
+    var showsPlaybackSummary = true
+    /// A compact editorial header can retain the standard Movie backdrop
+    /// geometry independently of its own layout height. Nil keeps both heights
+    /// coupled, which is the default behavior for every other detail page.
+    var backdropHeight: CGFloat? = nil
+    var heroHeight: CGFloat = TVDetailLayout.heroHeight
+    /// Space above the title block. Series trims it at the Large card size so
+    /// its taller episode rail stays on the first screen.
+    var topInset: CGFloat = TVDetailLayout.heroTopInset
+    /// Episode mode narrows only the editorial column. The logo keeps the
+    /// same leading/top anchor while long episode copy wraps before it reaches
+    /// the backdrop subject.
+    var editorialContentWidth: CGFloat = TVDetailLayout.heroContentWidth
+    /// Optional fixed footprint for the complete editorial stack. Series uses
+    /// this to keep the action row on one baseline in Show and Season modes;
+    /// changing episode text may never reflow the controls below it.
+    var editorialReservedHeight: CGFloat? = nil
+    /// Fixed metadata slot used by Series because Show facts and episode facts
+    /// have different intrinsic widths and availability.
+    var metadataReservedHeight: CGFloat = 0
+    /// Reserves a stable synopsis footprint while adjacent episodes swap in.
+    /// This keeps the selector and season tabs from moving when summaries have
+    /// different lengths.
+    var synopsisReservedHeight: CGFloat = 0
+    /// Keeps the playback summary on one baseline whether the Show credit is
+    /// present or the focused episode has no credit of its own.
+    var creditReservedHeight: CGFloat = 0
+    /// Vertical distance between editorial metadata and the hero controls.
+    /// Series tightens this inside its fixed hero so Seasons gains clearance
+    /// without moving the episode carousel down.
+    var actionSpacing: CGFloat = 18
+    /// Series keeps its compact layout but lets the standard Movie
+    /// backdrop fade finish behind the season row. Movies retain the existing
+    /// clipped hero through the default.
+    var extendsBackdropFadeBelowHero = false
+    @ViewBuilder let actions: () -> Actions
+    /// Affordance rendered directly under the synopsis (e.g. the on-view
+    /// description-translation control). Pass `{ EmptyView() }` when there's
+    /// nothing to show.
+    @ViewBuilder let belowSynopsis: () -> BelowSynopsis
+    @ObservedObject private var advisoryAgePreference = AdvisoryAgePreferenceStore.shared
+
+    @ViewBuilder
+    var body: some View {
+        Group {
+            if extendsBackdropFadeBelowHero {
+                heroComposition
+            } else {
+                heroComposition.clipped()
+            }
+        }
+        .task(id: overlayData?.advisoryAge) {
+            guard (overlayData?.advisoryAge ?? 0) > 0 else { return }
+            await advisoryAgePreference.hydrateIfNeeded()
+        }
+    }
+
+    private var heroComposition: some View {
+        ZStack(alignment: .topLeading) {
+            backdrop
+            content
+        }
+        .frame(height: heroHeight)
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Backdrop
+
+    private var backdrop: some View {
+        GeometryReader { geometry in
+            let resolvedBackdropHeight = backdropHeight ?? heroHeight
+            let artworkSize = TVBackdropArtworkLayout.artworkSize(
+                forViewportWidth: geometry.size.width
+            )
+
+            if let url = backdropUrl, !url.isEmpty {
+                AsyncImageView(
+                    url: url,
+                    thumbhash: backdropThumbhash,
+                    targetSize: artworkSize,
+                    contentMode: .fill
+                )
+                .frame(width: artworkSize.width, height: artworkSize.height)
+                .clipped()
+                .mask { TVBackdropArtworkFadeMask() }
+                .frame(
+                    width: geometry.size.width,
+                    height: resolvedBackdropHeight,
+                    alignment: .topTrailing
+                )
+            }
+        }
+    }
+
+    // MARK: - Content column
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: actionSpacing) {
+            reservedEditorialColumn
+
+            // Give the action cluster the full hero width with leading
+            // content (instead of `HStack { actions(); Spacer() }`) so the
+            // selector row inside can stretch its own focus section full-width
+            // for Down navigation — a trailing Spacer would split the width
+            // with that greedy child and leave the section too narrow.
+            // Still a full-width focus destination so lower rails can move
+            // "up" into this cluster even from a far-right card.
+            actions()
+                .padding(.top, 2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .focusSection()
+        }
+        .padding(.top, topInset)
+        .padding(.horizontal, TVDetailLayout.horizontalInset)
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: heroHeight,
+            alignment: .topLeading
+        )
+    }
+
+    @ViewBuilder
+    private var reservedEditorialColumn: some View {
+        if let editorialReservedHeight {
+            ZStack(alignment: .topLeading) {
+                editorialPrimaryInformationColumn
+                    .frame(
+                        height: max(
+                            0,
+                            editorialReservedHeight
+                                - fixedDisclosureReservedHeight
+                                - fixedDisclosureSpacing
+                        ),
+                        alignment: .topLeading
+                    )
+                    .clipped()
+
+                // The episode credit and playback readout are one bottom-locked
+                // disclosure block. Different synopsis lengths can no longer
+                // move Starring, Version, Audio, Subtitles, or the action row.
+                fixedDisclosureColumn
+                    .frame(
+                        width: editorialContentWidth,
+                        height: editorialReservedHeight,
+                        alignment: .bottomLeading
+                    )
+            }
+            .frame(
+                width: editorialContentWidth,
+                height: editorialReservedHeight,
+                alignment: .topLeading
+            )
+            .clipped()
+        } else {
+            editorialColumn
+        }
+    }
+
+    private var editorialColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            editorialPrimaryInformationColumn
+            creditBlock
+            TVPlaybackSelectionSummaryView(summary: playbackSummary)
+                .opacity(showsPlaybackSummary ? 1 : 0)
+                .accessibilityHidden(!showsPlaybackSummary)
+        }
+        .frame(maxWidth: editorialContentWidth, alignment: .leading)
+    }
+
+    private var editorialPrimaryInformationColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let eyebrow, !eyebrow.isEmpty {
+                TVHeroEyebrow(text: eyebrow)
+            }
+            titleBlock
+                .padding(.top, eyebrow == nil ? 0 : 2)
+            reservedMetadataBlock
+            synopsisBlock
+            belowSynopsis()
+        }
+        .frame(maxWidth: editorialContentWidth, alignment: .leading)
+    }
+
+    private var fixedDisclosureColumn: some View {
+        VStack(alignment: .leading, spacing: creditSummarySpacing) {
+            creditBlock
+            TVPlaybackSelectionSummaryView(summary: playbackSummary)
+                .opacity(showsPlaybackSummary ? 1 : 0)
+                .accessibilityHidden(!showsPlaybackSummary)
+                .frame(
+                    height: playbackSummaryReservedHeight,
+                    alignment: .topLeading
+                )
+        }
+        // Episode focus can replace all four strings in one model update. This
+        // block is intentionally static: values change in place without an
+        // inherited layout animation that makes the rows appear to bounce.
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
+    }
+
+    private var playbackSummaryReservedHeight: CGFloat { 44 }
+    private var creditSummarySpacing: CGFloat { creditReservedHeight > 0 ? 8 : 0 }
+    private var fixedDisclosureReservedHeight: CGFloat {
+        creditReservedHeight + creditSummarySpacing + playbackSummaryReservedHeight
+    }
+    private var fixedDisclosureSpacing: CGFloat { 4 }
+
+    @ViewBuilder
+    private var reservedMetadataBlock: some View {
+        if metadataReservedHeight > 0 {
+            factsRow
+                .frame(height: metadataReservedHeight, alignment: .leading)
+                .clipped()
+        } else {
+            factsRow
+        }
+    }
+
+    @ViewBuilder
+    private var synopsisBlock: some View {
+        if synopsisReservedHeight > 0 {
+            Group {
+                if let overview, !overview.isEmpty {
+                    TVHeroSynopsis(overview: overview, status: synopsisStatus)
+                }
+            }
+            .frame(height: synopsisReservedHeight, alignment: .topLeading)
+            .clipped()
+        } else if let overview, !overview.isEmpty {
+            TVHeroSynopsis(overview: overview, status: synopsisStatus)
+        }
+    }
+
+    @ViewBuilder
+    private var creditBlock: some View {
+        if creditReservedHeight > 0 {
+            Group {
+                if let starringText, !starringText.isEmpty {
+                    heroCredit(starringText)
+                }
+            }
+            .frame(height: creditReservedHeight, alignment: .leading)
+            .clipped()
+        } else if let starringText, !starringText.isEmpty {
+            heroCredit(starringText)
+        }
+    }
+
+    private var titleBlock: some View {
+        TVDecodedLogoTitle(
+            logoUrl: logoUrl,
+            accessibilityLabel: title,
+            maxWidth: 650,
+            maxHeight: 160
+        ) {
+            TVHeroTitle(title: title)
+        }
+    }
+
+    // MARK: - Facts + quality row
+
+    @ViewBuilder
+    private var factsRow: some View {
+        if !factsLine.isEmpty || !ratings.isEmpty || !sourceTokens.isEmpty || !ratingChips.isEmpty {
+            HStack(spacing: 14) {
+                if hasLeadingFacts {
+                    // The row never wraps. When the ratings don't all fit,
+                    // whole entries drop from the end of the server's list;
+                    // genres give way before any rating does.
+                    ViewThatFits(in: .horizontal) {
+                        ForEach(Array(factsRowRatingCandidates.enumerated()), id: \.offset) { _, shown in
+                            leadingFacts(ratings: shown)
+                        }
+                    }
+                }
+
+                ForEach(Array(sourceTokens.enumerated()), id: \.offset) { index, token in
+                    if !factsLine.isEmpty || !ratings.isEmpty || index > 0 { metadataDivider }
+                    Text(token)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.90))
+                        .lineLimit(1)
+                        // Genres give way first when a long ratings row
+                        // leaves too little width; a score never truncates.
+                        .layoutPriority(-1)
+                }
+            }
+        }
+    }
+
+    private var hasLeadingFacts: Bool {
+        !ratingChips.isEmpty || !factsLine.isEmpty || !ratings.isEmpty
+    }
+
+    /// Every rating first, then one fewer at a time. A single empty row
+    /// keeps the chip and facts when there are no ratings.
+    private var factsRowRatingCandidates: [[DisplayRating]] {
+        ratings.isEmpty ? [[]] : DisplayRating.rowCandidates(ratings)
+    }
+
+    /// The rating chip, facts and the given ratings, none of which truncate.
+    private func leadingFacts(ratings shown: [DisplayRating]) -> some View {
+        HStack(spacing: 14) {
+            ForEach(Array(ratingChips.enumerated()), id: \.offset) { _, chip in
+                ratingBadge(chip)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            ForEach(Array(factsLine.enumerated()), id: \.offset) { index, token in
+                if index > 0 { metadataDivider }
+                factsItem(token)
+            }
+
+            ForEach(Array(shown.enumerated()), id: \.offset) { index, rating in
+                if !factsLine.isEmpty || index > 0 { metadataDivider }
+                RatingEntryView(rating: rating, size: 24)
+                    .foregroundColor(.white)
+            }
+        }
+    }
+
+    private var metadataDivider: some View {
+        Text("·")
+            .font(.system(size: 22, weight: .semibold))
+            .foregroundColor(Color.white.opacity(0.45))
+    }
+
+    private func ratingBadge(_ value: String) -> some View {
+        Text(value)
+            .font(.system(size: 18, weight: .bold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.white.opacity(0.78), lineWidth: 1.5)
+            )
+    }
+
+    private var ratingChips: [String] {
+        var chips = [ratingChip].compactMap { value in
+            value.flatMap { $0.isEmpty ? nil : $0 }
+        }
+        if advisoryAgePreference.showsAdvisoryAge,
+           let advisory = overlayData?.advisoryAgeBadgeLabel {
+            chips.append(advisory)
+        }
+        return chips
+    }
+
+    @ViewBuilder
+    private func factsItem(_ token: TVHeroFactToken) -> some View {
+        switch token {
+        case .text(let value):
+            Text(value)
+                .font(.system(size: 24, weight: .medium))
+                .foregroundColor(Color.white.opacity(0.88))
+        }
+    }
+
+    private func heroCredit(_ value: String) -> some View {
+        Text(value)
+            .font(.system(size: 23, weight: .regular))
+            .foregroundColor(Color.white.opacity(0.70))
+            .lineLimit(1)
+    }
+}
+
+// MARK: - Title treatment
+
+/// Heavy condensed display title. Splits on ": " into title + subtitle
+/// when the source title contains a colon — e.g. "Monarch: Legacy of
+/// Monsters" becomes a two-line composition with a larger lead and a
+/// smaller, still-heavy underline, matching the Apple TV wordmark
+/// treatment.
+private struct TVHeroTitle: View {
+    let title: String
+
+    var body: some View {
+        let parts = split(title)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(parts.primary.uppercased())
+                .font(primaryFont)
+                .foregroundColor(.white)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+            if let subtitle = parts.subtitle {
+                Text(subtitle.uppercased())
+                    .font(subtitleFont)
+                    .foregroundColor(Color.white.opacity(0.95))
+                    .tracking(1.5)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private let primaryFont = Font.system(size: 92, weight: .black).width(.compressed)
+    private let subtitleFont = Font.system(size: 40, weight: .heavy).width(.compressed)
+
+    private func split(_ raw: String) -> (primary: String, subtitle: String?) {
+        let separators: [String] = [": ", " — ", " – ", " - "]
+        for sep in separators {
+            if let range = raw.range(of: sep) {
+                let head = String(raw[..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+                let tail = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                if !head.isEmpty, !tail.isEmpty {
+                    return (head, tail)
+                }
+            }
+        }
+        return (raw, nil)
+    }
+}
+
+/// Keeps the text identity on screen until server logo artwork has actually
+/// decoded. A prefetched logo is seeded synchronously so warm detail entry does
+/// not paint one intermediate frame of text before showing the finished art.
+/// With title art off (`ui.title_art`) it never shows the logo.
+struct TVDecodedLogoTitle<Fallback: View>: View {
+    let logoUrl: String?
+    let accessibilityLabel: String
+    let maxWidth: CGFloat
+    let maxHeight: CGFloat
+    @ViewBuilder let fallback: () -> Fallback
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(
+        logoUrl: String?,
+        accessibilityLabel: String,
+        maxWidth: CGFloat,
+        maxHeight: CGFloat,
+        @ViewBuilder fallback: @escaping () -> Fallback
+    ) {
+        self.logoUrl = logoUrl
+        self.accessibilityLabel = accessibilityLabel
+        self.maxWidth = maxWidth
+        self.maxHeight = maxHeight
+        self.fallback = fallback
+    }
+
+    @ViewBuilder
+    var body: some View {
+        Group {
+            if let normalizedLogoURL {
+                let request = PosterImageCache.titleLogoRequest(for: normalizedLogoURL)
+                let cachedImage = ImagePipeline.shared.cache[request]?.image
+                LazyImage(
+                    request: request,
+                    transaction: Transaction(
+                        animation: reduceMotion || cachedImage != nil
+                            ? nil
+                            : .easeInOut(duration: 0.2)
+                    )
+                ) { state in
+                    if let image = state.image {
+                        renderedLogo(image)
+                            .transition(reduceMotion ? .identity : .opacity)
+                    } else if let cachedImage {
+                        renderedLogo(Image(platformImage: cachedImage))
+                    } else {
+                        fallback()
+                    }
+                }
+                // LazyImage compares requests by cache identity, which a
+                // re-signed URL keeps; reload on the URL itself.
+                .id(normalizedLogoURL)
+            } else {
+                fallback()
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// Nil while the profile has title art off on this device, which keeps
+    /// the text title up for good.
+    private var normalizedLogoURL: URL? {
+        guard TitleArtPreferences.shared.showsTitleArt,
+              let normalized = logoUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalized.isEmpty else {
+            return nil
+        }
+        return URL(string: normalized)
+    }
+
+    private func renderedLogo(_ image: Image) -> some View {
+        image
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(
+                maxWidth: maxWidth,
+                maxHeight: maxHeight,
+                alignment: .bottomLeading
+            )
+            .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Eyebrow pill
+
+private struct TVHeroEyebrow: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 18, weight: .semibold))
+            .tracking(1.2)
+            .foregroundColor(.white)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(0.55))
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            )
+    }
+}
+
+// MARK: - Tokens
+
+/// A token in the combined facts row, separated by "·".
+enum TVHeroFactToken: Hashable {
+    case text(String)
+}
+
+// MARK: - Metadata builders
+
+enum TVHeroMetadata {
+    // Source row (type · genres)
+
+    static func movieSourceTokens(from detail: ItemDetail) -> [String] {
+        if detail.type == "episode" {
+            if let label = episodeNumberLabel(from: detail) {
+                return [label]
+            }
+            return []
+        }
+        if let genres = detail.genres, !genres.isEmpty {
+            return [genres.prefix(2).joined(separator: ", ")]
+        }
+        return []
+    }
+
+    /// "Season 3 · Episode 8" (or "Specials · Episode 5" / "Episode 5")
+    /// for an episode `ItemDetail`.
+    private static func episodeNumberLabel(from detail: ItemDetail) -> String? {
+        let seasonPart: String?
+        if let season = detail.seasonNumber {
+            seasonPart = season == 0 ? "Specials" : "Season \(season)"
+        } else {
+            seasonPart = nil
+        }
+        let episodePart = detail.episodeNumber.flatMap { n in n > 0 ? "Episode \(n)" : nil }
+
+        switch (seasonPart, episodePart) {
+        case let (.some(s), .some(e)): return "\(s) \u{00B7} \(e)"
+        case let (.some(s), .none):    return s
+        case let (.none, .some(e)):    return e
+        case (.none, .none):           return nil
+        }
+    }
+
+    static func seriesSourceTokens(from detail: ItemDetail) -> [String] {
+        if let genres = detail.genres, !genres.isEmpty {
+            return [genres.prefix(2).joined(separator: ", ")]
+        }
+        return []
+    }
+
+    static func contentRatingChip(from detail: ItemDetail) -> String? {
+        guard let rating = detail.contentRating?
+            .trimmingCharacters(in: .whitespaces), !rating.isEmpty
+        else { return nil }
+        return rating
+    }
+
+    // Movie/episode year or air date and runtime; series year and season count.
+
+    static func movieFactsLine(from detail: ItemDetail, version selectedVersion: FileVersion? = nil) -> [TVHeroFactToken] {
+        var tokens: [TVHeroFactToken] = []
+        if detail.type == "episode",
+           let airDate = DetailDateFormatting.abbreviatedDate(detail.airDate) {
+            tokens.append(.text(airDate))
+        } else if let year = detail.year, year > 0 {
+            tokens.append(.text(String(year)))
+        }
+        let runtime = SelectedMediaRuntime.minutes(detail: detail, selectedVersion: selectedVersion)
+        if let runtimeText = MediaTextFormatting.runtime(minutes: runtime) {
+            tokens.append(.text(runtimeText))
+        }
+        return tokens
+    }
+
+    /// `seasons` is the season list the page loaded from the library; the
+    /// count stays off the line until it arrives.
+    static func seriesFactsLine(from detail: ItemDetail, seasons: [Season]) -> [TVHeroFactToken] {
+        var tokens: [TVHeroFactToken] = []
+        if let year = detail.year, year > 0 {
+            tokens.append(.text(String(year)))
+        }
+        let count = seasons.librarySeasonCount
+        if count > 0 {
+            tokens.append(.text("\(count) Season\(count == 1 ? "" : "s")"))
+        }
+        return tokens
+    }
+
+    static func seriesEpisodeFactsLine(
+        episode: EpisodeListItem,
+        playbackDetail: ItemDetail?,
+        selectedVersion: FileVersion?
+    ) -> [TVHeroFactToken] {
+        var tokens: [TVHeroFactToken] = []
+        if let airDate = DetailDateFormatting.abbreviatedDate(episode.airDate) {
+            tokens.append(.text(airDate))
+        }
+        let runtime = playbackDetail.flatMap {
+            SelectedMediaRuntime.minutes(detail: $0, selectedVersion: selectedVersion)
+        } ?? episode.runtime
+        if let runtimeText = MediaTextFormatting.runtime(minutes: runtime) {
+            tokens.append(.text(runtimeText))
+        }
+        return tokens
+    }
+
+    // Starring (first 3 cast names)
+
+    static func starringText(from detail: ItemDetail) -> String? {
+        if detail.type == "movie" {
+            let directors = detail.crew?
+                .filter { $0.job?.caseInsensitiveCompare("Director") == .orderedSame }
+                .map(\.name) ?? []
+            guard !directors.isEmpty else { return nil }
+            return "Directed by " + directors.prefix(2).joined(separator: ", ")
+        }
+        guard let cast = detail.cast, !cast.isEmpty else { return nil }
+        let names = cast.prefix(3).map(\.name)
+        guard !names.isEmpty else { return nil }
+        return "Starring " + names.joined(separator: ", ")
+    }
+}
+
+/// Fixed-width readout matching the Android TV detail branch. Labels stay in
+/// place and unresolved values render quiet skeletons while the newly focused
+/// episode's playback detail arrives.
+private struct TVPlaybackSelectionSummaryView: View {
+    let summary: TVPlaybackSelectionSummary
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            summaryItem(
+                label: "VERSION",
+                value: summary.version,
+                slotWidth: 313,
+                placeholderWidth: 128
+            )
+            summaryItem(
+                label: "AUDIO",
+                value: summary.audio,
+                slotWidth: 364,
+                placeholderWidth: 166
+            )
+            summaryItem(
+                label: "SUBTITLES",
+                value: summary.subtitles,
+                slotWidth: 338,
+                placeholderWidth: 77
+            )
+        }
+        // This matches the compact no-Restart action-row footprint. Starts stay
+        // fixed between episodes, while unusually long values scale down inside
+        // their own slot instead of wrapping or extending into the artwork.
+        .frame(width: 1_031, height: 44, alignment: .topLeading)
+    }
+
+    private func summaryItem(
+        label: String,
+        value: String?,
+        slotWidth: CGFloat,
+        placeholderWidth: CGFloat
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(label)
+                .font(.system(size: 23, weight: .bold))
+                .tracking(0.9)
+                .foregroundColor(Color.white.opacity(0.48))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+
+            Group {
+                if let value {
+                    Text(value)
+                        .font(.system(size: 23, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.82))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .allowsTightening(true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.white.opacity(0.14))
+                        .frame(width: placeholderWidth, height: 18)
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        .frame(width: slotWidth, height: 44, alignment: .topLeading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label.capitalized), \(value ?? "loading")")
+    }
+}
+#endif

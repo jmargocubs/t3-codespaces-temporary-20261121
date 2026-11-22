@@ -1,0 +1,85 @@
+# Xcode / XcodeGen
+iosApp/Silo.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+iosApp/.deriveddata/
+
+# XcodeGen regenerates the project, but the exact Aether transitive graph is a
+# release input and must remain reviewable.
+!iosApp/Silo.xcodeproj/
+iosApp/Silo.xcodeproj/*
+!iosApp/Silo.xcodeproj/project.xcworkspace/
+iosApp/Silo.xcodeproj/project.xcworkspace/*
+!iosApp/Silo.xcodeproj/project.xcworkspace/xcshareddata/
+iosApp/Silo.xcodeproj/project.xcworkspace/xcshareddata/*
+!iosApp/Silo.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+iosApp/Silo.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!iosApp/Silo.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+# SwiftPM / CocoaPods
+.build/
+iosApp/.spm-packages/
+iosApp/Pods/
+
+# Fastlane build outputs (IPAs, archives from the ipa_*_unsigned lanes)
+build/
+fastlane/README.md
+
+# Local signing and secrets
+iosApp/Signing/Local.xcconfig
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.mobileprovision
+*.cer
+
+# Ruby / Fastlane
+vendor/bundle/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Local agent/tooling state
+/.agents/
+/.claude/
+.codex/
+.cursor/
+.sweetpad/
+.worktrees/
+.playwright-mcp/
+.playwright-cli/
+.superpowers/
+buildServer.json
+
+# Logs and OS files
+*.log
+logs/
+output/
+.DS_Store
+Thumbs.db
+.swiftpm/
+docs/*
+!docs/kyro-development/
+!docs/kyro-development/**
+!docs/tvos-focus.md
+!docs/mac-builder.md
+!docs/tvos-player/
+docs/tvos-player/*
+!docs/tvos-player/aetherengine-replacement-spec.md
+!docs/tvos-player/ass-subtitles.md
+!docs/release/*
+!docs/release/
+!docs/*-api-v2.md
+!docs/aether-forward-only-resume.md
+!docs/livetv/
+docs/livetv/*
+!docs/livetv/epg-cache-format.md
+
+# Local Seekr credentials (never commit)
+iosApp/Signing/SeekrSecrets.xcconfig
+iosApp/Signing/SeekrAPIKey

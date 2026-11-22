@@ -1,0 +1,669 @@
+import AetherEngine
+import AVFoundation
+import Foundation
+
+/// Resolves the language hint Aether uses for its initial audio pick.
+///
+/// A Protocol V3 plan's selected audio ordinal is authoritative. Feeding the
+/// user's broader profile preference to Aether in that case can start a
+/// different track, publish first frame, and then force a full pipeline reload
+/// when the exact ordinal is applied after inventory arrives. Prefer the
+/// selected track's language for the first open. Non-default original-file
+/// tracks are resolved to an exact stream id before loading; the existing
+/// post-open reconciliation remains a fallback for partial metadata.
+enum AetherInitialAudioPreference {
+    static func languages(
+        selectedOrdinal: Int?,
+        tracks: [AudioTrack],
+        fallbackLanguage: String
+    ) -> [String] {
+        if let selectedOrdinal {
+            guard tracks.indices.contains(selectedOrdinal) else { return [] }
+            let selectedLanguage = tracks[selectedOrdinal].language?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return selectedLanguage.isEmpty ? [] : [selectedLanguage]
+        }
+
+        let fallback = fallbackLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? [] : [fallback]
+    }
+
+    /// Whether an original-file load must resolve the plan's dense ordinal to
+    /// an AVStream id before opening Aether. The container default needs no
+    /// override; every other selection does. Language is deliberately ignored:
+    /// TrueHD and its compatibility track commonly share the same tag, so even
+    /// a non-empty language cannot prove which stream Aether will choose.
+    static func requiresExactStreamProbe(
+        selectedOrdinal: Int?,
+        tracks: [AudioTrack]
+    ) -> Bool {
+        guard let selectedOrdinal else { return false }
+        guard !tracks.isEmpty else { return true }
+        let defaultOrdinal = tracks.firstIndex { $0.isDefault == true } ?? 0
+        return selectedOrdinal != defaultOrdinal
+    }
+}
+
+/// Decides whether a committed Aether load failed because the bearer frozen
+/// into its media request expired, and whether rebuilding it would actually
+/// install a different credential.
+///
+/// Keep this typed and token-agnostic: AVFoundation localizes its messages,
+/// while the error domain/code and Aether's source-refusal status are stable.
+/// Comparing the complete header value bounds recovery to one reload per
+/// credential generation; a revoked current token falls through to the normal
+/// Protocol V3 route ladder instead of looping on the same URL forever.
+enum AetherAuthenticationRecoveryPolicy {
+    static func isExpiredBearerFailure(_ failure: PlaybackErrorInfo) -> Bool {
+        if failure.kind == .sourceRefused {
+            return failure.underlyingDomain == nil && failure.underlyingCode == 401
+        }
+        return failure.kind == .nativeItemFailed
+            && failure.underlyingDomain == NSURLErrorDomain
+            && failure.underlyingCode == NSURLErrorUserAuthenticationRequired
+    }
+
+    static func shouldReload(
+        failedHeaders: [String: String],
+        refreshedHeaders: [String: String]
+    ) -> Bool {
+        guard let refreshed = authorizationHeader(in: refreshedHeaders) else { return false }
+        return authorizationHeader(in: failedHeaders) != refreshed
+    }
+
+    /// Server HLS resolves the current credential for every playlist and
+    /// segment request, and direct play gets the current headers pushed into
+    /// Aether as the token rotates (`AetherPlaybackController
+    /// .refreshRequestHeaders`), so media with video survives token rotation
+    /// without a reload. Audio-only media keeps the headers it opened with and
+    /// the reload-after-rotation path.
+    static func resolvesRequestCredentials(delivery: String, hasVideo: Bool) -> Bool {
+        hasVideo && PlaybackProtocolV3.PlanDelivery.supported.contains(delivery)
+    }
+
+    static func shouldReloadAfterProgress(
+        _ result: PlaybackProgressReportResult,
+        activeHeaders: [String: String],
+        currentHeaders: [String: String],
+        hasRequestAuthorization: Bool = false
+    ) -> Bool {
+        !hasRequestAuthorization && result == .success && shouldReload(
+            failedHeaders: activeHeaders,
+            refreshedHeaders: currentHeaders
+        )
+    }
+
+    private static func authorizationHeader(in headers: [String: String]) -> String? {
+        headers.first { key, _ in
+            key.caseInsensitiveCompare("Authorization") == .orderedSame
+        }?.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Immutable inputs for one Aether load generation.
+///
+/// The initialisers are main-actor isolated because they sample the display
+/// before building `LoadOptions`: Aether runs the display-criteria handshake
+/// synchronously inside `load`, so `panelIsInHDRMode` and `matchContentEnabled`
+/// have to be true of the panel at spec-construction time. Passing an explicit
+/// `panelIsInHDRMode` overrides that measurement; `nil` means measure now.
+struct AetherLoadSpec {
+    enum ValidationError: Error, Equatable {
+        case invalidStreamURL(String)
+        case invalidAudioTrackIndex(Int)
+        case invalidSubtitleArtifactURL(String)
+        case unsupportedSubtitleTimingOrigin(origin: Double, timelineOffset: Double)
+    }
+
+    let planID: String
+    let sessionID: String
+    let delivery: String
+    let sourceURL: URL
+    let timeline: PlaybackTimelineMapper
+    /// Player-axis position handed to `AetherEngine.load`. Usually the plan's
+    /// declared start, but a same-plan credential reload resumes at the current
+    /// source position translated through the still-active timeline.
+    let aetherStartPosition: Double
+    let options: LoadOptions
+    let audioSourceStreamIndex: Int32?
+    /// App-facing ids for `options.externalSubtitles`, positionally parallel to
+    /// that array — element `i` is the Silo id of `options.externalSubtitles[i]`,
+    /// and `nil` means "this declared track has no stable Silo id".
+    ///
+    /// Aether assigns its own ids sequentially from `externalSubtitleTrackIDBase`
+    /// in declaration order, so the controller can only translate an alias by
+    /// position. That makes the parallel-arrays invariant load-bearing: an entry
+    /// here that Aether was never asked to register binds a Silo id to the Aether
+    /// id of some *other* sidecar (the first one registered later), which is how
+    /// picking "English" ends up rendering the first sidecar in the plan. Both
+    /// arrays are therefore built at a single append site.
+    let externalSubtitleAppTrackIDs: [Int64?]
+    /// Font bundles keyed by the same app-facing IDs as subtitle picker rows.
+    /// Requests carry only headers authorized for the bundle's origin.
+    let subtitleFontRequests: [Int64: URLRequest]
+    /// Captured API-session authorization, reused by late subtitle selections
+    /// and font downloads without changing registered track identities.
+    let subtitleRequestAuthorization: HTTPRequestAuthorization?
+    private let subtitleAuthorizationOrigin: URL?
+    /// Current headers for a direct-play source with video, from the resolver
+    /// behind `options.httpRequestAuthorization`. Aether asks that object only
+    /// for HLS and reads direct media with the headers it holds, so the
+    /// controller pushes this resolver's answers in as the token rotates.
+    let requestHeaderResolver: HTTPRequestAuthorization.Resolver?
+    /// The selected native row uses the same picker ID space as sidecars,
+    /// but resolves directly to its container stream, without an external slot.
+    let embeddedSubtitleAlias: (appTrackID: Int64, streamIndex: Int)?
+    /// The declared subtitle artifact is the server's extract of a track
+    /// inside the media file. That response streams until the server has
+    /// demuxed the whole file, which takes tens of seconds on a large remux.
+    let declaresEmbeddedTrackExtract: Bool
+    /// The selected picker row of an `hls_rendition` plan. The track is a
+    /// legible option of the stream's own playlist, so it has no declared
+    /// external slot and no Aether id until AVPlayer publishes the option.
+    let hlsSubtitleRenditionAppTrackID: Int64?
+
+    /// The bridge for codecs Aether cannot stream-copy, when a caller does not
+    /// name one. Lossless rather than Aether's `.surroundCompat` default;
+    /// `PlayerSettings.losslessAudioEnabled` overrides it.
+    static let defaultAudioBridgeMode: AudioBridgeMode = .lossless
+
+    /// The deinterlacer used when a caller does not name one.
+    ///
+    /// Aether's own default, unlike ``defaultAudioBridgeMode``: the hardware
+    /// graph with its software fallback is what every load has always got, so
+    /// restating it here changes nothing until the user picks otherwise. See
+    /// `PlayerSettings.deinterlaceMode`.
+    static let defaultDeinterlaceMode: DeinterlaceMode = .auto
+
+    /// The hardware deinterlacer's cadence when a caller does not name one.
+    /// Also Aether's own default; see `PlayerSettings.deinterlaceFieldRate`.
+    static let defaultDeinterlaceFieldRate: DeinterlaceFieldRate = .field
+
+    /// The Dolby Vision layer a load presents, from the per-device Dolby
+    /// Vision setting (which is only offered while HDR is on). The setting
+    /// also shapes the capabilities sent to the server, but an original file
+    /// is opened here, so Aether has to be told too: with it off, a Profile
+    /// 7 / 8.1 / 8.4 source plays as its HDR10 / HLG base layer and the TV is
+    /// asked for HDR10 / HLG, not Dolby Vision. A Profile 5 source has no
+    /// base layer and stays Dolby Vision.
+    static func dolbyVisionHandling(hdrEnabled: Bool, dolbyVisionEnabled: Bool) -> DolbyVisionHandling {
+        hdrEnabled && dolbyVisionEnabled ? .automatic : .baseLayerOnly
+    }
+
+    /// Resolve a download manifest's audio ordinal (`selected_audio_track_index`,
+    /// a position among the delivered file's audio streams) to the stream id
+    /// Aether selects by. Nil when the ordinal is outside the probed file, so
+    /// the load falls back to the file's default track.
+    static func offlineAudioStreamIndex(manifestOrdinal: Int, probedTrackIDs: [Int]) -> Int32? {
+        guard probedTrackIDs.indices.contains(manifestOrdinal) else { return nil }
+        return Int32(exactly: probedTrackIDs[manifestOrdinal])
+    }
+
+    @MainActor
+    init(
+        offlineURL: URL,
+        startPosition: Double,
+        audioOnly: Bool,
+        audioSourceStreamIndex: Int32? = nil,
+        sidecars: [SubtitleUrl] = [],
+        preferredAudioLanguages: [String] = [],
+        preferredSubtitleLanguages: [String] = [],
+        forwardBufferSegments: Int? = nil,
+        audioBridgeMode: AudioBridgeMode = Self.defaultAudioBridgeMode,
+        objectAudioRendering: ObjectAudioRendering = .off,
+        deinterlaceMode: DeinterlaceMode = Self.defaultDeinterlaceMode,
+        deinterlaceFieldRate: DeinterlaceFieldRate = Self.defaultDeinterlaceFieldRate,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        panelIsInHDRMode: Bool? = nil
+    ) throws {
+        guard offlineURL.isFileURL else {
+            throw ValidationError.invalidStreamURL(offlineURL.absoluteString)
+        }
+        let externalSubtitles = try sidecars.map { sidecar -> ExternalSubtitleTrack in
+            guard let url = URL(string: sidecar.url), url.isFileURL else {
+                throw ValidationError.invalidSubtitleArtifactURL(sidecar.url)
+            }
+            return ExternalSubtitleTrack(
+                url: url,
+                name: sidecar.label,
+                language: sidecar.language,
+                isForced: sidecar.forced ?? false,
+                isHearingImpaired: sidecar.hearingImpaired ?? false,
+                isDefault: sidecar.default ?? false,
+                formatHint: sidecar.codec
+            )
+        }
+        planID = "offline"
+        subtitleRequestAuthorization = nil
+        requestHeaderResolver = nil
+        subtitleAuthorizationOrigin = nil
+        sessionID = "offline"
+        delivery = PlaybackProtocolV3.PlanDelivery.originalHTTP
+        sourceURL = offlineURL
+        timeline = PlaybackTimelineMapper(directStartSeconds: startPosition)
+        aetherStartPosition = timeline.aetherStartPosition
+        self.audioSourceStreamIndex = audioSourceStreamIndex
+        subtitleFontRequests = Dictionary(uniqueKeysWithValues: sidecars.compactMap { sidecar in
+            guard let value = sidecar.fontBundleUrl,
+                  let url = URL(string: value), url.isFileURL else { return nil }
+            return (SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: sidecar.index), URLRequest(url: url))
+        })
+        embeddedSubtitleAlias = nil
+        declaresEmbeddedTrackExtract = false
+        hlsSubtitleRenditionAppTrackID = nil
+        externalSubtitleAppTrackIDs = sidecars.map { sidecar -> Int64? in
+            SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: sidecar.index)
+        }
+        options = LoadOptions(
+            dolbyVisionHandling: dolbyVisionHandling,
+            panelIsInHDRMode: panelIsInHDRMode ?? AetherDisplayContext.panelIsInHDRMode,
+            audioBridgeMode: audioBridgeMode,
+            objectAudioRendering: objectAudioRendering,
+            audioOnly: audioOnly,
+            preserveASSMarkup: true,
+            prepareNativeSubtitles: true,
+            eagerNativeSubtitleReaders: true,
+            nativeSubtitlePreferredLanguages: preferredSubtitleLanguages,
+            preferredAudioLanguages: preferredAudioLanguages,
+            preferredSubtitleLanguages: preferredSubtitleLanguages,
+            externalSubtitles: externalSubtitles,
+            forwardBufferSegments: forwardBufferSegments,
+            autoplay: false,
+            deinterlaceMode: deinterlaceMode,
+            deinterlaceFieldRate: deinterlaceFieldRate
+        )
+    }
+
+    @MainActor
+    init(
+        directURL: URL,
+        headers: [String: String],
+        startPosition: Double,
+        audioOnly: Bool,
+        sidecars: [SubtitleUrl] = [],
+        preferredAudioLanguages: [String] = [],
+        preferredSubtitleLanguages: [String] = [],
+        forwardBufferSegments: Int? = nil,
+        audioBridgeMode: AudioBridgeMode = Self.defaultAudioBridgeMode,
+        objectAudioRendering: ObjectAudioRendering = .off,
+        deinterlaceMode: DeinterlaceMode = Self.defaultDeinterlaceMode,
+        deinterlaceFieldRate: DeinterlaceFieldRate = Self.defaultDeinterlaceFieldRate,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        panelIsInHDRMode: Bool? = nil
+    ) throws {
+        guard ["http", "https", "file"].contains(directURL.scheme?.lowercased() ?? "") else {
+            throw ValidationError.invalidStreamURL(directURL.absoluteString)
+        }
+        let externalSubtitles = try sidecars.map { sidecar -> ExternalSubtitleTrack in
+            guard let url = Self.resolveSidecarURL(sidecar.url, relativeTo: directURL),
+                  ["http", "https", "file"].contains(url.scheme?.lowercased() ?? "") else {
+                throw ValidationError.invalidSubtitleArtifactURL(sidecar.url)
+            }
+            return ExternalSubtitleTrack(
+                url: url,
+                name: sidecar.label,
+                language: sidecar.language,
+                isForced: sidecar.forced ?? false,
+                isHearingImpaired: sidecar.hearingImpaired ?? false,
+                isDefault: sidecar.default ?? false,
+                httpHeaders: Self.subtitleRequestHeaders(
+                    headers,
+                    resourceURL: url,
+                    trustedOriginURLs: [directURL]
+                ),
+                formatHint: sidecar.codec
+            )
+        }
+        planID = "legacy-direct"
+        subtitleRequestAuthorization = nil
+        requestHeaderResolver = nil
+        subtitleAuthorizationOrigin = nil
+        sessionID = "legacy-direct"
+        delivery = PlaybackProtocolV3.PlanDelivery.originalHTTP
+        sourceURL = directURL
+        timeline = PlaybackTimelineMapper(directStartSeconds: startPosition)
+        aetherStartPosition = timeline.aetherStartPosition
+        audioSourceStreamIndex = nil
+        subtitleFontRequests = Dictionary(uniqueKeysWithValues: sidecars.compactMap { sidecar in
+            guard let value = sidecar.fontBundleUrl,
+                  let url = Self.resolveSidecarURL(value, relativeTo: directURL),
+                  ["http", "https", "file"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+            var request = URLRequest(url: url)
+            request.allHTTPHeaderFields = Self.subtitleRequestHeaders(
+                headers, resourceURL: url, trustedOriginURLs: [directURL])
+            return (SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: sidecar.index), request)
+        })
+        embeddedSubtitleAlias = nil
+        declaresEmbeddedTrackExtract = false
+        hlsSubtitleRenditionAppTrackID = nil
+        externalSubtitleAppTrackIDs = sidecars.map { sidecar -> Int64? in
+            SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: sidecar.index)
+        }
+        options = LoadOptions(
+            httpHeaders: headers,
+            dolbyVisionHandling: dolbyVisionHandling,
+            panelIsInHDRMode: panelIsInHDRMode ?? AetherDisplayContext.panelIsInHDRMode,
+            audioBridgeMode: audioBridgeMode,
+            objectAudioRendering: objectAudioRendering,
+            audioOnly: audioOnly,
+            preserveASSMarkup: true,
+            prepareNativeSubtitles: true,
+            eagerNativeSubtitleReaders: true,
+            nativeSubtitlePreferredLanguages: preferredSubtitleLanguages,
+            preferredAudioLanguages: preferredAudioLanguages,
+            preferredSubtitleLanguages: preferredSubtitleLanguages,
+            externalSubtitles: externalSubtitles,
+            forwardBufferSegments: forwardBufferSegments,
+            autoplay: false,
+            deinterlaceMode: deinterlaceMode,
+            deinterlaceFieldRate: deinterlaceFieldRate
+        )
+    }
+
+    @MainActor
+    init(
+        validating plan: PlaybackV3Plan,
+        sessionID: String,
+        matchContentEnabled: Bool,
+        sourceURLOverride: URL? = nil,
+        requestHeaders: [String: String]? = nil,
+        requestAuthorization: HTTPRequestAuthorization? = nil,
+        requestHeaderResolver: HTTPRequestAuthorization.Resolver? = nil,
+        subtitleRequestAuthorization: HTTPRequestAuthorization? = nil,
+        resolveURL: ((String) -> URL?)? = nil,
+        apiOriginURL: URL? = nil,
+        audioSourceStreamIndex: Int32? = nil,
+        preferredAudioLanguages: [String] = [],
+        forwardBufferSegments: Int? = nil,
+        audioBridgeMode: AudioBridgeMode = Self.defaultAudioBridgeMode,
+        objectAudioRendering: ObjectAudioRendering = .off,
+        deinterlaceMode: DeinterlaceMode = Self.defaultDeinterlaceMode,
+        deinterlaceFieldRate: DeinterlaceFieldRate = Self.defaultDeinterlaceFieldRate,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        resumeSourcePosition: Double? = nil,
+        panelIsInHDRMode: Bool? = nil
+    ) throws {
+        try ApplePlaybackV3PlanAdapter.validate(plan)
+        let resolvedPlanSourceURL: URL?
+        if let resolveURL {
+            resolvedPlanSourceURL = resolveURL(plan.stream.url)
+        } else {
+            resolvedPlanSourceURL = URL(string: plan.stream.url)
+        }
+        guard let sourceURL = sourceURLOverride ?? resolvedPlanSourceURL,
+              ["http", "https", "file"].contains(sourceURL.scheme?.lowercased() ?? "") else {
+            throw ValidationError.invalidStreamURL(plan.stream.url)
+        }
+        let timeline = try PlaybackTimelineMapper(validating: plan.timeline)
+        // `StreamRequest` adds the current Silo bearer to the plan-provided
+        // headers. Its merged value is authoritative for both the media and
+        // same-origin subtitle artifacts; falling back to the wire-plan value
+        // keeps the pure mapper independently usable in tests.
+        let effectiveHeaders = requestHeaders ?? plan.stream.headers
+
+        // Protocol V3's selected audio index is an ordinal in the server's
+        // audio-track list, not an FFmpeg AVStream index. The caller resolves
+        // a non-default original-file ordinal through Aether's authenticated
+        // probe and passes the resulting stream id separately. The post-open
+        // reconciliation remains a fallback for older/partial metadata.
+        if let selectedIndex = plan.selectedTracks.audio?.index {
+            guard selectedIndex >= 0 else {
+                throw ValidationError.invalidAudioTrackIndex(selectedIndex)
+            }
+        }
+
+        // Declared tracks and their Silo aliases are appended together so the
+        // two arrays cannot drift: an alias without a declared track shifts
+        // every later Aether external id by one.
+        var externalSubtitles: [ExternalSubtitleTrack] = []
+        var externalSubtitleAppTrackIDs: [Int64?] = []
+        var declaresEmbeddedTrackExtract = false
+        if plan.subtitle.embedded == nil,
+           let artifact = plan.subtitle.artifact,
+           PlaybackProtocolV3.SubtitleMode.locallyRendered.contains(plan.subtitle.mode) {
+            guard artifact.timingOriginSeconds.isFinite, abs(artifact.timingOriginSeconds) < 0.001 else {
+                throw ValidationError.unsupportedSubtitleTimingOrigin(
+                    origin: artifact.timingOriginSeconds,
+                    timelineOffset: plan.timeline.timelineOffsetSeconds
+                )
+            }
+            let resolvedArtifactURL: URL?
+            if let resolveURL {
+                resolvedArtifactURL = resolveURL(artifact.url)
+            } else {
+                resolvedArtifactURL = URL(string: artifact.url)
+            }
+            guard let artifactURL = resolvedArtifactURL,
+                  ["http", "https", "file"].contains(artifactURL.scheme?.lowercased() ?? "") else {
+                throw ValidationError.invalidSubtitleArtifactURL(artifact.url)
+            }
+            // One shared resolution order for the selected row; see
+            // `PlaybackV3Plan.selectedSubtitleInventoryItem`.
+            let inventoryItem = plan.selectedSubtitleInventoryItem
+            externalSubtitles.append(ExternalSubtitleTrack(
+                url: artifactURL,
+                name: inventoryItem?.label,
+                language: inventoryItem?.language,
+                isForced: inventoryItem?.forced ?? false,
+                isHearingImpaired: inventoryItem?.hearingImpaired ?? false,
+                isDefault: inventoryItem?.default ?? false,
+                // Subtitle artifacts are always API-origin routes, including
+                // when `authorized_media_origins_v1` puts the media itself on a
+                // proxy. Trusting the API origin alongside the source is what
+                // keeps the bearer attached to the sidecar in that case; the
+                // artifact URL itself is still plan-validated as API-relative.
+                httpHeaders: Self.subtitleRequestHeaders(
+                    effectiveHeaders,
+                    resourceURL: artifactURL,
+                    trustedOriginURLs: [sourceURL, apiOriginURL].compactMap { $0 }
+                ),
+                httpRequestAuthorization: subtitleRequestAuthorization,
+                formatHint: artifact.format,
+                nativeTimelineOffsetSeconds: plan.timeline.timelineOffsetSeconds
+            ))
+            // A declared artifact the inventory does not name has no stable
+            // Silo id; leaving the slot empty keeps the arrays parallel and
+            // lets the controller fall back to Aether's own id for it.
+            externalSubtitleAppTrackIDs.append(inventoryItem.map { item in
+                SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: item.combinedIndex)
+            })
+            declaresEmbeddedTrackExtract = inventoryItem?.source == "embedded"
+        }
+
+        self.planID = plan.planId
+        self.subtitleRequestAuthorization = subtitleRequestAuthorization
+        subtitleAuthorizationOrigin = apiOriginURL ?? sourceURL
+        self.sessionID = sessionID
+        self.delivery = plan.delivery
+        self.sourceURL = sourceURL
+        self.timeline = timeline
+        if plan.delivery == PlaybackProtocolV3.PlanDelivery.remuxProgressive {
+            // A progressive remux is one chunked response the reader cannot
+            // rewind. Aether answers a non-zero start by seeking and flushing
+            // what it probed, then fails re-reading the first sample, so the
+            // stream never plays. Starting at byte zero replays the copied
+            // pre-roll (the keyframe before the requested position) instead;
+            // the timeline offset still maps the clock to the source position.
+            // Remove once Aether skips that seek on a forward-only source
+            // (docs/aether-forward-only-resume.md).
+            aetherStartPosition = 0
+        } else if let resumeSourcePosition, resumeSourcePosition.isFinite {
+            aetherStartPosition = timeline.playerPosition(
+                forSourceTime: max(0, resumeSourcePosition)
+            )
+        } else {
+            aetherStartPosition = timeline.aetherStartPosition
+        }
+        self.audioSourceStreamIndex = audioSourceStreamIndex
+        self.externalSubtitleAppTrackIDs = externalSubtitleAppTrackIDs
+        self.declaresEmbeddedTrackExtract = declaresEmbeddedTrackExtract
+        if let item = plan.selectedSubtitleInventoryItem, let value = item.fontBundleUrl {
+            let url = resolveURL.map { $0(value) } ?? URL(string: value)
+            guard let url, ["http", "https", "file"].contains(url.scheme?.lowercased() ?? "") else {
+                throw ValidationError.invalidSubtitleArtifactURL(value)
+            }
+            var request = URLRequest(url: url)
+            request.allHTTPHeaderFields = Self.subtitleRequestHeaders(
+                effectiveHeaders, resourceURL: url,
+                trustedOriginURLs: [sourceURL, apiOriginURL].compactMap { $0 }
+            )
+            subtitleFontRequests = [SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: item.combinedIndex): request]
+        } else {
+            subtitleFontRequests = [:]
+        }
+        if PlaybackProtocolV3.SubtitleMode.locallyRendered.contains(plan.subtitle.mode),
+           let embedded = plan.subtitle.embedded,
+           let combinedIndex = plan.selectedSubtitleCombinedIndex {
+            embeddedSubtitleAlias = (
+                SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: combinedIndex),
+                embedded.streamIndex
+            )
+        } else {
+            embeddedSubtitleAlias = nil
+        }
+        if plan.subtitle.hlsRendition != nil,
+           PlaybackProtocolV3.SubtitleMode.locallyRendered.contains(plan.subtitle.mode),
+           let combinedIndex = plan.selectedSubtitleCombinedIndex {
+            hlsSubtitleRenditionAppTrackID = SubtitleTrackIdSpace.makeSidecarTrackId(urlIndex: combinedIndex)
+        } else {
+            hlsSubtitleRenditionAppTrackID = nil
+        }
+        let isServerHLS = [
+            PlaybackProtocolV3.PlanDelivery.remuxHLS,
+            PlaybackProtocolV3.PlanDelivery.transcodeHLS,
+        ].contains(plan.delivery)
+        let resolvesRequestCredentials = AetherAuthenticationRecoveryPolicy.resolvesRequestCredentials(
+            delivery: plan.delivery, hasVideo: plan.effectiveRecipe.videoCodec != nil
+        )
+        self.requestHeaderResolver = resolvesRequestCredentials && !isServerHLS ? requestHeaderResolver : nil
+        var loadOptions = LoadOptions(
+            httpHeaders: effectiveHeaders,
+            httpRequestAuthorization: resolvesRequestCredentials ? requestAuthorization : nil,
+            dolbyVisionHandling: dolbyVisionHandling,
+            matchContentEnabled: matchContentEnabled,
+            panelIsInHDRMode: panelIsInHDRMode ?? AetherDisplayContext.panelIsInHDRMode,
+            audioBridgeMode: audioBridgeMode,
+            objectAudioRendering: objectAudioRendering,
+            audioOnly: plan.effectiveRecipe.videoCodec == nil,
+            nativeRemoteHLS: isServerHLS,
+            preserveASSMarkup: true,
+            prepareNativeSubtitles: true,
+            eagerNativeSubtitleReaders: true,
+            // V3 already selected one exact artifact. Language preference is
+            // planning input, not permission for the engine to select a
+            // different embedded or inventory track after the plan arrives.
+            nativeSubtitlePreferredLanguages: [],
+            preferredAudioLanguages: preferredAudioLanguages,
+            preferredSubtitleLanguages: [],
+            externalSubtitles: externalSubtitles,
+            forwardBufferSegments: forwardBufferSegments,
+            autoplay: false,
+            deinterlaceMode: deinterlaceMode,
+            deinterlaceFieldRate: deinterlaceFieldRate
+        )
+        if plan.delivery == PlaybackProtocolV3.PlanDelivery.remuxProgressive,
+           let sourceDuration = plan.source.durationSeconds,
+           sourceDuration > timeline.timelineOffsetSeconds {
+            // A progressive remux is fragmented, so the container reports
+            // only its first fragment (a few seconds). Aether then treats the
+            // session as parked at end of media, and the next play() rewinds
+            // to zero: a seek this stream cannot serve, which ends playback.
+            // Declare what remains of the runtime on the engine's axis.
+            loadOptions.declaredDurationSeconds = sourceDuration - timeline.timelineOffsetSeconds
+        }
+        options = loadOptions
+    }
+
+    private static func resolveSidecarURL(_ value: String, relativeTo mediaURL: URL) -> URL? {
+        if let absolute = URL(string: value), absolute.scheme != nil {
+            return absolute
+        }
+        guard !mediaURL.isFileURL else {
+            return URL(fileURLWithPath: value, relativeTo: mediaURL.deletingLastPathComponent())
+                .standardizedFileURL
+        }
+        return URL(string: value, relativeTo: mediaURL)?.absoluteURL
+    }
+
+    /// Choose per resource: an unrelated sidecar or font server keeps its
+    /// unauthenticated path. API-origin URLs retain the strict provider even
+    /// for invalid paths/sessions, so denial cannot fall back to frozen headers.
+    func subtitleRequestAuthorization(for resourceURL: URL?) -> HTTPRequestAuthorization? {
+        guard let resourceURL, let subtitleAuthorizationOrigin,
+              StreamRequest.hasSameOrigin(resourceURL, subtitleAuthorizationOrigin) else { return nil }
+        return subtitleRequestAuthorization
+    }
+
+    func refreshableSubtitleHeaders(for resourceURL: URL) -> [String: String] {
+        Self.subtitleRequestHeaders(
+            options.httpHeaders, resourceURL: resourceURL,
+            trustedOriginURLs: [subtitleAuthorizationOrigin].compactMap { $0 }
+        )
+    }
+
+    static func subtitleRequestHeaders(
+        _ headers: [String: String],
+        resourceURL: URL,
+        trustedOriginURLs: [URL]
+    ) -> [String: String] {
+        guard !resourceURL.isFileURL else {
+            return [:]
+        }
+        // Origin equality has to normalize the implicit ports, or
+        // `https://host/media` and `https://host:443/subtitles` read as
+        // different origins and the bearer is stripped from a sidecar that is
+        // genuinely same-origin (Aether then gets a 401). `StreamRequest`
+        // already owns that comparison for the media URL itself; sharing it
+        // keeps the two boundaries from drifting apart.
+        let isTrustedOrigin = trustedOriginURLs.contains { trustedURL in
+            !trustedURL.isFileURL && StreamRequest.hasSameOrigin(resourceURL, trustedURL)
+        }
+        return isTrustedOrigin ? headers : [:]
+    }
+}
+
+/// How the TrueHD Atmos and DTS:X setting becomes Aether's `objectAudioRendering`.
+enum AetherObjectAudioPolicy {
+    /// The bed Aether delivers TrueHD Atmos and DTS:X heights in (DTS:X takes
+    /// only 7.1.4 or 9.1.6, its heights one to one). Nothing downstream plays it
+    /// speaker for speaker: an Atmos receiver or soundbar re-renders the Dolby
+    /// Atmos it receives onto its own speakers, and AirPods or the built-in
+    /// speakers render it as Spatial Audio. So one detailed bed serves every
+    /// system, and 7.1.4 keeps sides apart from rears and front heights apart
+    /// from rear heights for that renderer to fold down.
+    static let layout: SpatialSpeakerLayout = .l714
+
+    /// The setting alone decides. tvOS doesn't say whether its output can carry
+    /// Atmos: `AVAudioSession.renderingMode` resolves for the content already
+    /// playing (stereo reads `monoStereo`, the lossless 7.1 bridge `surround`),
+    /// so a check before the load would turn heights off on an Atmos receiver
+    /// after any other stream. A setup without Atmos turns the setting off
+    /// instead and keeps `audioBridgeMode`'s channels.
+    static func rendering(enabled: Bool) -> ObjectAudioRendering {
+        enabled ? .apac(layout) : .off
+    }
+
+    /// `apac 7.1.4` or `off`, for the diagnostics line.
+    static func diagnosticName(_ rendering: ObjectAudioRendering) -> String {
+        switch rendering {
+        case .off: return "off"
+        case .apac(let layout): return "apac \(layout.rawValue)"
+        }
+    }
+
+    #if os(tvOS)
+    /// The mode's own name for the diagnostics line: what tvOS had resolved
+    /// for whatever was playing when the load began.
+    static func renderingModeName(_ mode: AVAudioSession.RenderingMode) -> String {
+        switch mode {
+        case .notApplicable: return "notApplicable"
+        case .monoStereo: return "monoStereo"
+        case .surround: return "surround"
+        case .spatialAudio: return "spatialAudio"
+        case .dolbyAudio: return "dolbyAudio"
+        case .dolbyAtmos: return "dolbyAtmos"
+        @unknown default: return "raw\(mode.rawValue)"
+        }
+    }
+    #endif
+}

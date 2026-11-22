@@ -1,0 +1,51 @@
+import SwiftUI
+
+/// The "Available to request" section embedded in the library `SearchView`
+/// below local results: TMDB matches the library can't answer, one tap from
+/// the query the user already typed. Renders nothing when the feature is
+/// disabled or there's nothing requestable to show, so the search screen is
+/// untouched on servers without requests.
+struct RequestSearchSectionView: View {
+    let viewModel: RequestSearchSectionViewModel
+    let visibleResults: [RequestMediaResult]
+    @Environment(AppRouter.self) private var router
+
+    var body: some View {
+        if !visibleResults.isEmpty {
+            VStack(alignment: .leading, spacing: RequestsUI.headerSpacing) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.siloCaption)
+                        Text("Available to request")
+                            .font(.siloHeadline)
+                    }
+                    .foregroundColor(.siloOnSurface)
+
+                    Text("Not in the library yet · tap to request")
+                        .font(.siloSmall)
+                        .foregroundColor(.siloSecondaryText)
+                }
+
+                RequestCardRail(items: visibleResults) { result in
+                    RequestMediaCard(result: result, onTap: { router.openRequestResult(result) })
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            #if os(tvOS)
+            .focusSection()
+            #endif
+            .onChange(of: RequestsEventBus.shared.lastUpdate) { _, update in
+                if let update {
+                    viewModel.applyRequestUpdate(update)
+                }
+            }
+            .onChange(of: RequestsEventBus.shared.lastTitleState) { _, update in
+                if let update {
+                    viewModel.applyTitleState(update)
+                }
+            }
+        }
+    }
+
+}

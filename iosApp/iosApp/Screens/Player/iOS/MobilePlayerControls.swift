@@ -1,0 +1,1057 @@
+#if os(iOS)
+import SwiftUI
+
+/// Touch-driven overlay used on iOS/iPadOS. Layout:
+/// - Top strip: close, title block (series eyebrow + episode title), PiP,
+///   AirPlay, rotate, rotation lock
+/// - Center: skip back, play/pause, skip forward (profile video intervals),
+///   pinned to the middle of the player rather than between the bars
+/// - Bottom stack: time row (elapsed / status chips / remaining), capsule
+///   scrubber with buffered range + intro tint + chapter ticks + scrub
+///   preview bubble, then a labeled action row (Quality menu, Audio &
+///   Subtitles sheet, Chapters menu, More → settings sheet)
+///
+/// The whole thing is wrapped in a tap-to-toggle gesture and the auto-hide.
+/// The view is stateful only for sheet presentation and the
+/// trailing-time display mode; the rest of the state lives on
+/// `PlayerViewModel`. Invisible gestures (double-tap skip, hold-2×, edge
+/// swipes) live in `MobilePlayerGestureLayer` underneath this overlay.
+struct MobilePlayerControls: View {
+    let viewModel: PlayerViewModel
+    let onDismiss: () -> Void
+
+    @State private var activeSheet: PlayerSheet?
+    @State private var tracksDetent: PresentationDetent = .medium
+    @State private var tracksNestedSheetCovers = false
+    /// Trailing time label mode: remaining ("−12:34") when true, total
+    /// duration otherwise. Tap the label to flip — the native player idiom.
+    @State private var showsRemainingTime = true
+    @State private var pictureInPicture = PictureInPictureCoordinator.shared
+    @State private var orientationCoordinator = PlayerOrientationCoordinator.shared
+    /// Floating stats card. Kept here rather than on the view model because
+    /// it is purely presentation, and kept outside the `showControls` gate
+    /// below so the auto-hide takes the transport away without it.
+    @State private var showsStats = false
+    @Environment(\.playerTabletopLayout) private var tabletopLayout
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    var body: some View {
+        // NOTE: the .sheet modifier MUST live outside the `showControls` gate.
+        // If it's attached to a view that only exists while controls are
+        // visible, the auto-hide tears down the sheet's host and dismisses
+        // the sheet mid-interaction — then re-presents it when controls come
+        // back, because @State activeSheet survives the rebuild.
+        ZStack {
+            if viewModel.showControls {
+                // GeometryReader pins the control stack to the player's own
+                // bounds. The bars are siblings of the shared player notice in
+                // `PlayerView`'s ZStack; inside the player's `.fullScreenCover`
+                // a too-wide bar would otherwise stretch that shared layer past
+                // the screen and drag the notice off both edges in portrait.
+                // Clamping the stack to `proxy.size` keeps every overlay inside
+                // the visible frame regardless of how wide a bar wants to be.
+                GeometryReader { proxy in
+                    // In the tabletop posture the controls take the pane
+                    // below the fold, clear of the video above it.
+                    let paneTop = tabletopControlsTop(in: proxy)
+                    let pane = CGSize(width: proxy.size.width, height: proxy.size.height - paneTop)
+                    ZStack {
+                        Color.black.opacity(viewModel.isScrubbing ? 0.55 : 0.4)
+                            .ignoresSafeArea()
+                            .onTapGesture { viewModel.toggleControls() }
+
+                        // Centred on the whole pane (the screen, where the
+                        // video is, unless the tabletop posture moved the
+                        // controls below the fold) rather than between the top
+                        // strip and the taller bottom stack, which would pull
+                        // it off-centre. Kept beneath the bars so the scrub
+                        // preview draws over it.
+                        centerCluster
+                            .opacity(recedingOpacity)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .ignoresSafeArea()
+
+                        VStack(spacing: 0) {
+                            topStrip(compact: pane.width < pane.height)
+                                .opacity(recedingOpacity)
+                            Spacer()
+                            bottomStack
+                        }
+                        .padding(.horizontal)
+                        .padding(.top)
+                        // Hug the bottom: the safe-area inset already keeps
+                        // the action row clear of the home indicator, so only
+                        // a hairline of extra breathing room is needed.
+                        .padding(.bottom, 2)
+                        .frame(width: pane.width, height: pane.height)
+                    }
+                    .padding(.top, paneTop)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.isScrubbing)
+                }
+                .transition(.opacity)
+            }
+            introSkipPill
+            if viewModel.showSegmentSkip {
+                segmentSkipPill
+            }
+            if showsStats {
+                MobilePlaybackStatsOverlay(stats: viewModel.playbackStats)
+                    .transition(.opacity)
+            }
+        }
+        // Tap-to-toggle and auto-hide flip `showControls` without an
+        // animation of their own; fade every control in and out together.
+        .animation(.easeOut(duration: 0.18), value: viewModel.showControls)
+        .animation(.easeOut(duration: 0.18), value: showsStats)
+        // Fades in, and out when its timer runs out. Tap takes it down at once
+        // (see `PlayerViewModel.selectIntroSkipPrompt`).
+        .animation(.easeOut(duration: 0.2), value: viewModel.showIntroSkip)
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .tracks:
+                TrackSelectionSheet(viewModel: viewModel, nestedSheetCoversPlayer: $tracksNestedSheetCovers) {
+                    activeSheet = nil
+                }
+                    .presentationDetents([.medium, .large], selection: $tracksDetent)
+                    .presentationDragIndicator(.visible)
+            case .settings:
+                PlayerSettingsSheet(
+                    viewModel: viewModel,
+                    sleepTimer: viewModel.sleepTimer,
+                    statsOverlayVisible: Binding(
+                        get: { showsStats },
+                        set: { newValue in
+                            showsStats = newValue
+                            // Switching it on closes the sheet: the stats are
+                            // only useful over the picture they describe.
+                            if newValue { activeSheet = nil }
+                        }
+                    )
+                )
+                .presentationDetents([.large])
+            }
+        }
+        .onChange(of: activeSheet) { _, newValue in
+            // Keep controls pinned while a sheet is up, and restart the
+            // auto-hide timer once it closes.
+            if newValue != nil {
+                viewModel.pinControlsVisible()
+            } else {
+                viewModel.resumeAutoHide()
+                tracksDetent = .medium
+                tracksNestedSheetCovers = false
+            }
+        }
+        // Initial too: controls that mount again say whether their sheet
+        // came back with them.
+        .onChange(of: sheetCoversPlayer, initial: true) { _, covers in
+            viewModel.playerSheetCoversPlayer(covers)
+        }
+    }
+
+    /// Top strip, center cluster and action row fade out of the way while
+    /// the user is scrubbing so the preview bubble owns the screen.
+    private var recedingOpacity: Double {
+        viewModel.isScrubbing ? 0.12 : 1
+    }
+
+    // MARK: - Top strip
+
+    private func topStrip(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                closeButton
+                if !compact { titleBlock }
+                Spacer(minLength: 0)
+                if !compact { externalPlaybackControls }
+                if showsRotationControls { rotationControls }
+            }
+            if compact {
+                HStack(spacing: 12) {
+                    titleBlock
+                    Spacer(minLength: 12)
+                    externalPlaybackControls
+                }
+            }
+        }
+    }
+
+    private var closeButton: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: SiloTheme.topBarIconHitSize, height: SiloTheme.topBarIconHitSize)
+        }
+        .buttonStyle(MobilePlayerGlassButtonStyle())
+        .accessibilityLabel("Close Player")
+        .accessibilityIdentifier("player.close")
+    }
+
+    @ViewBuilder
+    private var externalPlaybackControls: some View {
+        if !viewModel.isWatchPartyPlayback, pictureInPicture.isSupported, pictureInPicture.hasSource {
+            controlButton(
+                systemName: pictureInPicture.isActive ? "pip.exit" : "pip.enter"
+            ) {
+                pictureInPicture.toggle()
+            }
+            // AVKit can report `possible == false` during the final active
+            // transition; the user must still be able to stop PiP.
+            .disabled(!pictureInPicture.isPossible && !pictureInPicture.isActive)
+            .accessibilityLabel(
+                pictureInPicture.isActive
+                    ? "Stop Picture in Picture"
+                    : "Start Picture in Picture"
+            )
+        }
+
+        if !viewModel.isWatchPartyPlayback, viewModel.supportsExternalPlayback {
+            AirPlayRoutePicker { isPresentingRoutes in
+                // The route sheet is a UIKit presentation the auto-hide
+                // timer knows nothing about; pin the controls so it can't
+                // dismantle the picker mid-selection.
+                if isPresentingRoutes {
+                    viewModel.pinControlsVisible()
+                } else {
+                    viewModel.resumeAutoHide()
+                }
+            }
+            .frame(width: SiloTheme.topBarIconHitSize, height: SiloTheme.topBarIconHitSize)
+            .siloPlayerGlass(in: Circle(), interactive: true)
+        }
+    }
+
+    /// The iPhone Duo's open display turns with the device and ignores the
+    /// app's rotation requests, so it gets no rotate or lock buttons. It is
+    /// the only phone window that is regular in both dimensions.
+    private var showsRotationControls: Bool {
+        !(UIDevice.current.userInterfaceIdiom == .phone
+            && horizontalSizeClass == .regular && verticalSizeClass == .regular)
+    }
+
+    /// Where the controls start: the top of the player, or just below the
+    /// fold in the iPhone Duo's tabletop posture.
+    private func tabletopControlsTop(in proxy: GeometryProxy) -> CGFloat {
+        guard let tabletopLayout else { return 0 }
+        let top = tabletopLayout.controlsMinY - proxy.frame(in: .global).minY
+        return min(max(top, 0), proxy.size.height)
+    }
+
+    private var rotationControls: some View {
+        HStack(spacing: 12) {
+            controlButton(systemName: "rectangle.landscape.rotate") {
+                orientationCoordinator.togglePlayerOrientation()
+                viewModel.resumeAutoHide()
+            }
+            .accessibilityLabel("Rotate to \(orientationCoordinator.nextPlayerOrientation.title)")
+            .accessibilityHint("Rotates the screen without interrupting playback")
+            .accessibilityIdentifier("player.rotate")
+
+            // The open and closed glyphs differ only in the padlock's shackle,
+            // so the lock also takes the active tint the quality pill uses.
+            controlButton(
+                systemName: orientationCoordinator.isRotationLocked ? "lock.rotation" : "lock.rotation.open",
+                tint: orientationCoordinator.isRotationLocked ? Color.white.opacity(0.22) : nil
+            ) {
+                orientationCoordinator.toggleRotationLock()
+                viewModel.resumeAutoHide()
+            }
+            .accessibilityLabel(orientationCoordinator.isRotationLocked ? "Unlock screen rotation" : "Lock screen rotation")
+            .accessibilityValue(orientationCoordinator.isRotationLocked ? "Locked" : "Unlocked")
+            .accessibilityHint(orientationCoordinator.isRotationLocked
+                ? "Allows video to follow phone orientation"
+                : "Stops phone movement rotating video. The rotate button still works")
+            .accessibilityIdentifier("player.rotation-lock")
+        }
+    }
+
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            if let eyebrow = titleEyebrow {
+                Text(eyebrow)
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(.white.opacity(0.65))
+                    .lineLimit(1)
+            }
+            Text(heroTitle)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .shadow(color: .black.opacity(0.5), radius: 6, y: 1)
+        .layoutPriority(-1)
+    }
+
+    /// "SEVERANCE · S2:E4"-style context line. Series title + episode tag
+    /// for episodes, release year for movies, nothing when metadata hasn't
+    /// resolved yet.
+    private var titleEyebrow: String? {
+        let metadata = viewModel.metadata
+        var parts: [String] = []
+        if let series = metadata.seriesTitle, !series.isEmpty {
+            parts.append(series)
+        }
+        if let tag = metadata.episodeTag, !tag.isEmpty {
+            parts.append(tag)
+        }
+        if parts.isEmpty, let year = metadata.year {
+            parts.append(String(year))
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ").uppercased()
+    }
+
+    private var heroTitle: String {
+        let primary = viewModel.metadata.primaryTitle
+        return primary.isEmpty ? viewModel.title : primary
+    }
+
+    // MARK: - Center
+
+    /// Play/pause is the largest control, flanked by smaller skips — the
+    /// same 64/52pt hierarchy and 48pt spacing as the Android phone player.
+    private var centerCluster: some View {
+        HStack(spacing: 48) {
+            Button {
+                viewModel.skipBackward()
+            } label: {
+                Image(systemName: SeekIntervalLabel.symbolName(.backward, seconds: viewModel.skipIntervals.backward))
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: Self.skipButtonSize, height: Self.skipButtonSize)
+            }
+            .buttonStyle(MobilePlayerGlassButtonStyle(size: Self.skipButtonSize))
+            .accessibilityLabel(SeekIntervalLabel.accessibilityLabel(.backward, seconds: viewModel.skipIntervals.backward))
+            .disabled(!viewModel.canRequestSeek)
+
+            Button {
+                viewModel.togglePlayPause()
+            } label: {
+                Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.black.opacity(0.85))
+                    // play.fill reads left-heavy inside a circle;
+                    // nudge it toward the optical center.
+                    .offset(x: viewModel.isPlaying ? 0 : 2)
+                    .frame(width: Self.playButtonSize, height: Self.playButtonSize)
+            }
+            .buttonStyle(MobilePlayerGlassButtonStyle(tint: .white.opacity(0.9), size: Self.playButtonSize))
+            .accessibilityLabel(viewModel.isPlaying ? "Pause" : "Play")
+            .disabled(!viewModel.canRequestPlayPause)
+
+            Button {
+                viewModel.skipForward()
+            } label: {
+                Image(systemName: SeekIntervalLabel.symbolName(.forward, seconds: viewModel.skipIntervals.forward))
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: Self.skipButtonSize, height: Self.skipButtonSize)
+            }
+            .buttonStyle(MobilePlayerGlassButtonStyle(size: Self.skipButtonSize))
+            .accessibilityLabel(SeekIntervalLabel.accessibilityLabel(.forward, seconds: viewModel.skipIntervals.forward))
+            .disabled(!viewModel.canRequestSeek)
+        }
+    }
+
+    static let playButtonSize: CGFloat = 64
+    static let skipButtonSize: CGFloat = 52
+
+    /// A checkmark-sized blank for the unchecked menu rows. Menus redraw
+    /// template images in their own tint, so it is drawn clear as original.
+    private static let clearCheckmark: Image = {
+        let symbol = UIImage(systemName: "checkmark")?
+            .withTintColor(.clear, renderingMode: .alwaysOriginal) ?? UIImage()
+        return Image(uiImage: symbol).renderingMode(.original)
+    }()
+
+    // MARK: - Bottom stack
+
+    private var bottomStack: some View {
+        VStack(spacing: 10) {
+            MobilePlayerTimeline(viewModel: viewModel, showsRemainingTime: $showsRemainingTime)
+            actionRow
+                .opacity(recedingOpacity)
+        }
+    }
+
+    // MARK: - Action row
+
+    private enum ActionRowStyle {
+        case full      // labeled pills, value on the Quality pill
+        case compact   // shorter labels
+        case icons     // icon controls; Quality remains a pill
+    }
+
+    /// Labeled pill row. `ViewThatFits` tries the full labels first, then
+    /// compact ones, then icon controls, so the row never truncates or wraps
+    /// — an iPhone in portrait with chapters present lands on `.icons`.
+    private var actionRow: some View {
+        ViewThatFits(in: .horizontal) {
+            actionRowContent(style: .full)
+            actionRowContent(style: .compact)
+            actionRowContent(style: .icons)
+        }
+        .frame(maxWidth: .infinity)
+        // A track-less file on a server last seen without a provider leaves
+        // the pill inert, so the sheet's own provider refresh cannot run.
+        // Ask again each time the controls show, so a provider added
+        // meanwhile makes search reachable.
+        .onAppear {
+            if trackPickerIsEmpty, viewModel.subtitleSearchVisible, !viewModel.subtitleSearchEnabled {
+                viewModel.refreshSubtitleProviders()
+            }
+        }
+    }
+
+    /// The Audio & Subtitles picker would have nothing in it apart from
+    /// subtitle search.
+    private var trackPickerIsEmpty: Bool {
+        viewModel.audioTracks.isEmpty
+            && viewModel.subtitleTracks.isEmpty
+            && !aiSubtitlesAvailable
+    }
+
+    private func actionRowContent(style: ActionRowStyle) -> some View {
+        // The Audio & Subtitles pill is only inert when the picker would have
+        // nothing at all in it. A track-less file can still offer subtitle
+        // search when the server has a provider, so that entry point keeps
+        // the sheet reachable.
+        let noTracks = trackPickerIsEmpty && !viewModel.subtitleSearchEnabled
+        return HStack(spacing: 8) {
+            if viewModel.hasQualityChoice {
+                qualityMenu(compact: style != .full)
+            }
+
+            trackSelectionButton(style: style)
+                .disabled(noTracks)
+                .opacity(noTracks ? 0.4 : 1)
+                .accessibilityLabel("Audio & Subtitles")
+
+            if !viewModel.chapters.isEmpty {
+                chaptersMenu(style: style)
+                    .accessibilityLabel("Chapters")
+            }
+
+            controlButton(systemName: "ellipsis") {
+                activeSheet = .settings
+            }
+            .accessibilityLabel("Playback Settings")
+        }
+    }
+
+    private func qualityMenu(compact: Bool) -> some View {
+        let menu = Menu {
+            // The menu indents only rows that carry an icon, so every row
+            // gets a checkmark, invisible unless checked: the titles stay
+            // in one column instead of the checked one shifting right. The
+            // bitrate goes underneath so the indented titles still fit.
+            ForEach(viewModel.qualityOptions) { option in
+                Button {
+                    viewModel.switchQuality(option.id)
+                } label: {
+                    Text(option.label)
+                    if let bitrate = option.bitrateText {
+                        Text(bitrate)
+                    }
+                    if option.id == viewModel.highlightedQualityOptionId {
+                        Image(systemName: "checkmark")
+                    } else {
+                        Self.clearCheckmark
+                    }
+                }
+                .disabled(viewModel.isQualitySwitching)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                if viewModel.isQualitySwitching {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(.white)
+                } else {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                if compact {
+                    Text(qualityValueText)
+                        .font(.system(size: 12, weight: .semibold))
+                } else {
+                    Text("Quality")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(qualityValueText)
+                        .font(.system(size: 11, weight: .medium))
+                        .opacity(0.7)
+                }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .frame(height: SiloTheme.topBarIconHitSize)
+        }
+        .menuStyle(.button)
+        // Keep Auto at the top, reading down.
+        .menuOrder(.fixed)
+
+        return menu
+        .buttonStyle(MobilePlayerGlassButtonStyle(
+            tint: viewModel.activeQualityId == ApplePlaybackQuality.autoId ? nil : Color.white.opacity(0.22)
+        ))
+        .accessibilityLabel("Playback Quality")
+        .accessibilityValue(qualityValueText)
+    }
+
+    /// Short value for the pill — the tier's resolution ("1080p") rather
+    /// than the full "Up to 1080p HD (High)" menu label. A fixed saved
+    /// resolution the menu has no row for still reads as that resolution.
+    private var qualityValueText: String {
+        if let active = viewModel.activeQualityOption {
+            return active.isAuto || active.resolution.isEmpty ? "Auto" : active.resolution
+        }
+        return SiloQualityPresets.resolutionLabel(AppleQualityAxes.split(viewModel.activeQualityId).resolution)
+    }
+
+    // MARK: - Audio & Subtitles sheet
+
+    /// Whether any AI subtitle action is available (translate or transcribe),
+    /// per the server's capability probes **and** the current track list.
+    /// Gates the "AI Subtitles…" row so it never opens an empty menu.
+    private var aiSubtitlesAvailable: Bool {
+        SubtitleTranslateMenu.hasActionableSource(viewModel)
+    }
+
+    /// Track inventories are unbounded, so they use a scrollable sheet rather
+    /// than a native `Menu`, whose landscape popover can clip later rows.
+    private func trackSelectionButton(style: ActionRowStyle) -> some View {
+        Group {
+            if style == .icons {
+                controlButton(systemName: "captions.bubble") {
+                    activeSheet = .tracks
+                }
+            } else {
+                actionPill(
+                    systemImage: "captions.bubble",
+                    title: style == .compact ? "Audio & Subs" : "Audio & Subtitles"
+                ) {
+                    activeSheet = .tracks
+                }
+            }
+        }
+    }
+
+    // MARK: - Chapters menu
+
+    /// Native chapter picker: one row per chapter with the timestamp as the
+    /// menu subtitle and a checkmark on the chapter currently playing.
+    private func chaptersMenu(style: ActionRowStyle) -> some View {
+        Menu {
+            MobileChapterMenuItems(viewModel: viewModel)
+        } label: {
+            menuPillLabel(
+                systemImage: "list.bullet",
+                title: style == .icons ? nil : "Chapters"
+            )
+        }
+        .menuStyle(.button)
+        // Keep Chapter 1 at the top, reading down.
+        .menuOrder(.fixed)
+        .buttonStyle(MobilePlayerGlassButtonStyle())
+    }
+
+    /// Menu label matching the `actionPill` (titled) / `controlButton`
+    /// (icon circle) appearance so menus and buttons read as one family.
+    @ViewBuilder
+    private func menuPillLabel(systemImage: String, title: String?) -> some View {
+        if let title {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .frame(height: SiloTheme.topBarIconHitSize)
+        } else {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: SiloTheme.topBarIconHitSize, height: SiloTheme.topBarIconHitSize)
+        }
+    }
+
+    private func actionPill(
+        systemImage: String,
+        title: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .frame(height: SiloTheme.topBarIconHitSize)
+        }
+        .buttonStyle(MobilePlayerGlassButtonStyle())
+    }
+
+    // MARK: - Intro skip
+
+    /// The intro-skip pill: "Skip Intro" for `ask`, and a small "Intro
+    /// skipped" caption over "Watch Intro" for `always`'s undo. The same state
+    /// machine and copy as the TV, web and Android pills, with pointer rules: a
+    /// tap is Select, and a tap elsewhere is not a dismissal.
+    @ViewBuilder
+    private var introSkipPill: some View {
+        if let pill = viewModel.introSkipPrompt.pill {
+            VStack(alignment: .trailing, spacing: 4) {
+                Spacer()
+                if let caption = pill.kind.caption {
+                    Text(caption)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .shadow(color: .black.opacity(0.6), radius: 3, y: 1)
+                        .padding(.trailing, 12)
+                        .accessibilityHidden(true)
+                }
+                Button {
+                    viewModel.selectIntroSkipPrompt()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: pill.kind == .skip ? "forward.end.fill" : "arrow.counterclockwise")
+                        Text(pill.kind.actionTitle)
+                    }
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 16)
+                    .frame(height: SiloTheme.topBarIconHitSize)
+                }
+                .buttonStyle(MobilePlayerPillButtonStyle(pill: pill))
+                .accessibilityLabel(pill.kind.accessibilityLabel)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, 24)
+            // Clear the bottom stack while the controls are up; hug the
+            // bottom edge when the pill is floating alone.
+            .padding(.bottom, viewModel.showControls ? 88 : 24)
+            .animation(.easeOut(duration: 0.2), value: viewModel.showControls)
+            .transition(.opacity)
+        }
+    }
+
+    private var segmentSkipPill: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                Button {
+                    viewModel.skipCurrentSegment()
+                } label: {
+                    Label(viewModel.segmentSkipLabel, systemImage: "forward.end.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.black.opacity(0.85))
+                        .padding(.horizontal, 16)
+                        .frame(height: SiloTheme.topBarIconHitSize)
+                }
+                .buttonStyle(MobilePlayerGlassButtonStyle(tint: .white.opacity(0.9)))
+                .accessibilityLabel(viewModel.segmentSkipLabel)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, viewModel.showControls ? 88 : 24)
+        }
+        .animation(.easeOut(duration: 0.2), value: viewModel.showControls)
+        .transition(.opacity)
+    }
+
+    // MARK: - Helpers
+
+    private func controlButton(
+        systemName: String, tint: Color? = nil, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: SiloTheme.topBarIconHitSize, height: SiloTheme.topBarIconHitSize)
+        }
+        .buttonStyle(MobilePlayerGlassButtonStyle(tint: tint))
+    }
+
+    // MARK: - Sheet identifier
+
+    /// A full-height sheet covers the top of the player, where the buffering
+    /// pill and notices show; the tracks sheet at half height does not. In
+    /// a compact height every sheet is full height, and a sheet the tracks
+    /// sheet opens can cover the player on its own.
+    private var sheetCoversPlayer: Bool {
+        switch activeSheet {
+        case .settings: true
+        case .tracks: tracksDetent == .large || verticalSizeClass == .compact || tracksNestedSheetCovers
+        case nil: false
+        }
+    }
+
+    private enum PlayerSheet: Identifiable {
+        case tracks, settings
+        var id: Self { self }
+    }
+}
+
+/// Time row and scrubber. The only part of the controls that reads the
+/// playback clock, so clock ticks re-render this view alone.
+private struct MobilePlayerTimeline: View {
+    let viewModel: PlayerViewModel
+    @Binding var showsRemainingTime: Bool
+    /// Set only while a finger drags the scrub bar. Skip buttons and
+    /// hold-seek also set `isScrubbing`, but they shouldn't play chapter ticks
+    /// or change scrub speed.
+    @GestureState private var scrubDrag: MobileScrubDrag?
+
+    /// Space between the scrub bubble's bottom edge and the top of the bar's
+    /// 20pt touch strip, 4pt above the visible bar while scrubbing. The
+    /// bubble grows upward from here when it adds a line.
+    private static let scrubBubbleGap: CGFloat = 16
+    /// Taller than the bubble ever gets; the bubble sits at its bottom.
+    private static let scrubBubbleBoxHeight: CGFloat = 240
+
+    var body: some View {
+        VStack(spacing: 10) {
+            timeRow
+            progressSlider
+        }
+    }
+
+    private var timeRow: some View {
+        HStack {
+            Text(PlayerTimeFormatter.formatHMS(displayTime))
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.85))
+                .monospacedDigit()
+
+            Spacer()
+
+            if viewModel.sleepTimer.isActive {
+                statusChip(
+                    systemImage: "moon.zzz.fill",
+                    text: PlayerTimeFormatter.formatCountdown(viewModel.sleepTimer.remainingSeconds)
+                )
+            }
+
+            Spacer()
+
+            Button {
+                showsRemainingTime.toggle()
+            } label: {
+                Text(trailingTimeText)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.6))
+                    .monospacedDigit()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showsRemainingTime ? "Time Remaining" : "Duration")
+            .accessibilityHint("Switches between time remaining and total duration")
+        }
+    }
+
+    private var trailingTimeText: String {
+        if showsRemainingTime {
+            return "−" + PlayerTimeFormatter.formatHMS(max(viewModel.duration - displayTime, 0))
+        }
+        return PlayerTimeFormatter.formatHMS(viewModel.duration)
+    }
+
+    private func statusChip(systemImage: String, text: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: systemImage)
+                .font(.system(size: 10, weight: .semibold))
+            Text(text)
+                .font(.system(size: 11, weight: .bold))
+                .monospacedDigit()
+        }
+        .foregroundStyle(.white.opacity(0.85))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(.black.opacity(0.45)))
+        .overlay(Capsule().stroke(.white.opacity(0.16), lineWidth: 0.5))
+    }
+
+    private var displayTime: Double {
+        viewModel.isScrubbing ? viewModel.scrubPreviewTime : viewModel.currentTime
+    }
+
+    // MARK: - Scrubber
+
+    private var progressSlider: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let progress = viewModel.duration > 0
+                ? min(max(displayTime / viewModel.duration, 0), 1)
+                : 0
+            let barHeight: CGFloat = viewModel.isScrubbing ? 12 : 6
+
+            ZStack(alignment: .leading) {
+                // Base track
+                Capsule()
+                    .fill(Color.white.opacity(0.2))
+                    .frame(height: barHeight)
+
+                // Buffered range from Aether telemetry. Routes that cannot
+                // report a comparable value leave the layer empty.
+                if let buffered = bufferedFraction, buffered > progress {
+                    Capsule()
+                        .fill(Color.white.opacity(0.22))
+                        .frame(width: max(width * buffered, barHeight), height: barHeight)
+                }
+
+                introMarker(width: width, height: barHeight)
+
+                // Chapter ticks. Rendered behind the fill so they're visible
+                // in unplayed territory; the fill covers them over played
+                // time, which matches Apple's native transport-bar behavior.
+                if viewModel.duration > 0 && !viewModel.chapters.isEmpty {
+                    ForEach(viewModel.chapters) { chapter in
+                        let fraction = chapter.time / viewModel.duration
+                        Capsule()
+                            .fill(Color.white.opacity(0.6))
+                            .frame(width: 2, height: barHeight + 5)
+                            .offset(x: width * min(max(fraction, 0), 1) - 1)
+                    }
+                }
+
+                // Played portion. Thumbless — the whole bar is the handle.
+                Capsule()
+                    .fill(Color.white)
+                    .frame(width: max(width * progress, barHeight), height: barHeight)
+                    .shadow(color: .white.opacity(viewModel.isScrubbing ? 0.35 : 0), radius: 8)
+            }
+            .frame(height: 20, alignment: .center)
+            .animation(.snappy(duration: 0.22), value: viewModel.isScrubbing)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .updating($scrubDrag) { value, drag, _ in
+                        guard width > 0 else { return }
+                        var next = drag ?? MobileScrubDrag(startX: value.startLocation.x, width: width)
+                        next.move(toX: value.location.x, heightAboveBar: -value.translation.height, width: width)
+                        drag = next
+                        if viewModel.isScrubbing {
+                            viewModel.updateScrub(fraction: next.fraction)
+                        } else {
+                            viewModel.beginScrub(fraction: next.fraction)
+                        }
+                    }
+                    .onEnded { _ in
+                        viewModel.endScrub()
+                    }
+            )
+            .scrubTickFeedback(
+                tickTimes: viewModel.chapters.map(\.time),
+                scrubTime: scrubDrag != nil ? viewModel.scrubPreviewTime : nil
+            )
+            .sensoryFeedback(trigger: scrubDrag?.speed) { old, new in
+                old != nil && new != nil ? .impact(weight: .light) : nil
+            }
+            .overlay(alignment: .topLeading) {
+                if viewModel.isScrubbing {
+                    let previewInset: CGFloat = viewModel.scrubPreviewImage == nil ? 80 : 102
+                    // Pin the bubble's bottom above the bar so a speed label
+                    // grows it upward instead of over the bar.
+                    scrubPreviewBubble
+                        .frame(height: Self.scrubBubbleBoxHeight, alignment: .bottom)
+                        .position(
+                            x: min(
+                                max(width * progress, previewInset),
+                                max(width - previewInset, previewInset)
+                            ),
+                            y: -Self.scrubBubbleGap - Self.scrubBubbleBoxHeight / 2
+                        )
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
+            }
+            // The custom scrubber is drag-only; expose it to VoiceOver as an
+            // adjustable element that seeks through the same skip path.
+            .accessibilityElement()
+            .accessibilityLabel("Playback Position")
+            .accessibilityValue(
+                "\(PlayerTimeFormatter.formatHMS(displayTime)) of \(PlayerTimeFormatter.formatHMS(viewModel.duration))"
+            )
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: viewModel.skipForward()
+                case .decrement: viewModel.skipBackward()
+                @unknown default: break
+                }
+            }
+        }
+        .frame(height: 20)
+    }
+
+    private var bufferedFraction: Double? {
+        guard viewModel.duration > 0, viewModel.bufferedAheadSeconds > 0 else { return nil }
+        return viewModel.bufferedEndFraction
+    }
+
+    /// Floating time + chapter readout pinned above the touch point while
+    /// scrubbing. Presentation-only: reads the same `scrubPreviewTime` the
+    /// seek machinery already maintains.
+    private var scrubPreviewBubble: some View {
+        VStack(spacing: 6) {
+            if let image = viewModel.scrubPreviewImage {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 176, height: 99)
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            }
+            Text(PlayerTimeFormatter.formatHMS(scrubPreviewLabelTime))
+                .font(.system(size: 19, weight: .bold))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+            if let chapter = chapterTitle(at: scrubPreviewLabelTime) {
+                Text(chapter)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .lineLimit(1)
+            }
+            if let speedLabel = scrubDrag?.speed.label {
+                Text(speedLabel)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+        }
+        .padding(7)
+        .siloPlayerGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .fixedSize()
+    }
+
+    /// Prefer the preview frame's actual cue time when Seekr (or another
+    /// provider) published one; otherwise the scrub target.
+    private var scrubPreviewLabelTime: Double {
+        viewModel.scrubPreviewImageSourceTime ?? viewModel.scrubPreviewTime
+    }
+
+    private func chapterTitle(at time: Double) -> String? {
+        guard let chapter = viewModel.chapters.last(where: { $0.time <= time }) else { return nil }
+        return chapter.title ?? "Chapter \(chapter.index + 1)"
+    }
+
+    @ViewBuilder
+    private func introMarker(width: CGFloat, height: CGFloat) -> some View {
+        if let introRange = viewModel.introRange, viewModel.duration > 0 {
+            let start = min(max(introRange.start / viewModel.duration, 0), 1)
+            let end = min(max(introRange.end / viewModel.duration, 0), 1)
+            if end > start {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.cyan.opacity(0.4))
+                    .frame(width: width * (end - start), height: height)
+                    .offset(x: width * start)
+            }
+        }
+    }
+}
+
+/// Chapter menu rows. Reads the clock for the checkmark, so it is kept out of
+/// the controls' own body.
+private struct MobileChapterMenuItems: View {
+    let viewModel: PlayerViewModel
+
+    var body: some View {
+        let currentChapterIndex = viewModel.chapters.lastIndex(where: { $0.time <= viewModel.currentTime })
+        ForEach(viewModel.chapters) { chapter in
+            Button {
+                viewModel.seekTo(seconds: chapter.time)
+            } label: {
+                if currentChapterIndex == chapter.index {
+                    Label {
+                        Text(chapterMenuTitle(chapter))
+                        Text(PlayerTimeFormatter.formatHMS(chapter.time))
+                    } icon: {
+                        Image(systemName: "checkmark")
+                    }
+                } else {
+                    Text(chapterMenuTitle(chapter))
+                    Text(PlayerTimeFormatter.formatHMS(chapter.time))
+                }
+            }
+        }
+    }
+
+    private func chapterMenuTitle(_ chapter: PlayerChapterInfo) -> String {
+        "\(chapter.index + 1).  \(chapter.title ?? "Chapter \(chapter.index + 1)")"
+    }
+}
+
+/// The player pills' capsule, shared by the intro-skip and buffering-quality
+/// pills: a dark scrim with the timer's fill creeping behind the label,
+/// brighter while pressed. A button without a timer, such as **Keep quality**,
+/// gets the same capsule with no fill.
+struct MobilePlayerPillButtonStyle: ButtonStyle {
+    let pill: (any PlayerTimedPill)?
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(minWidth: SiloTheme.topBarIconHitSize)
+            .background {
+                ZStack {
+                    Capsule().fill(Color.black.opacity(0.65))
+                    if let pill {
+                        PlayerPillProgress(
+                            pill: pill,
+                            color: .white.opacity(configuration.isPressed ? 0.4 : 0.22)
+                        )
+                    } else if configuration.isPressed {
+                        Capsule().fill(Color.white.opacity(0.22))
+                    }
+                }
+                .clipShape(Capsule())
+            }
+            .overlay {
+                Capsule().strokeBorder(Color.white.opacity(0.2), lineWidth: 1)
+            }
+            .contentShape(Capsule())
+            .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+    }
+}
+
+/// Match detail chrome without the extra padding added by native glass
+/// button styles. A square label is circular; longer labels form a pill.
+/// Chrome uses the 44pt default; the transport cluster passes larger sizes.
+struct MobilePlayerGlassButtonStyle: ButtonStyle {
+    var tint: Color? = nil
+    var size: CGFloat = SiloTheme.topBarIconHitSize
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(minWidth: size)
+            .frame(height: size)
+            .opacity(configuration.isPressed ? 0.75 : 1)
+            .contentShape(Capsule())
+            .siloPlayerGlass(in: Capsule(), tint: tint, interactive: true)
+    }
+}
+
+/// The standalone close button shown while loading, on Next Up and on
+/// errors — when the full controls aren't mounted — follows the same
+/// tap/auto-hide state as the controls.
+struct MobilePlayerChromeVisibility: ViewModifier {
+    /// Room the Next Up layout leaves above itself for the close button.
+    static let topClearance: CGFloat = SiloTheme.topBarIconHitSize + 32
+
+    let isVisible: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(isVisible ? 1 : 0)
+            .allowsHitTesting(isVisible)
+            .accessibilityHidden(!isVisible)
+            .animation(.easeOut(duration: 0.18), value: isVisible)
+    }
+}
+#endif

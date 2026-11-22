@@ -1,0 +1,590 @@
+name: Silo
+options:
+  bundleIdPrefix: com.cubbiestream.kyro
+  deploymentTarget:
+    iOS: "18.0"
+    macOS: "26.0"
+    tvOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  configs:
+    Debug:
+      # Required for `@testable import Silo` in SiloTests; Xcode's Debug
+      # template sets these defaults but XcodeGen does not.
+      ENABLE_TESTABILITY: "YES"
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG"
+  base:
+    SWIFT_VERSION: "5"
+    ENABLE_USER_SCRIPT_SANDBOXING: false
+    # DEVELOPMENT_TEAM is intentionally omitted — set via the DEVELOPMENT_TEAM env var locally
+    # or injected by the CI pipeline.
+    CODE_SIGN_STYLE: Automatic
+    # Media/image packages ship arm64 simulator slices. Exclude x86_64 for all
+    # simulator SDKs so Apple Silicon Macs don't try to link missing slices.
+    EXCLUDED_ARCHS[sdk=appletvsimulator*]: x86_64
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+
+# One committed version/channel baseline for every shippable target: the app
+# and its embedded extensions must ship the same CFBundleVersion, and six
+# copies of the same three lines drift.
+#
+# This is a target template, NOT the project-level `settings.base`, and that
+# distinction is load-bearing. Xcode resolves build settings target settings >
+# target xcconfig > project settings > project xcconfig. Every target below
+# carries a Signing/<Target>.xcconfig that ends with
+# `#include? "Local.xcconfig"` — a gitignored file contributors are told to
+# create. At project level a stray MARKETING_VERSION in someone's
+# Local.xcconfig would silently outrank the committed value; template settings
+# are merged into the target, where they win, which is the same guarantee the
+# per-target blocks used to provide. CI still outranks everything via
+# xcodebuild xcargs (command-line settings beat xcconfigs too).
+targetTemplates:
+  ShippableProduct:
+    settings:
+      base:
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: 90
+        # Surfaced to the app as the `SiloBuildChannel` Info.plist key and
+        # reported to the server as X-Silo-Client-Channel. The unsigned
+        # sideload lanes override this to `sideload`; DEBUG builds report
+        # `dev` regardless. Every target using this template must declare the
+        # key in its Info.plist or it reports `release` no matter what.
+        SILO_BUILD_CHANNEL: release
+        # The published source archive for this build, surfaced as the
+        # `SiloSourceURL` Info.plist key behind Settings > About > Source
+        # Code. Release lanes set it from SILO_RELEASE_SOURCE_URL; empty
+        # builds link the repository instead.
+        SILO_SOURCE_URL: ""
+
+packages:
+  KyroMediaCore:
+    path: ../Packages/KyroMediaCore
+  # The only media engine in the replacement player. Keep this at an exact
+  # reviewed revision; Package.resolved also freezes its binary dependencies.
+  AetherEngine:
+    url: https://github.com/Silo-Server/AetherEngine
+    revision: c74ec2f224f0e6a356b1f9ea4b74f1da5063e83d
+  SwiftAssRenderer:
+    url: https://github.com/mihai8804858/swift-ass-renderer
+    exactVersion: 1.3.1
+  SwiftLibass:
+    url: https://github.com/mihai8804858/swift-libass
+    exactVersion: 1.4.0
+  Nuke:
+    url: https://github.com/kean/Nuke
+    from: "13.2.0"
+
+targets:
+  Silo:
+    templates: [ShippableProduct]
+    type: application
+    platform: iOS
+    sources:
+      - path: iosApp
+        excludes:
+          - "**/*.xcodeproj"
+          - "**/*.xcworkspace"
+          - "macOS/**"
+          - "tvOS-Info.plist"
+      - path: Resources
+        buildPhase: resources
+      # Silo's own license and App Store permission, shown under Settings >
+      # About > Open Source Licenses. Bundled from the repository root so the
+      # app cannot drift from the published terms.
+      - path: ../LICENSE
+        buildPhase: resources
+      - path: ../APPSTORE-EXCEPTION.md
+        buildPhase: resources
+    # PRODUCT_BUNDLE_IDENTIFIER and CODE_SIGN_ENTITLEMENTS live in
+    # Signing/Silo.xcconfig so local contributors can override
+    # them via Signing/Local.xcconfig without dirtying this file.
+    # Target-level `settings` entries win over xcconfig, so they MUST
+    # NOT be set below.
+    configFiles:
+      Debug: Signing/Silo.xcconfig
+      Release: Signing/Silo.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: Silo
+        INFOPLIST_FILE: iosApp/Info.plist
+        # Kyro's iPhone icon lives in Kyro/KyroBrand.xcassets; the Silo
+        # AppIcon set stays in place for the macOS target.
+        ASSETCATALOG_COMPILER_APPICON_NAME: $(KYRO_APP_ICON_NAME)
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+      configs:
+        Debug:
+          APS_ENVIRONMENT: development
+        Release:
+          APS_ENVIRONMENT: production
+    dependencies:
+      - package: AetherEngine
+        product: AetherEngine
+      - package: SwiftAssRenderer
+        product: SwiftAssRenderer
+      - package: SwiftLibass
+        product: SwiftLibass
+      - package: Nuke
+        product: Nuke
+      - package: Nuke
+        product: NukeUI
+      - package: KyroMediaCore
+        product: KyroIdentity
+      - package: KyroMediaCore
+        product: KyroCredentials
+      - target: SiloNotificationService
+        embed: true
+      - target: SiloDownloadsActivity
+        embed: true
+
+  # NOTE: tvOS-specific source files live under iosApp/tvOS/. They are guarded
+  # by #if os(tvOS) so they compile out on the iOS target even though the
+  # directory is included in both targets' source tree.
+  SiloTV:
+    templates: [ShippableProduct]
+    type: application
+    platform: tvOS
+    sources:
+      - path: iosApp
+        excludes:
+          - "**/*.xcodeproj"
+          - "**/*.xcworkspace"
+          - "Info.plist"
+          - "macOS/**"
+          - "Kyro/**"
+      - path: Resources
+        buildPhase: resources
+      # Silo's own license and App Store permission, shown under Settings >
+      # About > Open Source Licenses. Bundled from the repository root so the
+      # app cannot drift from the published terms.
+      - path: ../LICENSE
+        buildPhase: resources
+      - path: ../APPSTORE-EXCEPTION.md
+        buildPhase: resources
+    # PRODUCT_BUNDLE_IDENTIFIER and CODE_SIGN_ENTITLEMENTS live in
+    # Signing/SiloTV.xcconfig so local contributors can override
+    # them via Signing/Local.xcconfig without dirtying this file.
+    # Target-level `settings` entries win over xcconfig, so they MUST
+    # NOT be set below.
+    configFiles:
+      Debug: Signing/SiloTV.xcconfig
+      Release: Signing/SiloTV.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: SiloTV
+        INFOPLIST_FILE: iosApp/tvOS-Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: TVAppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        SDKROOT: appletvos
+        SUPPORTED_PLATFORMS: "appletvos appletvsimulator"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+    dependencies:
+      - package: AetherEngine
+        product: AetherEngine
+      - package: SwiftAssRenderer
+        product: SwiftAssRenderer
+      - package: SwiftLibass
+        product: SwiftLibass
+      - package: Nuke
+        product: Nuke
+      - package: Nuke
+        product: NukeUI
+      - package: KyroMediaCore
+        product: KyroIdentity
+      - package: KyroMediaCore
+        product: KyroCredentials
+      - target: SiloTVTopShelf
+        embed: true
+
+  SiloMac:
+    templates: [ShippableProduct]
+    type: application
+    platform: macOS
+    sources:
+      - path: iosApp
+        excludes:
+          - "**/*.xcodeproj"
+          - "**/*.xcworkspace"
+          - "Info.plist"
+          - "tvOS-Info.plist"
+          - "PrivacyInfo.xcprivacy"
+          - "tvOS/**"
+          - "Kyro/**"
+          - "Screens/Player/iOS/**"
+          - "Screens/Player/tvOS/**"
+          - "Screens/Player/PlayerView.swift"
+          - "Screens/WatchParty/**"
+      - path: Resources
+        buildPhase: resources
+      # Silo's own license and App Store permission, shown under Settings >
+      # About > Open Source Licenses. Bundled from the repository root so the
+      # app cannot drift from the published terms.
+      - path: ../LICENSE
+        buildPhase: resources
+      - path: ../APPSTORE-EXCEPTION.md
+        buildPhase: resources
+    configFiles:
+      Debug: Signing/SiloMac.xcconfig
+      Release: Signing/SiloMac.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: Silo
+        INFOPLIST_FILE: macOS-Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SDKROOT: macosx
+        SUPPORTED_PLATFORMS: "macosx"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    dependencies:
+      - package: AetherEngine
+        product: AetherEngine
+      - package: SwiftAssRenderer
+        product: SwiftAssRenderer
+      - package: SwiftLibass
+        product: SwiftLibass
+      - package: Nuke
+        product: Nuke
+      - package: Nuke
+        product: NukeUI
+      - package: KyroMediaCore
+        product: KyroIdentity
+      - package: KyroMediaCore
+        product: KyroCredentials
+
+  # Top Shelf extension: populates the Apple TV Home Screen with
+  # Continue Watching / Next Up rows when the Silo app icon is
+  # focused. Shares auth state with the host app via an App Group +
+  # shared Keychain access group. Compiles `iosApp/Shared/` for the
+  # SharedStorage helpers used on both sides.
+  SiloTVTopShelf:
+    templates: [ShippableProduct]
+    type: app-extension
+    platform: tvOS
+    sources:
+      - path: TopShelf
+      - path: iosApp/Shared
+        excludes:
+          - "Diagnostics/**"
+    # PRODUCT_BUNDLE_IDENTIFIER and CODE_SIGN_ENTITLEMENTS live in
+    # Signing/SiloTVTopShelf.xcconfig so local contributors can
+    # override them via Signing/Local.xcconfig without dirtying this
+    # file. Target-level `settings` entries win over xcconfig, so they
+    # MUST NOT be set below.
+    configFiles:
+      Debug: Signing/SiloTVTopShelf.xcconfig
+      Release: Signing/SiloTVTopShelf.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: SiloTVTopShelf
+        INFOPLIST_FILE: TopShelf/Info.plist
+        SDKROOT: appletvos
+        SUPPORTED_PLATFORMS: "appletvos appletvsimulator"
+    dependencies:
+      - sdk: TVServices.framework
+
+  # iOS Notification Service extension: enriches generic APNs alerts by
+  # fetching compact display metadata directly from the user's Silo server.
+  # Shares active server/profile/token state via the App Group + shared
+  # Keychain access group, but does not link the main app's AuthService.
+  SiloNotificationService:
+    templates: [ShippableProduct]
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NotificationService
+      - path: iosApp/Notifications/ApplePushDisplayMetadata.swift
+      - path: iosApp/Notifications/ApplePushDisplayTargets.swift
+      - path: iosApp/Shared/KeychainAudience.swift
+      - path: iosApp/Shared/KyroAppIdentity.swift
+      - path: iosApp/Shared/SharedStorage.swift
+    configFiles:
+      Debug: Signing/SiloNotificationService.xcconfig
+      Release: Signing/SiloNotificationService.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: SiloNotificationService
+        INFOPLIST_FILE: NotificationService/Info.plist
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    dependencies:
+      - sdk: UserNotifications.framework
+
+  # iOS WidgetKit extension hosting the downloads Live Activity: the
+  # lock-screen / Dynamic Island progress card for active downloads. The
+  # host app owns the activity lifecycle (DownloadLiveActivityController)
+  # and pushes content states through ActivityKit; this target only renders
+  # them, so it compiles just the shared attributes schema and needs no
+  # entitlements or shared storage.
+  SiloDownloadsActivity:
+    templates: [ShippableProduct]
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DownloadsActivity
+      - path: iosApp/Downloads/DownloadActivityAttributes.swift
+    configFiles:
+      Debug: Signing/SiloDownloadsActivity.xcconfig
+      Release: Signing/SiloDownloadsActivity.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: SiloDownloadsActivity
+        INFOPLIST_FILE: DownloadsActivity/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+
+  # Unit-test bundle for the iOS Silo app. Hosts the XCTest cases under
+  # Tests/ and loads the Silo.app binary so `@testable import Silo` can
+  # reach the app's internal types (policies, codecs, formatting helpers).
+  SiloTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      # The whole tree, fixtures included. XcodeGen's default inference puts
+      # every non-Swift file under Tests/Fixtures into the resources phase
+      # (Fixtures/DiagnosticsContract has always been bundled this way), so
+      # nothing is excluded and re-listed by hand. The provenance files named
+      # SOURCE stay in the project but out of the bundle: nothing reads them
+      # at runtime.
+      - path: Tests
+        excludes:
+          # Provenance and tooling next to the fixtures, not fixtures. They
+          # are re-added below with no build phase so they stay visible in
+          # the project without landing in the bundle (ASS/README.md would
+          # also collide with DiagnosticsContract/README.md when flattened).
+          - "Fixtures/ASS/README.md"
+          - "Fixtures/ASS/generate-font.py"
+          - "Fixtures/ASS/alternate.ass"
+      - path: Tests/Fixtures/SettingsContract/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/PlaybackV3/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/BufferingQuality/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/APIv2/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/DiagnosticsContract/SOURCE
+        buildPhase: none
+      # Provenance note for the Sleeper fixtures, not a fixture itself.
+      - path: Tests/Fixtures/Sleeper/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/ESPN/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/ASS/README.md
+        buildPhase: none
+      - path: Tests/Fixtures/ASS/generate-font.py
+        buildPhase: none
+      - path: Tests/Fixtures/ASS/alternate.ass
+        buildPhase: none
+    dependencies:
+      - target: Silo
+    settings:
+      base:
+        PRODUCT_NAME: SiloTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        # Without an explicit SDKROOT the generated test config resolves
+        # BUILT_PRODUCTS_DIR without a platform suffix, so TEST_HOST points
+        # at .../Debug/Silo.app and xcodebuild can't find the test host.
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Silo.app/Silo"
+
+  # UI tests for Kyro's first-run introduction on iPhone: page flow, Skip,
+  # Get Started into server setup, and the returning-user bypass. Run from
+  # the KyroIntroUITests scheme so the Silo scheme's tests stay unit-only.
+  KyroIntroUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Silo
+    settings:
+      base:
+        PRODUCT_NAME: KyroIntroUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        TEST_TARGET_NAME: Silo
+
+  # Unit-test bundle for the tvOS SiloTV app. Same Tests/ tree as SiloTests
+  # minus the files that reference iOS-only declarations (each exclusion says
+  # which). Everything else compiles against the tvOS module, so the
+  # `#if os(tvOS)` branches in shared code and tests become real coverage.
+  SiloTVTests:
+    type: bundle.unit-test
+    platform: tvOS
+    sources:
+      - path: Tests
+        excludes:
+          # UserNotifications and the ApplePush* types (Notifications/, #if os(iOS)).
+          - "ApplePushRegistrationTests.swift"
+          # PlayerOrientationCoordinator, AppRouter, DetailDismissalPolicy (iOS player/detail).
+          - "DetailDismissalNavigationTests.swift"
+          # Unguarded `import UIKit`, UIApplication.shared, phone home-feed rails.
+          - "HorizontalMediaRailTests.swift"
+          # UIApplication.shared, UIImage(systemName:), MobilePlayer* controls (iOS player).
+          - "PlayerSurfaceLayoutTests.swift"
+          # MetricKitCapture is declared under #if os(iOS).
+          - "MetricKitCaptureTests.swift"
+          # CompanionPairingCoordinator is declared under #if os(iOS).
+          - "PairingCoordinatorTests.swift"
+          # Kyro global shell adapters and the iPhone-only Live TV tab.
+          - "KyroUnifiedNavigationTests.swift"
+          # RemotePlaybackClock / RemoteVolumeReconciler / SiloControlClient (Control/iOS).
+          - "SiloControlTests.swift"
+          # OnboardingTourViewModel / OnboardingTourAPI are declared under #if !os(tvOS).
+          - "OnboardingInvitationTests.swift"
+          # Kyro/Sports is excluded from the SiloTV target (Kyro/** is iPhone-only),
+          # so the Sports Hub and its provider clients do not exist on tvOS.
+          - "KyroSportsDecodingTests.swift"
+          - "KyroSportsCacheTests.swift"
+          - "KyroSportsHubStoreTests.swift"
+          - "KyroSportsDashboardTests.swift"
+          - "KyroSportsLeagueStoreTests.swift"
+          - "KyroSportsS6ScheduleTests.swift"
+          - "KyroESPNProviderTests.swift"
+          - "KyroESPNLeagueWindowTests.swift"
+          - "KyroESPNNFLPrimaryTests.swift"
+          - "KyroESPNTennisLiveTests.swift"
+          - "KyroSportsEventChannelMatchingTests.swift"
+          - "KyroSportsEventDetailTests.swift"
+          - "KyroSoccerTests.swift"
+          - "KyroSportsMatchReportTests.swift"
+          - "KyroSportsStreamDiscoveryCorrectionsTests.swift"
+          - "KyroSportsEventPreviewTests.swift"
+          - "KyroSportsLiveNowTests.swift"
+          - "KyroSportsPlaybackCoordinatorTests.swift"
+          - "KyroSportsInlinePlaybackTests.swift"
+          - "KyroSportsPlayerPolishTests.swift"
+          - "KyroSportsShellPresentationTests.swift"
+          - "KyroSportsStreamMatcherTests.swift"
+          - "KyroSportsStreamPresentationTests.swift"
+          # AutoDownloadRules / AutoDownloadSchedule are declared under #if !os(tvOS).
+          - "AutoDownloadStatusTests.swift"
+          # Same non-fixture files as SiloTests, re-added below with no phase.
+          - "Fixtures/ASS/README.md"
+          - "Fixtures/ASS/generate-font.py"
+          - "Fixtures/ASS/alternate.ass"
+      - path: Tests/Fixtures/SettingsContract/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/PlaybackV3/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/BufferingQuality/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/APIv2/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/DiagnosticsContract/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/Sleeper/SOURCE
+        buildPhase: none
+      - path: Tests/Fixtures/ASS/README.md
+        buildPhase: none
+      - path: Tests/Fixtures/ASS/generate-font.py
+        buildPhase: none
+      - path: Tests/Fixtures/ASS/alternate.ass
+        buildPhase: none
+    dependencies:
+      - target: SiloTV
+    settings:
+      base:
+        PRODUCT_NAME: SiloTVTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        # Same reason as SiloTests: an explicit SDKROOT is what gives
+        # BUILT_PRODUCTS_DIR its platform suffix so TEST_HOST resolves.
+        SDKROOT: appletvos
+        SUPPORTED_PLATFORMS: "appletvos appletvsimulator"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/SiloTV.app/SiloTV"
+        # Every shared test file says `@testable import Silo`, but the tvOS
+        # app's Swift module is `SiloTV` (its PRODUCT_NAME, which must stay
+        # for TestFlight continuity). Module aliasing resolves `Silo` to
+        # `SiloTV` for this test bundle only; the app target, its symbol
+        # mangling, and its Info.plist are untouched.
+        OTHER_SWIFT_FLAGS: "$(inherited) -module-alias Silo=SiloTV"
+
+schemes:
+  Silo:
+    build:
+      targets:
+        Silo: all
+        SiloTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SiloTests
+    archive:
+      config: Release
+    analyze:
+      config: Debug
+    profile:
+      config: Release
+  KyroIntroUITests:
+    build:
+      targets:
+        Silo: all
+        KyroIntroUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - KyroIntroUITests
+  SiloNoDebugger:
+    build:
+      targets:
+        Silo: all
+    run:
+      config: Debug
+      debugEnabled: false
+      disableMainThreadChecker: true
+      disableThreadPerformanceChecker: true
+      enableGPUFrameCaptureMode: disabled
+      enableGPUValidationMode: false
+    analyze:
+      config: Debug
+    profile:
+      config: Release
+  SiloTV:
+    build:
+      targets:
+        SiloTV: all
+        SiloTVTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SiloTVTests
+    archive:
+      config: Release
+    analyze:
+      config: Debug
+    profile:
+      config: Release
+  SiloMac:
+    build:
+      targets:
+        SiloMac: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    archive:
+      config: Release
+    analyze:
+      config: Debug
+    profile:
+      config: Release

@@ -1,0 +1,41 @@
+The espn_detail_*.json files are minimized copies of public ESPN event-summary
+responses captured on 2026-11-11. They retain only fields decoded by Kyro.
+
+Endpoints:
+- NFL event 401873026
+- NBA event 401810341
+- NHL event 401688063
+- MLB event 401816775
+- NCAA football event 401752717
+- English Premier League event 704317
+
+They are regression fixtures for provider wire types, selected-event/team
+validation, team/player statistics, and article metadata. They are not shown to
+users and are not a substitute for a live response.
+
+The espn_b60_*.json files (Build 60) are minimized copies of public ESPN responses
+captured on 2026-11-11 from site.api.espn.com. They keep the real structure of every
+field Kyro decodes; other fields and most article bodies are removed.
+
+- NBA scoreboard 2026-11-11, summary and team news (teams 11, 27) for event 401909966,
+  Washington Wizards at Indiana Pacers (the event in the Build 59 Stats screenshot).
+- MLB scoreboard 2026-10-28, summary and team news (team 30) for event 401908046,
+  World Series Game 5. Team statistics trimmed to the lines Kyro shows plus one unused line.
+- NHL scoreboard 2026-11-10, summary with recap and team news (teams 21, 17) for event
+  401892683, Colorado Avalanche at Toronto Maple Leafs.
+- WTA scoreboard 2026-11-11 (two WTA Finals matches: 187385 Muchova v Svitolina,
+  187373 Noskova v Kostyuk) and WTA league news. ESPN's tennis summary route returned
+  HTTP 400 for match and tournament IDs, so tennis has no box-score fixture.
+
+The espn_b68_pregame_*.json files (Build 68) are minimized copies of public ESPN
+event-summary responses captured on 2026-11-13 for events that had not started
+(header status state "pre"). They keep every field Kyro decodes for pregame context:
+records, standings, last five games, season series, leaders, injuries, venue and the
+season averages ESPN places under boxscore.teams before the start. Injuries and
+news are cut to three entries per list.
+
+- NBA 401909296, New York Knicks at Indiana Pacers
+- NHL 401892706, New York Rangers at Vancouver Canucks
+- NFL 401873053, New England Patriots at Detroit Lions (Munich)
+- NCAA football 401858526, Illinois at UCLA (18-team Big Ten standings)
+- English Premier League 401879233, Fulham at Manchester City
