@@ -4,7 +4,7 @@ Kyro Labs is the experimental edition of Kyro. It lives on the `kyro/labs` branc
 stable Kyro, and is where upstream Silo integration and the Jellyfin, Emby and Plex providers are
 developed. Stable Kyro stays on `kyro/m1-rebrand` and is never rebuilt from this branch.
 
-## Stable baseline (do not move)
+## Stable iOS baseline (Build 110 - do not move)
 
 | | |
 | --- | --- |
@@ -15,6 +15,46 @@ developed. Stable Kyro stays on `kyro/m1-rebrand` and is never rebuilt from this
 | SHA-256 | `f8b7443384207f1c0601fa7f830b8803f0c1a12e49a98359ede9a0239ccae59a` |
 
 Build 111 (`840a9406`) is a different, later commit. Labs starts from it.
+
+## Approved tvOS baseline (Build 104)
+
+Kyro tvOS Build 104 is the approved, physically tested, usable Apple TV baseline for Kyro Labs and tvOS development.
+
+| | |
+| --- | --- |
+| Platform | Apple TV / tvOS (`SiloTV`) |
+| Version | Kyro 1.0.104 (Build 104) |
+| Repository | `jmargocubs/Kyro` |
+| Source commit | [`f66d9e929cce41c90b67bbeaffaf057f342438d1`](https://github.com/jmargocubs/Kyro/commit/f66d9e929cce41c90b67bbeaffaf057f342438d1) |
+| Branch | `kyro/tvos-build104-recovery` |
+| Release | [`kyro-tvos-v1.0.104-build104-rc1`](https://github.com/jmargocubs/Kyro/releases/tag/kyro-tvos-v1.0.104-build104-rc1) |
+| Status | **Accepted baseline** (Physically tested and verified on Apple TV hardware) |
+
+### Physical Apple TV Feedback
+- Main navigation is usable and stable across the 10-foot UI.
+- All major sections and controls are reachable.
+- Live TV toolbar navigation works.
+- Movies and Series navigation works.
+- Sports Hub, Search, and Settings are accessible.
+- Overall experience is nearly perfect.
+
+### Known Remaining Issues (Deferred, Nonblocking Polish)
+1. Movies and Series dropdowns occasionally require repeated Down presses or a delay before focus enters.
+2. Movies dropdown sometimes enters on the second option instead of the first.
+3. An intermittent Live TV category-to-first-channel focus handoff issue was previously observed.
+
+These issues are accepted for now as deferred, nonblocking polish. Do not prioritize fixing them ahead of independent architecture completion.
+
+### tvOS Integration & Architectural Invariants
+1. **Preserve UI, Navigation & Focus Behavior**: Future tvOS integration plans must preserve Build 104's working UI, navigation hierarchy, and Siri Remote focus behavior.
+2. **Continue Kyro-Independent Architecture Roadmap**:
+   - Kyro-owned identity and profiles
+   - Provider-independent startup
+   - Silo as an optional provider
+   - Preservation of existing Silo-specific features when connected
+   - **No redesign or replacement of the existing app UI**
+3. **Do Not Overwrite Newer Labs Architecture Code**: Never overwrite newer Labs architecture code (KyroMediaCore foundation, independent auth/identity runtime, local profiles) with Build 104 source.
+4. **Selective Fix Integration Only**: Do not automatically or bulk-merge the recovery branch (`kyro/tvos-build104-recovery`). Integrate relevant fixes selectively and deliberately when appropriate.
 
 ## Identity
 

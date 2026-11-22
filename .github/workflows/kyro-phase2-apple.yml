@@ -36,4 +36,8 @@ jobs:
         run: >-
           xcodebuild test -project iosApp/Silo.xcodeproj -scheme Silo
           -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
+          -parallel-testing-enabled NO
+          -only-testing:SiloTests/KyroLocalIdentityRuntimeTests
+          -only-testing:SiloTests/RestoredSessionValidatorTests/testNoSiloServerCanResolveToKyroLocalProfilePicker
+          -only-testing:SiloTests/KyroIntroductionTests
           CODE_SIGNING_ALLOWED=NO

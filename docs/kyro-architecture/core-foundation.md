@@ -51,3 +51,22 @@ The existing private macOS workflow passed on foundation commit `44a9be9`, with 
 ## Integration boundary
 
 Phase 0/1 ends at these independent APIs. No app integration, playback engine, UI, IPA, signing, public push or Labs merge is included. Before integration, validate iOS/tvOS SDK compilation and physical-device behavior, supply an Apple Keychain CredentialStore, review privacy/backup retention and benchmark PIN costs on target devices. The test credential store is intentionally in memory; durable provider secrets must not use the catalog/identity document store. Provider compatibility beyond synthetic fixtures and real-player reporting remain integration work. No server or Android changes are required for this standalone package.
+
+## Approved tvOS baseline (Build 104) and shell integration invariants
+
+Kyro tvOS Build 104 is the accepted usable Apple TV baseline for future shell and platform integrations:
+- **Repository:** `jmargocubs/Kyro`
+- **Source commit:** [`f66d9e929cce41c90b67bbeaffaf057f342438d1`](https://github.com/jmargocubs/Kyro/commit/f66d9e929cce41c90b67bbeaffaf057f342438d1)
+- **Branch:** `kyro/tvos-build104-recovery`
+- **Version / Build:** 1.0.104 (Build 104)
+- **Release:** [`kyro-tvos-v1.0.104-build104-rc1`](https://github.com/jmargocubs/Kyro/releases/tag/kyro-tvos-v1.0.104-build104-rc1)
+- **Status:** Physically verified on Apple TV hardware. Main navigation, Live TV toolbar, Movies, Series, Sports Hub, Search, and Settings are all accessible and functional.
+- **Accepted deferred polish (nonblocking):**
+  1. Movies/Series dropdowns occasionally require repeated Down presses or a delay before focus enters.
+  2. Movies dropdown sometimes enters on the second option instead of the first.
+  3. Intermittent Live TV category-to-first-channel focus handoff.
+- **Integration rules:**
+  - Future tvOS integration must preserve Build 104's working UI, navigation, and focus behavior.
+  - Continue the Kyro-independent architecture roadmap: Kyro-owned identity and profiles, provider-independent startup, Silo as an optional provider, preservation of existing Silo-specific features when connected, and no redesign or replacement of the existing app UI.
+  - Do not overwrite newer Labs architecture code with the Build 104 source.
+  - Do not automatically bulk-merge the recovery branch; integrate relevant fixes selectively when appropriate.

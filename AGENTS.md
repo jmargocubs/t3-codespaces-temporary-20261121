@@ -62,6 +62,22 @@ menus, grids, or custom controls. Prefer a stable native focus graph or a
 single composite focus owner; do not mix row-level focusable controls with
 manual directional focus mutation.
 
+## Approved tvOS Baseline (Build 104)
+
+Kyro tvOS Build 104 is the accepted, physically tested Apple TV baseline:
+- **Repository:** `jmargocubs/Kyro`
+- **Branch:** `kyro/tvos-build104-recovery`
+- **Source commit:** [`f66d9e929cce41c90b67bbeaffaf057f342438d1`](https://github.com/jmargocubs/Kyro/commit/f66d9e929cce41c90b67bbeaffaf057f342438d1)
+- **Release:** [`kyro-tvos-v1.0.104-build104-rc1`](https://github.com/jmargocubs/Kyro/releases/tag/kyro-tvos-v1.0.104-build104-rc1)
+- **Status:** Main navigation, Live TV toolbar, Movies, Series, Sports Hub, Search, and Settings are verified functional on Apple TV hardware.
+- **Accepted deferred polish:** Movies and Series dropdown focus delays / second-option entry, and intermittent category-to-channel focus handoff are nonblocking and accepted for now.
+- **Integration invariants:**
+  1. Future tvOS integration must preserve Build 104's working UI, navigation, and focus behavior.
+  2. Continue the Kyro-independent architecture roadmap: Kyro-owned identity/profiles, provider-independent startup, Silo as optional provider, and preservation of existing Silo features when connected.
+  3. **No redesign or replacement of the existing app UI.**
+  4. Do not overwrite newer Labs architecture code with Build 104 source.
+  5. Do not automatically bulk-merge the recovery branch; integrate fixes selectively.
+
 ## Testing Guidelines
 
 Apple tests use XCTest under `iosApp/Tests/`. Add focused regression tests when
