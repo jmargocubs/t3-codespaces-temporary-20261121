@@ -716,6 +716,7 @@ struct CreateProfileView: View {
                 try await KyroLocalIdentityRuntime.shared.createProfile(
                     name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                     isChild: isChild,
+                    avatarEmoji: activePreset?.ref,
                     pin: pin.isEmpty ? nil : pin
                 )
                 onCreated()

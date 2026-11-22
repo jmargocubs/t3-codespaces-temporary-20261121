@@ -61,9 +61,13 @@ final class KyroLocalIdentityRuntime {
         }
     }
 
-    func createProfile(name: String, isChild: Bool, pin: String?) async throws {
+    func createProfile(name: String, isChild: Bool, avatarEmoji: String?, pin: String?) async throws {
         guard let identity else { throw startupError ?? RuntimeError.storageUnavailable }
-        let profile = KyroProfile(name: name, kind: isChild ? .kids : .standard)
+        let profile = KyroProfile(
+            name: name,
+            kind: isChild ? .kids : .standard,
+            avatarEmoji: avatarEmoji
+        )
         try await identity.create(profile)
         if let pin, !pin.isEmpty {
             do {
@@ -82,7 +86,7 @@ final class KyroLocalIdentityRuntime {
             result.append(UserProfile(
                 id: profile.id.description,
                 name: profile.name,
-                avatarEmoji: nil,
+                avatarEmoji: profile.avatarEmoji,
                 hasPin: try await identity.hasPIN(for: profile.id),
                 isChild: profile.kind == .kids,
                 isPrimary: false

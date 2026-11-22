@@ -44,6 +44,18 @@ final class RestoredSessionValidatorTests: XCTestCase {
         )
     }
 
+    func testNoSiloServerCanResolveToKyroLocalProfilePicker() {
+        XCTAssertEqual(
+            RestoredSessionAuthResolver.localState(
+                hasServer: false,
+                hasAccessToken: false,
+                hasProfile: false,
+                hasKyroLocalProfile: true
+            ),
+            .needsProfile
+        )
+    }
+
     func testConfiguredServerAndSuccessfulAccountProbeAreValid() async {
         let harness = ValidationHarness(identity: expected)
         let result = await makeValidator(harness).validate(expected: expected)

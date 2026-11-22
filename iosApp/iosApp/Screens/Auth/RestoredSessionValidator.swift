@@ -234,9 +234,10 @@ enum RestoredSessionAuthResolver {
     static func localState(
         hasServer: Bool,
         hasAccessToken: Bool,
-        hasProfile: Bool
+        hasProfile: Bool,
+        hasKyroLocalProfile: Bool = false
     ) -> AppRouter.AuthState {
-        guard hasServer else { return .needsServerSetup }
+        guard hasServer else { return hasKyroLocalProfile ? .needsProfile : .needsServerSetup }
         guard hasAccessToken else { return .needsLogin }
         return hasProfile ? .authenticated : .needsProfile
     }
@@ -248,7 +249,15 @@ enum RestoredSessionAuthResolver {
               !activeServerID.isEmpty else {
             do {
                 try await KyroLocalIdentityRuntime.shared.ensureInitialProfile()
-                return LocalResolution(state: .needsProfile, restoredAccount: nil)
+                return LocalResolution(
+                    state: localState(
+                        hasServer: false,
+                        hasAccessToken: false,
+                        hasProfile: false,
+                        hasKyroLocalProfile: true
+                    ),
+                    restoredAccount: nil
+                )
             } catch {
                 // The existing profile picker owns storage error presentation;
                 // it keeps the same first-run surface without requiring Silo.

@@ -253,7 +253,9 @@ struct ProfileSelectionView: View {
     private var serverChip: some View {
         let serverURL = AuthService.shared.serverUrl
         let branding = ServerBrandingCache.branding(for: serverURL)
-        let name = ServerBranding.displayName(branding, serverURL: serverURL)
+        let name = viewModel.isKyroLocalMode
+            ? "Connect Silo"
+            : ServerBranding.displayName(branding, serverURL: serverURL)
         return Menu {
             Section(ServerBranding.hostLabel(serverURL)) {
                 Button {

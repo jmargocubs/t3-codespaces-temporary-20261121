@@ -30,6 +30,8 @@ jobs:
           xcodebuild -project iosApp/Silo.xcodeproj -scheme SiloTV
           -destination 'generic/platform=tvOS Simulator'
           CODE_SIGNING_ALLOWED=NO build
+      - name: Run Swift package tests, including Keychain tests
+        run: swift test --package-path Packages/KyroMediaCore -j 2
       - name: Run iOS unit tests
         run: >-
           xcodebuild test -project iosApp/Silo.xcodeproj -scheme Silo

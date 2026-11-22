@@ -295,7 +295,9 @@ struct LiveTVView: View {
         .liveTVPageBackground()
         .tint(LiveTVAccent.primaryText)
         .navigationTitle("")
+        #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .navigationBarBackButtonHidden(true)
         .toolbar {
             if backPlacement == .toolbar {
@@ -315,7 +317,7 @@ struct LiveTVView: View {
             LiveTVSettingsSheet(service: service)
         }
         .toolbar {
-            ToolbarItem(placement: .secondaryAction) {
+            ToolbarItem(placement: .automatic) {
                 if LiveTVNavigationDiagnostics.isAvailable {
                     Button("Navigation Diagnostics", systemImage: "stethoscope") { showingNavigationDiagnostics = true }
                 }
@@ -679,10 +681,14 @@ struct LiveTVSettingsView: View {
             }
 
         }
+        #if os(iOS)
         .scrollContentBackground(.hidden)
+        #endif
         .background(Color.siloBackground)
         .navigationTitle("Live TV Settings")
+        #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .toolbar {
             if presentation.showsDoneButton {
                 ToolbarItem(placement: .confirmationAction) {
