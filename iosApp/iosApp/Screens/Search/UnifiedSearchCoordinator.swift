@@ -113,7 +113,8 @@ struct UnifiedSearchLiveTVSource {
         -> [EPGProgramChannel]?
 
     @MainActor static func live(service: LiveTVService) -> Self {
-        Self(search: { query, providerID, revision in
+        #if os(iOS)
+        return Self(search: { query, providerID, revision in
             guard service.selectedProviderID == providerID, service.channelCatalogRevision == revision else { return nil }
             async let page = service.channelPage(providerID: providerID, query: query, limit: 200)
             async let count = service.channelCount(providerID: providerID, query: query)
@@ -131,6 +132,16 @@ struct UnifiedSearchLiveTVSource {
             guard service.selectedProviderID == providerID, service.channelCatalogRevision == revision else { return nil }
             return result
         })
+        #else
+        // The bounded provider catalog index currently exists on iOS only.
+        // tvOS search keeps its existing Silo and guide paths and reports no
+        // indexed IPTV results until that catalog surface is ported.
+        return Self(
+            search: { _, _, _ in nil },
+            resolve: { _, _, _ in nil },
+            programAssociations: { _, _ in nil }
+        )
+        #endif
     }
 }
 
