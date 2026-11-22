@@ -20,11 +20,11 @@ final class KyroLocalIdentityRuntime {
 
     private let database: SQLiteDatabase?
     private let identity: IdentityStore?
-    private let household: HouseholdID
+    private let defaults: UserDefaults
     private(set) var startupError: Error?
 
-    private init() {
-        let defaults = UserDefaults.standard
+    init(databaseURL: URL? = nil, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         let key = KyroLocalIdentityDefaults.householdIDKey
         let householdID: HouseholdID
         if let value = defaults.string(forKey: key),
@@ -34,17 +34,23 @@ final class KyroLocalIdentityRuntime {
             householdID = HouseholdID()
             defaults.set(householdID.description, forKey: key)
         }
-        household = householdID
-
         do {
-            let root = try FileManager.default.url(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask,
-                appropriateFor: nil,
-                create: true
-            ).appendingPathComponent("Kyro", isDirectory: true)
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            let database = try SQLiteDatabase(path: root.appendingPathComponent("identity.sqlite"))
+            let databasePath: URL
+            if let databaseURL {
+                databasePath = databaseURL
+            } else {
+                let root = try FileManager.default.url(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask,
+                    appropriateFor: nil,
+                    create: true
+                ).appendingPathComponent("Kyro", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                databasePath = root.appendingPathComponent("identity.sqlite")
+            }
+            try FileManager.default.createDirectory(
+                at: databasePath.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let database = try SQLiteDatabase(path: databasePath)
             self.database = database
             identity = IdentityStore(database: database, household: householdID)
         } catch {
@@ -104,7 +110,7 @@ final class KyroLocalIdentityRuntime {
                 throw RuntimeError.incorrectPIN
             }
         }
-        UserDefaults.standard.set(profile.id, forKey: KyroLocalIdentityDefaults.activeProfileIDKey)
+        defaults.set(profile.id, forKey: KyroLocalIdentityDefaults.activeProfileIDKey)
     }
 
     func verify(_ pin: String, profileID: UUID) async throws -> Bool {

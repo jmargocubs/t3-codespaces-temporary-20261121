@@ -63,6 +63,7 @@ enum StartupContentPrefetcher {
     }
 
     static func prefetchProfiles() {
+        guard AuthService.shared.hasServer else { return }
         Task {
             _ = try? await fetchProfiles()
         }

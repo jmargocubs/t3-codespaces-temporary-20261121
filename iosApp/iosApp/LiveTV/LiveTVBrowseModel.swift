@@ -747,7 +747,6 @@ struct LiveTVChannelBrowserScreen: View {
         .safeAreaInset(edge: .top, spacing: 0) {
             if browse.isSearchPresented {
                 TextField("Search channels", text: $browse.searchText)
-                    .textFieldStyle(.roundedBorder)
                     .padding(.horizontal, 64)
                     .padding(.vertical, 12)
             }
