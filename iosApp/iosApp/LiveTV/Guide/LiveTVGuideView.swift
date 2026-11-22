@@ -201,7 +201,9 @@ struct LiveTVGuideView: View {
                 .liveTVPageBackground()
                 .tint(LiveTVAccent.primaryText)
                 .navigationTitle(selectedCategory ?? (favoritesOnly ? "Favorites" : "TV Guide"))
+                #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
+                #endif
                 .toolbar { toolbar }
                 // A navigation-bar drawer can rebuild the two-axis guide while a query is being
                 // edited. Keep search at a fixed height so the rows and scroll container remain

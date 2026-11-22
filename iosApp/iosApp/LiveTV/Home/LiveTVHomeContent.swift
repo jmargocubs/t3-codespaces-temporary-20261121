@@ -279,6 +279,7 @@ struct LiveTVHomeToolbar: ToolbarContent {
     let settings: () -> Void
 
     var body: some ToolbarContent {
+        #if os(iOS)
         if #available(iOS 26.0, *) {
             ToolbarItemGroup(placement: .topBarLeading) {
                 backButton
@@ -291,6 +292,12 @@ struct LiveTVHomeToolbar: ToolbarContent {
                 LiveTVBrandWordmark()
             }
         }
+        #else
+        ToolbarItemGroup(placement: .topBarLeading) {
+            backButton
+            LiveTVBrandWordmark()
+        }
+        #endif
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button(action: search) { Image(systemName: "magnifyingglass") }
                 .accessibilityLabel("Search channels")
@@ -629,7 +636,9 @@ struct LiveTVChannelInfoSheet: View {
             .safeAreaPadding(.bottom, 16)
             .background(LiveTVHomeBackground())
             .navigationTitle("Channel Info")
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
