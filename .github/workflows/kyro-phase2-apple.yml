@@ -32,6 +32,8 @@ jobs:
           CODE_SIGNING_ALLOWED=NO build
       - name: Run Swift package tests, including Keychain tests
         run: swift test --package-path Packages/KyroMediaCore -j 2
+      # This integration checkout uses the Labs baseline; keep iOS XCTest
+      # scoped to Phase 2 identity and first-launch routing regressions.
       - name: Run iOS unit tests
         run: >-
           xcodebuild test -project iosApp/Silo.xcodeproj -scheme Silo
