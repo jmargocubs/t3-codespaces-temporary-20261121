@@ -387,11 +387,17 @@ struct LiveTVNavigationDiagnosticsView: View {
                 Toggle("Record Categories navigation", isOn: $trace.enabled)
                 Text("Off by default. Keeps the latest 150 events in memory. Enable, reproduce Back, then return here to share the trace. No provider or category names are recorded. A \"push/pop\" line without a following \"destination resolved\" line means the screen did not resolve.")
                     .font(.footnote)
+                #if os(iOS)
                 ShareLink("Share navigation trace", item: trace.export)
+                #endif
                 #if os(iOS)
                 Button("Copy navigation trace") { UIPasteboard.general.string = trace.export }
                 #endif
-                Text(trace.export).font(.caption.monospaced()).textSelection(.enabled)
+                Text(trace.export)
+                    .font(.caption.monospaced())
+                    #if os(iOS)
+                    .textSelection(.enabled)
+                    #endif
             }
             .navigationTitle("Navigation Diagnostics")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
@@ -872,6 +878,7 @@ private struct LiveTVManageCategoriesView: View {
     let categories: [String]
     @Binding var preferences: LiveTVCategoryPreferences
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.editMode) private var editMode
     private var availablePins: [String] { preferences.pinned.filter { categories.contains($0) } }
 
     var body: some View {
@@ -934,7 +941,17 @@ private struct LiveTVManageCategoriesView: View {
         .navigationTitle("Manage Categories")
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-            ToolbarItem(placement: .primaryAction) { EditButton() }
+            ToolbarItem(placement: .primaryAction) {
+                #if os(iOS)
+                EditButton()
+                #else
+                Button(editMode?.wrappedValue == .active ? "Done Editing" : "Reorder") {
+                    withAnimation {
+                        editMode?.wrappedValue = editMode?.wrappedValue == .active ? .inactive : .active
+                    }
+                }
+                #endif
+            }
         }
     }
 }
