@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "KyroMediaCore",
-    platforms: [.iOS(.v18), .tvOS(.v18), .macOS(.v15)],
+    platforms: [.iOS(.v18), .tvOS("26.0"), .macOS("26.0")],
     products: [
         .library(name: "KyroFoundation", targets: ["KyroFoundation"]),
         .library(name: "KyroIdentity", targets: ["KyroIdentity"]),
