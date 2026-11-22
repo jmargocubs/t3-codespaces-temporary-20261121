@@ -1,0 +1,950 @@
+{
+  "header": {
+    "id": "704317",
+    "competitions": [
+      {
+        "id": "704317",
+        "date": "2024-09-15T13:00Z",
+        "competitors": [
+          {
+            "id": "367",
+            "homeAway": "home",
+            "team": {
+              "id": "367",
+              "abbreviation": "TOT",
+              "displayName": "Tottenham Hotspur",
+              "shortDisplayName": "Spurs"
+            }
+          },
+          {
+            "id": "359",
+            "homeAway": "away",
+            "team": {
+              "id": "359",
+              "abbreviation": "ARS",
+              "displayName": "Arsenal",
+              "shortDisplayName": "Arsenal"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "boxscore": {
+    "teams": [
+      {
+        "team": {
+          "id": "367",
+          "abbreviation": "TOT",
+          "displayName": "Tottenham Hotspur",
+          "shortDisplayName": "Spurs"
+        },
+        "homeAway": "home",
+        "statistics": [
+          {
+            "name": "foulsCommitted",
+            "label": "Fouls",
+            "displayValue": "13"
+          },
+          {
+            "name": "yellowCards",
+            "label": "Yellow Cards",
+            "displayValue": "5"
+          },
+          {
+            "name": "redCards",
+            "label": "Red Cards",
+            "displayValue": "0"
+          },
+          {
+            "name": "offsides",
+            "label": "Offsides",
+            "displayValue": "2"
+          },
+          {
+            "name": "wonCorners",
+            "label": "Corner Kicks",
+            "displayValue": "7"
+          },
+          {
+            "name": "saves",
+            "label": "Saves",
+            "displayValue": "3"
+          },
+          {
+            "name": "possessionPct",
+            "label": "Possession",
+            "displayValue": "63.7"
+          },
+          {
+            "name": "totalShots",
+            "label": "SHOTS",
+            "displayValue": "15"
+          },
+          {
+            "name": "shotsOnTarget",
+            "label": "ON GOAL",
+            "displayValue": "5"
+          },
+          {
+            "name": "shotPct",
+            "label": "On Target %",
+            "displayValue": "0.3"
+          },
+          {
+            "name": "penaltyKickGoals",
+            "label": "Penalty Goals",
+            "displayValue": "0"
+          },
+          {
+            "name": "penaltyKickShots",
+            "label": "Penalty Kicks Taken",
+            "displayValue": "0"
+          }
+        ]
+      },
+      {
+        "team": {
+          "id": "359",
+          "abbreviation": "ARS",
+          "displayName": "Arsenal",
+          "shortDisplayName": "Arsenal"
+        },
+        "homeAway": "away",
+        "statistics": [
+          {
+            "name": "foulsCommitted",
+            "label": "Fouls",
+            "displayValue": "10"
+          },
+          {
+            "name": "yellowCards",
+            "label": "Yellow Cards",
+            "displayValue": "3"
+          },
+          {
+            "name": "redCards",
+            "label": "Red Cards",
+            "displayValue": "0"
+          },
+          {
+            "name": "offsides",
+            "label": "Offsides",
+            "displayValue": "3"
+          },
+          {
+            "name": "wonCorners",
+            "label": "Corner Kicks",
+            "displayValue": "6"
+          },
+          {
+            "name": "saves",
+            "label": "Saves",
+            "displayValue": "5"
+          },
+          {
+            "name": "possessionPct",
+            "label": "Possession",
+            "displayValue": "36.3"
+          },
+          {
+            "name": "totalShots",
+            "label": "SHOTS",
+            "displayValue": "7"
+          },
+          {
+            "name": "shotsOnTarget",
+            "label": "ON GOAL",
+            "displayValue": "4"
+          },
+          {
+            "name": "shotPct",
+            "label": "On Target %",
+            "displayValue": "0.6"
+          },
+          {
+            "name": "penaltyKickGoals",
+            "label": "Penalty Goals",
+            "displayValue": "0"
+          },
+          {
+            "name": "penaltyKickShots",
+            "label": "Penalty Kicks Taken",
+            "displayValue": "0"
+          }
+        ]
+      }
+    ],
+    "players": []
+  },
+  "article": {
+    "id": 41271780,
+    "headline": "Gabriel's header earns Arsenal win at Spurs in feisty derby",
+    "published": "2024-09-15T14:56:00Z",
+    "links": {
+      "web": {
+        "href": "http://www.espn.com/soccer/report/_/gameId/704317"
+      }
+    },
+    "categories": [
+      {
+        "type": "league",
+        "team": null
+      },
+      {
+        "type": "team",
+        "team": {
+          "id": 367
+        }
+      },
+      {
+        "type": "team",
+        "team": {
+          "id": 359
+        }
+      },
+      {
+        "type": "league",
+        "team": null
+      },
+      {
+        "type": "athlete",
+        "team": null
+      },
+      {
+        "type": "event",
+        "team": null
+      }
+    ]
+  },
+  "news": {
+    "articles": [
+      {
+        "id": 50455118,
+        "headline": "Schmeichel blasts Man United's 'disrespectful' treatment of Carrick amid Pochettino links",
+        "published": "2026-11-11T21:40:27Z",
+        "links": {
+          "web": {
+            "href": "https://www.espn.com/soccer/story/_/id/50455118/manchester-united-michael-carrick-premier-league-peter-schmeichel-mauricio-pochettino"
+          }
+        },
+        "categories": [
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 360
+            }
+          }
+        ]
+      },
+      {
+        "id": 50451226,
+        "headline": "Transfer rumors, news: Man United add Brentford defender Nathan Collins to shortlist",
+        "published": "2026-11-11T11:51:55Z",
+        "links": {
+          "web": {
+            "href": "https://www.espn.com/soccer/story/_/id/50451226/transfer-rumors-news-gossip-manchester-united-brentford-nathan-collins"
+          }
+        },
+        "categories": [
+          {
+            "type": "topic",
+            "team": null
+          },
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 337
+            }
+          },
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 360
+            }
+          }
+        ]
+      },
+      {
+        "id": 50451966,
+        "headline": "Arsenal's Martin Zubimendi denies wanting to leave amid Atlético Madrid links",
+        "published": "2026-11-11T11:37:06Z",
+        "links": {
+          "web": {
+            "href": "https://www.espn.com/soccer/story/_/id/50451966/arsenal-martin-zubimendi-atletico-madrid"
+          }
+        },
+        "categories": [
+          {
+            "type": "athlete",
+            "team": null
+          },
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 359
+            }
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 164
+            }
+          },
+          {
+            "type": "league",
+            "team": null
+          },
+          {
+            "type": "team",
+            "team": {
+              "id": 1068
+            }
+          },
+          {
+            "type": "topic",
+            "team": null
+          },
+          {
+            "type": "contributor",
+            "team": null
+          }
+        ]
+      }
+    ]
+  },
+  "keyEvents": [
+    {
+      "id": "43752718",
+      "type": {
+        "id": "80",
+        "text": "Kickoff",
+        "type": "kickoff"
+      },
+      "clock": {
+        "value": 0.0,
+        "displayValue": ""
+      },
+      "team": null,
+      "athletesInvolved": []
+    },
+    {
+      "id": "43752931",
+      "type": {
+        "id": "94",
+        "text": "Yellow Card",
+        "type": "yellow-card"
+      },
+      "clock": {
+        "value": 891.0,
+        "displayValue": "15'"
+      },
+      "team": {
+        "id": "359"
+      },
+      "athletesInvolved": []
+    },
+    {
+      "id": "43753059",
+      "type": {
+        "id": "94",
+        "text": "Yellow Card",
+        "type": "yellow-card"
+      },
+      "clock": {
+        "value": 1569.0,
+        "displayValue": "27'"
+      },
+      "team": {
+        "id": "367"
+      },
+      "athletesInvolved": []
+    },
+    {
+      "id": "43753138",
+      "type": {
+        "id": "94",
+        "text": "Yellow Card",
+        "type": "yellow-card"
+      },
+      "clock": {
+        "value": 1881.0,
+        "displayValue": "32'"
+      },
+      "team": {
+        "id": "367"
+      },
+      "athletesInvolved": []
+    }
+  ],
+  "rosters": [
+    {
+      "team": {
+        "id": "367",
+        "abbreviation": "TOT",
+        "displayName": "Tottenham Hotspur",
+        "shortDisplayName": null
+      },
+      "roster": [
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "204082",
+            "displayName": "Guglielmo Vicario",
+            "shortName": "G. Vicario",
+            "position": null
+          },
+          "position": {
+            "name": "Goalkeeper",
+            "displayName": "Goalkeeper",
+            "abbreviation": "G"
+          },
+          "stats": [
+            {
+              "name": "appearances",
+              "displayName": "Appearances",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsCommitted",
+              "displayName": "Fouls Committed",
+              "displayValue": "0"
+            },
+            {
+              "name": "foulsSuffered",
+              "displayName": "Fouls Suffered",
+              "displayValue": "0"
+            },
+            {
+              "name": "ownGoals",
+              "displayName": "Own Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "redCards",
+              "displayName": "Red Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "subIns",
+              "displayName": "Substitute Appearances",
+              "displayValue": "0"
+            },
+            {
+              "name": "yellowCards",
+              "displayName": "Yellow Cards",
+              "displayValue": "1"
+            },
+            {
+              "name": "goalsConceded",
+              "displayName": "Goals Against",
+              "displayValue": "1"
+            },
+            {
+              "name": "saves",
+              "displayName": "Saves",
+              "displayValue": "3"
+            },
+            {
+              "name": "shotsFaced",
+              "displayName": "Shots Faced",
+              "displayValue": "5"
+            },
+            {
+              "name": "goalAssists",
+              "displayName": "Assists",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsOnTarget",
+              "displayName": "Shots On Goal",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalGoals",
+              "displayName": "Total Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalShots",
+              "displayName": "Shots",
+              "displayValue": "0"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "296512",
+            "displayName": "Micky van de Ven",
+            "shortName": "M. van de Ven",
+            "position": null
+          },
+          "position": {
+            "name": "Center Left Defender",
+            "displayName": "Center Left Defender",
+            "abbreviation": "CD-L"
+          },
+          "stats": [
+            {
+              "name": "appearances",
+              "displayName": "Appearances",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsCommitted",
+              "displayName": "Fouls Committed",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsSuffered",
+              "displayName": "Fouls Suffered",
+              "displayValue": "0"
+            },
+            {
+              "name": "ownGoals",
+              "displayName": "Own Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "redCards",
+              "displayName": "Red Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "subIns",
+              "displayName": "Substitute Appearances",
+              "displayValue": "0"
+            },
+            {
+              "name": "yellowCards",
+              "displayName": "Yellow Cards",
+              "displayValue": "1"
+            },
+            {
+              "name": "goalsConceded",
+              "displayName": "Goals Against",
+              "displayValue": "1"
+            },
+            {
+              "name": "shotsFaced",
+              "displayName": "Shots Faced",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalAssists",
+              "displayName": "Assists",
+              "displayValue": "0"
+            },
+            {
+              "name": "offsides",
+              "displayName": "Offsides",
+              "displayValue": "1"
+            },
+            {
+              "name": "shotsOnTarget",
+              "displayName": "Shots On Goal",
+              "displayValue": "1"
+            },
+            {
+              "name": "totalGoals",
+              "displayName": "Total Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalShots",
+              "displayName": "Shots",
+              "displayValue": "1"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "96970",
+            "displayName": "Cristian Romero",
+            "shortName": "C. Romero",
+            "position": null
+          },
+          "position": {
+            "name": "Center Right Defender",
+            "displayName": "Center Right Defender",
+            "abbreviation": "CD-R"
+          },
+          "stats": [
+            {
+              "name": "appearances",
+              "displayName": "Appearances",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsCommitted",
+              "displayName": "Fouls Committed",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsSuffered",
+              "displayName": "Fouls Suffered",
+              "displayValue": "1"
+            },
+            {
+              "name": "ownGoals",
+              "displayName": "Own Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "redCards",
+              "displayName": "Red Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "subIns",
+              "displayName": "Substitute Appearances",
+              "displayValue": "0"
+            },
+            {
+              "name": "yellowCards",
+              "displayName": "Yellow Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalsConceded",
+              "displayName": "Goals Against",
+              "displayValue": "1"
+            },
+            {
+              "name": "shotsFaced",
+              "displayName": "Shots Faced",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalAssists",
+              "displayName": "Assists",
+              "displayValue": "0"
+            },
+            {
+              "name": "offsides",
+              "displayName": "Offsides",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsOnTarget",
+              "displayName": "Shots On Goal",
+              "displayValue": "1"
+            },
+            {
+              "name": "totalGoals",
+              "displayName": "Total Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalShots",
+              "displayName": "Shots",
+              "displayValue": "1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "team": {
+        "id": "359",
+        "abbreviation": "ARS",
+        "displayName": "Arsenal",
+        "shortDisplayName": null
+      },
+      "roster": [
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "196176",
+            "displayName": "David Raya",
+            "shortName": "D. Raya",
+            "position": null
+          },
+          "position": {
+            "name": "Goalkeeper",
+            "displayName": "Goalkeeper",
+            "abbreviation": "G"
+          },
+          "stats": [
+            {
+              "name": "appearances",
+              "displayName": "Appearances",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsCommitted",
+              "displayName": "Fouls Committed",
+              "displayValue": "0"
+            },
+            {
+              "name": "foulsSuffered",
+              "displayName": "Fouls Suffered",
+              "displayValue": "1"
+            },
+            {
+              "name": "ownGoals",
+              "displayName": "Own Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "redCards",
+              "displayName": "Red Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "subIns",
+              "displayName": "Substitute Appearances",
+              "displayValue": "0"
+            },
+            {
+              "name": "yellowCards",
+              "displayName": "Yellow Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalsConceded",
+              "displayName": "Goals Against",
+              "displayValue": "0"
+            },
+            {
+              "name": "saves",
+              "displayName": "Saves",
+              "displayValue": "5"
+            },
+            {
+              "name": "shotsFaced",
+              "displayName": "Shots Faced",
+              "displayValue": "15"
+            },
+            {
+              "name": "goalAssists",
+              "displayName": "Assists",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsOnTarget",
+              "displayName": "Shots On Goal",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalGoals",
+              "displayName": "Total Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalShots",
+              "displayName": "Shots",
+              "displayValue": "0"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "236322",
+            "displayName": "Gabriel Magalhães",
+            "shortName": "G. Magalhães",
+            "position": null
+          },
+          "position": {
+            "name": "Center Left Defender",
+            "displayName": "Center Left Defender",
+            "abbreviation": "CD-L"
+          },
+          "stats": [
+            {
+              "name": "appearances",
+              "displayName": "Appearances",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsCommitted",
+              "displayName": "Fouls Committed",
+              "displayValue": "0"
+            },
+            {
+              "name": "foulsSuffered",
+              "displayName": "Fouls Suffered",
+              "displayValue": "0"
+            },
+            {
+              "name": "ownGoals",
+              "displayName": "Own Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "redCards",
+              "displayName": "Red Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "subIns",
+              "displayName": "Substitute Appearances",
+              "displayValue": "0"
+            },
+            {
+              "name": "yellowCards",
+              "displayName": "Yellow Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalsConceded",
+              "displayName": "Goals Against",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsFaced",
+              "displayName": "Shots Faced",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalAssists",
+              "displayName": "Assists",
+              "displayValue": "0"
+            },
+            {
+              "name": "offsides",
+              "displayName": "Offsides",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsOnTarget",
+              "displayName": "Shots On Goal",
+              "displayValue": "1"
+            },
+            {
+              "name": "totalGoals",
+              "displayName": "Total Goals",
+              "displayValue": "1"
+            },
+            {
+              "name": "totalShots",
+              "displayName": "Shots",
+              "displayValue": "1"
+            }
+          ]
+        },
+        {
+          "active": true,
+          "starter": true,
+          "didNotPlay": null,
+          "athlete": {
+            "id": "277385",
+            "displayName": "William Saliba",
+            "shortName": "W. Saliba",
+            "position": null
+          },
+          "position": {
+            "name": "Center Right Defender",
+            "displayName": "Center Right Defender",
+            "abbreviation": "CD-R"
+          },
+          "stats": [
+            {
+              "name": "appearances",
+              "displayName": "Appearances",
+              "displayValue": "1"
+            },
+            {
+              "name": "foulsCommitted",
+              "displayName": "Fouls Committed",
+              "displayValue": "2"
+            },
+            {
+              "name": "foulsSuffered",
+              "displayName": "Fouls Suffered",
+              "displayValue": "2"
+            },
+            {
+              "name": "ownGoals",
+              "displayName": "Own Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "redCards",
+              "displayName": "Red Cards",
+              "displayValue": "0"
+            },
+            {
+              "name": "subIns",
+              "displayName": "Substitute Appearances",
+              "displayValue": "0"
+            },
+            {
+              "name": "yellowCards",
+              "displayName": "Yellow Cards",
+              "displayValue": "1"
+            },
+            {
+              "name": "goalsConceded",
+              "displayName": "Goals Against",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsFaced",
+              "displayName": "Shots Faced",
+              "displayValue": "0"
+            },
+            {
+              "name": "goalAssists",
+              "displayName": "Assists",
+              "displayValue": "0"
+            },
+            {
+              "name": "offsides",
+              "displayName": "Offsides",
+              "displayValue": "0"
+            },
+            {
+              "name": "shotsOnTarget",
+              "displayName": "Shots On Goal",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalGoals",
+              "displayName": "Total Goals",
+              "displayValue": "0"
+            },
+            {
+              "name": "totalShots",
+              "displayName": "Shots",
+              "displayValue": "0"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

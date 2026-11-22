@@ -1,0 +1,696 @@
+#if !os(tvOS)
+import SwiftUI
+
+// MARK: - Metrics
+
+/// Layout constants shared by the Design Lab variants.
+///
+/// These deliberately diverge from `SiloTheme` in a few places — the
+/// divergences *are* the proposal, and each one is called out below so the
+/// reasoning survives the experiment.
+enum HomeFeedMetrics {
+    /// True 2:3, the ratio every poster source (TMDB, TVDB, Fanart) ships.
+    static let posterAspect: CGFloat = 3.0 / 2.0
+
+    /// The app-wide poster width, so Home's rows match every other page.
+    static let posterWidth: CGFloat = SiloTheme.posterCardWidth
+    /// 16:9 still used by resume rows. Continue Watching is the row people
+    /// act on most, so it reads as "one card plus a peek" rather than matching
+    /// the poster rows' density — at 184 the stills felt like thumbnails and
+    /// the progress rail was hard to read. Android's backdrop card is 280dp.
+    /// Scaled by the Poster Size setting at the call site.
+    #if os(macOS)
+    static let stillWidth: CGFloat = 340
+    #else
+    static let stillWidth: CGFloat = 240
+    #endif
+    /// Runway under the last row so captions clear the floating tab bar.
+    static let bottomRunway: CGFloat = 96
+
+    static let posterRadius: CGFloat = 10
+    static let stillRadius: CGFloat = 12
+
+    /// Screen gutter. Matches `SiloTheme.safePadding` so variants stay
+    /// aligned with the rest of the app's chrome.
+    static let gutter: CGFloat = 16
+    static let cardSpacing: CGFloat = 10
+    /// Row-to-row gap. Slightly wider than today's 24 because the rows
+    /// themselves are now tighter internally.
+    static let sectionSpacing: CGFloat = 30
+    /// Header baseline to the top of the artwork.
+    static let headerGap: CGFloat = 12
+
+    /// Card caption fonts. The Mac uses the shared card tokens, which are a
+    /// step larger to suit its bigger cards.
+    static var captionTitleFont: Font {
+        #if os(macOS)
+        .siloCardTitle
+        #else
+        .footnote.weight(.semibold)
+        #endif
+    }
+
+    static var captionMetadataFont: Font {
+        #if os(macOS)
+        .siloCardMetadata
+        #else
+        .caption2
+        #endif
+    }
+}
+
+// MARK: - Feed helpers
+
+/// Row-shaping helpers shared by the Home feed.
+enum HomeFeed {
+    /// Resume rows get 16:9 stills rather than posters — showing where you
+    /// are inside a runtime is the row's entire job.
+    static func isResume(_ section: ResolvedSection) -> Bool {
+        let type = section.sectionType.lowercased()
+        return type == "continue_watching" || type == "in_progress"
+    }
+}
+
+// MARK: - Metadata formatting
+
+enum HomeFeedMeta {
+    static func remaining(position: Double?, duration: Double?) -> String? {
+        guard let position, let duration, duration > 0, position > 0 else { return nil }
+        let minutesLeft = Int((duration - position) / 60)
+        guard minutesLeft > 0 else { return nil }
+        return MediaTextFormatting.runtime(minutes: minutesLeft).map { "\($0) left" }
+    }
+
+    static func progress(for item: SectionItem) -> Double? {
+        guard let position = item.positionSeconds,
+              let duration = item.durationSeconds,
+              duration > 0, position > 0 else { return nil }
+        return min(max(position / duration, 0), 1)
+    }
+
+    /// Secondary caption line under a card title: "S01E02 · Pilot" for
+    /// episodes, otherwise the year. One line, so every card in a row keeps
+    /// the same height.
+    static func cardSecondLine(for item: SectionItem) -> String? {
+        EpisodeCardCaption.line(for: item) ?? item.year.map(String.init)
+    }
+
+    /// Caption under a resume still — "23m left".
+    ///
+    /// Some items carry a resume position but no duration, which left their
+    /// card showing a progress bar and no caption while the card beside it had
+    /// one — ragged, and it read like missing data. Percentage is a weaker
+    /// answer than time remaining but it is still true, and it keeps every
+    /// resume card the same height.
+    static func resumeCaption(for item: SectionItem) -> String? {
+        let progressText: String?
+        if let remainingText = remaining(position: item.positionSeconds, duration: item.durationSeconds) {
+            progressText = remainingText
+        } else if let fraction = progress(for: item) {
+            progressText = "\(Int((fraction * 100).rounded()))% watched"
+        } else {
+            progressText = nil
+        }
+
+        return progressText
+    }
+
+    /// The title a card should be captioned with. Episodes caption with the
+    /// series name — the bare episode title is frequently "TBA".
+    static func cardTitle(for item: SectionItem) -> String {
+        item.type.lowercased() == "episode" ? (item.seriesTitle ?? item.title) : item.title
+    }
+
+}
+
+// MARK: - Navigation
+
+/// Shared tap handling so every variant card opens detail the same way.
+private struct HomeCardTap<Label: View>: View {
+    let contentId: String
+    let accessibilityLabel: String
+    var continueWatchingItem: SectionItem? = nil
+    /// Secondary action surfaced to VoiceOver. The card collapses its
+    /// children into one element, so a nested play button would otherwise
+    /// vanish from the accessibility tree.
+    var accessibilityPlayAction: (name: String, perform: () -> Void)? = nil
+    /// Replaces opening detail, for hosts that pick rather than browse.
+    var onTap: (() -> Void)? = nil
+    @ViewBuilder var label: () -> Label
+
+    @Environment(AppRouter.self) private var router
+    @Environment(\.browseLibraryId) private var browseLibraryId
+
+    var body: some View {
+        Button {
+            if let onTap { onTap(); return }
+            if let continueWatchingItem {
+                router.presentContinueWatchingDetail(for: continueWatchingItem, libraryId: browseLibraryId)
+            } else {
+                router.presentItemDetail(contentId: contentId, libraryId: browseLibraryId)
+            }
+        } label: {
+            label()
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+        .modifier(OptionalAccessibilityAction(action: accessibilityPlayAction))
+    }
+}
+
+private struct OptionalAccessibilityAction: ViewModifier {
+    let action: (name: String, perform: () -> Void)?
+
+    func body(content: Content) -> some View {
+        if let action {
+            content.accessibilityAction(named: Text(action.name), action.perform)
+        } else {
+            content
+        }
+    }
+}
+
+// MARK: - Card context menu
+
+/// Long-press menu for a Home card.
+///
+/// `MediaCard` carries these actions on Browse and For You, so a card that
+/// loses them on Home behaves differently depending on which tab you found it
+/// in — and `HomeViewModel`'s dismiss/watched mutations become unreachable.
+/// Same action set and ordering as `MediaCard`: watched toggle, personal
+/// lists, then the destructive removal.
+private struct HomeCardMenu: ViewModifier {
+    let item: SectionItem
+    let onRemoveFromContinueWatching: (() -> Void)?
+    let onSetWatched: ((Bool) async -> Bool)?
+
+    /// Owned by the card, not the menu, so the artwork's watched check flips
+    /// with the menu label instead of waiting on the Home refresh —
+    /// `MediaCard` drives its badge from the same effective state.
+    let personalState: MediaCardPersonalState
+
+    private var isPlayed: Bool { personalState.isPlayed(item.userState) }
+    private var isFavorite: Bool { personalState.isFavorite(item.userState) }
+    private var inWatchlist: Bool { personalState.inWatchlist(item.userState) }
+
+    /// Only cards backed by server user state get the personal-list entries,
+    /// matching `MediaCard`.
+    private var hasPersonalActions: Bool { item.userState != nil }
+
+    private var hasAnyAction: Bool {
+        hasPersonalActions || onSetWatched != nil || onRemoveFromContinueWatching != nil
+    }
+
+    func body(content: Content) -> some View {
+        if hasAnyAction {
+            content
+                .contextMenu { menuItems }
+                .mediaActionFeedback(personalState.feedback)
+                .onChange(of: item.userState) { _, _ in
+                    personalState.reset()
+                }
+        } else {
+            content
+        }
+    }
+
+    @ViewBuilder
+    private var menuItems: some View {
+        MediaStateMenuItems(
+            isWatched: isPlayed,
+            isFavorite: isFavorite,
+            inWatchlist: inWatchlist,
+            isUpdating: personalState.feedback.isUpdating,
+            onToggleWatched: canSetWatched ? toggleWatched : nil,
+            onToggleFavorite: hasPersonalActions ? toggleFavorite : nil,
+            onToggleWatchlist: hasPersonalActions ? toggleWatchlist : nil
+        )
+
+        if let onRemoveFromContinueWatching {
+            Button(role: .destructive, action: onRemoveFromContinueWatching) {
+                Label(HomeDismissal.menuTitle(for: item), systemImage: "xmark.circle")
+            }
+        }
+    }
+
+    private var canSetWatched: Bool {
+        onSetWatched != nil || (hasPersonalActions && !item.isAudiobook)
+    }
+
+    private func toggleWatched() {
+        let write: MediaCardPersonalState.WatchedWrite = onSetWatched.map { .host($0) }
+            ?? .catalog(contentId: item.contentId, seriesId: item.seriesId)
+        personalState.toggleWatched(from: item.userState, via: write)
+    }
+
+    private func toggleFavorite() {
+        personalState.toggleFavorite(contentId: item.contentId, from: item.userState)
+    }
+
+    private func toggleWatchlist() {
+        personalState.toggleWatchlist(contentId: item.contentId, from: item.userState)
+    }
+}
+
+// MARK: - Watched check
+
+/// Top-trailing watched indicator shared by both Home cards.
+private struct HomeWatchedCheck: View {
+    var body: some View {
+        Image(systemName: "checkmark")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(Color.siloBackground)
+            .frame(width: 18, height: 18)
+            .background(Circle().fill(Color.siloOnSurface))
+    }
+}
+
+// MARK: - Poster card
+
+/// Poster card with the shipping card's flaws corrected: true 2:3 artwork,
+/// a single-line title and the year folded onto the caption line instead of
+/// occupying its own. Card overlays remain shared with the rest of the app.
+struct HomePosterCard: View {
+    let item: SectionItem
+    var width: CGFloat = HomeFeedMetrics.posterWidth
+    var showsCaption: Bool = true
+    var showsMetadata: Bool = true
+    /// Draws the resume rail across the bottom of the artwork.
+    var showsProgress: Bool = false
+    var opensResumeContext = false
+    /// Audiobook covers are square; stretching one into a 2:3 poster crops
+    /// its edges off.
+    var aspect: MediaCardAspect = .poster
+    /// Episode context retained for accessibility. Episode numbers are
+    /// intentionally not drawn over poster artwork.
+    var episodeAccessibilityLabel: String? = nil
+    /// Long-press actions, matching what `MediaCard` offers elsewhere.
+    var onRemoveFromContinueWatching: (() -> Void)? = nil
+    var onSetWatched: ((Bool) async -> Bool)? = nil
+    /// Replaces opening detail; see `HomeCardTap.onTap`.
+    var onTap: (() -> Void)? = nil
+    /// Replaces the year/metadata caption line.
+    var secondLineOverride: String? = nil
+
+    @EnvironmentObject private var overlayStore: OverlayPrefsStore
+    /// Optimistic personal state, shared with the menu so the badge flips the
+    /// moment "Mark as Watched" is tapped rather than after the Home refresh.
+    @State private var personalState = MediaCardPersonalState()
+
+    private var isPlayed: Bool { personalState.isPlayed(item.userState) }
+
+    private var height: CGFloat { Self.artworkSize(width: width, aspect: aspect).height }
+
+    /// The size a poster card of `width` draws its artwork at.
+    static func artworkSize(width: CGFloat, aspect: MediaCardAspect) -> CGSize {
+        switch aspect {
+        case .poster: CGSize(width: width, height: (width * HomeFeedMetrics.posterAspect).rounded())
+        case .square: CGSize(width: width, height: width)
+        }
+    }
+
+    var body: some View {
+        HomeCardTap(
+            contentId: item.contentId,
+            accessibilityLabel: accessibilityDescription,
+            continueWatchingItem: opensResumeContext ? item : nil,
+            onTap: onTap
+        ) {
+            VStack(alignment: .leading, spacing: 7) {
+                artwork
+                if showsCaption { caption }
+            }
+            .frame(width: width, alignment: .leading)
+        }
+        .modifier(HomeCardMenu(
+            item: item,
+            onRemoveFromContinueWatching: onRemoveFromContinueWatching,
+            onSetWatched: onSetWatched,
+            personalState: personalState
+        ))
+    }
+
+    private var artwork: some View {
+        AsyncImageView(
+            url: item.posterUrl ?? "",
+            thumbhash: item.posterThumbhash,
+            targetSize: CGSize(width: width, height: height),
+            contentMode: .fill,
+            placeholderStyle: .artwork,
+            placeholderSymbol: ArtworkPlaceholderSymbol.forMediaType(item.type)
+        )
+        .frame(width: width, height: height)
+        .episodeSpoilerBlur(item.isEpisodeItem && EpisodeSpoilerPreferences.shared.settings.hidesImage(
+            for: EpisodeWatchState(sectionItem: item, playedOverride: isPlayed), isEpisodeStill: item.posterIsEpisodeStill
+        ))
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: HomeFeedMetrics.posterRadius, style: .continuous))
+        // A hairline lifts the poster off a pure-black background. Without
+        // it, dark artwork bleeds into the page and the card loses its edge.
+        .overlay(
+            RoundedRectangle(cornerRadius: HomeFeedMetrics.posterRadius, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 0.5)
+        )
+        .overlay {
+            // Home uses the same renderer and resolved profile preferences as
+            // Browse, For You, Watchlist, and Favorites. Keep this below the
+            // progress and watched affordances so those controls retain their
+            // established corner priority.
+            if overlayStore.enabled {
+                CardOverlays(
+                    data: OverlayData.from(item),
+                    prefs: overlayStore.prefs,
+                    variant: .poster
+                )
+                .frame(width: width, height: height)
+                .clipShape(
+                    RoundedRectangle(
+                        cornerRadius: HomeFeedMetrics.posterRadius,
+                        style: .continuous
+                    )
+                )
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if isPlayed {
+                HomeWatchedCheck()
+                    .padding(6)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if showsProgress, let progress = HomeFeedMeta.progress(for: item) {
+                ProgressBar(value: progress)
+                    .padding(.horizontal, 6)
+                    .padding(.bottom, 6)
+            }
+        }
+        .overlay {
+            DownloadedBadgeOverlay(contentId: item.contentId, padding: 6)
+        }
+    }
+
+    private var caption: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(HomeFeedMeta.cardTitle(for: item))
+                .font(HomeFeedMetrics.captionTitleFont)
+                .foregroundStyle(Color.siloOnSurface)
+                // One line, always. Reserving two lines (as the shipping card
+                // does) makes every row 17pt taller than it needs to be; letting
+                // it wrap makes row baselines ragged. Truncation is the honest
+                // answer — the poster already carries the identity.
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            if showsMetadata, let secondLine = secondLineOverride ?? HomeFeedMeta.cardSecondLine(for: item) {
+                Text(secondLine)
+                    .font(HomeFeedMetrics.captionMetadataFont)
+                    .foregroundStyle(Color.siloOnSurface.opacity(0.5))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+    }
+
+    private var accessibilityDescription: String {
+        var components = [HomeFeedMeta.cardTitle(for: item)]
+        if let episodeAccessibilityLabel {
+            components.append(episodeAccessibilityLabel)
+        } else if let year = item.year {
+            components.append(String(year))
+        }
+        if isPlayed {
+            components.append("Watched")
+        }
+        return components.joined(separator: ", ")
+    }
+}
+
+// MARK: - Still card (16:9)
+
+/// Wide 16:9 card for resume rows. A half-watched episode is a *moment* in
+/// a video, not a poster — the still plus an inline progress rail says
+/// "you're 40 minutes into this" at a glance, which a 2:3 poster cannot.
+struct HomeStillCard: View {
+    let item: SectionItem
+    var width: CGFloat = HomeFeedMetrics.stillWidth
+    var showsCaption: Bool = true
+    var showsMetadata: Bool = true
+    var opensResumeContext = false
+    var onRemoveFromContinueWatching: (() -> Void)? = nil
+    var onSetWatched: ((Bool) async -> Bool)? = nil
+    /// Replaces opening detail and drops the direct-play action; see `HomeCardTap.onTap`.
+    var onTap: (() -> Void)? = nil
+
+    /// Optimistic personal state, shared with the menu — see `HomePosterCard`.
+    @State private var personalState = MediaCardPersonalState()
+    @EnvironmentObject private var overlayStore: OverlayPrefsStore
+    @Environment(\.browseLibraryId) private var playbackLibraryId
+    @Environment(AppRouter.self) private var router
+
+    private var isPlayed: Bool { personalState.isPlayed(item.userState) }
+
+    private var height: CGFloat { Self.artworkSize(width: width).height }
+
+    /// The size a still card of `width` draws its artwork at.
+    static func artworkSize(width: CGFloat) -> CGSize {
+        CGSize(width: width, height: (width * 9.0 / 16.0).rounded())
+    }
+
+    /// Backdrop when the payload actually has one — some send `""` rather
+    /// than omitting the field — otherwise the poster, with the thumbhash
+    /// kept in lockstep so the blur placeholder previews the image that
+    /// will actually load.
+    static func art(for item: SectionItem) -> (url: String, thumbhash: String?) {
+        if let backdrop = item.backdropUrl, !backdrop.isEmpty {
+            return (backdrop, item.backdropThumbhash)
+        }
+        return (item.posterUrl ?? "", item.posterThumbhash)
+    }
+
+    /// Protect the selected episode still while preserving fallback artwork.
+    private var hidesStill: Bool {
+        return EpisodeSpoilerPreferences.shared.settings.hidesImage(for: item, playedOverride: isPlayed)
+    }
+    private var art: (url: String, thumbhash: String?) { Self.art(for: item) }
+
+    var body: some View {
+        HomeCardTap(
+            contentId: item.contentId,
+            accessibilityLabel: accessibilityDescription,
+            continueWatchingItem: opensResumeContext ? item : nil,
+            accessibilityPlayAction: isDirectlyPlayable && onTap == nil
+                ? (name: playActionName, perform: playItem)
+                : nil,
+            onTap: onTap
+        ) {
+            VStack(alignment: .leading, spacing: 8) {
+                artwork
+                if showsCaption { caption }
+            }
+            .frame(width: width, alignment: .leading)
+        }
+        .modifier(HomeCardMenu(
+            item: item,
+            onRemoveFromContinueWatching: onRemoveFromContinueWatching,
+            onSetWatched: onSetWatched,
+            personalState: personalState
+        ))
+    }
+
+    private var artwork: some View {
+        ZStack(alignment: .bottom) {
+            AsyncImageView(
+                url: art.url,
+                thumbhash: art.thumbhash,
+                targetSize: CGSize(width: width, height: height),
+                contentMode: .fill,
+                placeholderStyle: .artwork,
+                // The play badge sits where the mark would.
+                placeholderSymbol: onTap == nil ? nil : ArtworkPlaceholderSymbol.forMediaType(item.type)
+            )
+            .frame(width: width, height: height)
+            .episodeSpoilerBlur(hidesStill)
+            .clipped()
+
+            // Scrim so the play affordance and rail stay legible over bright
+            // stills without dimming the whole image.
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.55)],
+                startPoint: .center,
+                endPoint: .bottom
+            )
+            .frame(height: height * 0.6)
+            .frame(maxHeight: .infinity, alignment: .bottom)
+            .allowsHitTesting(false)
+
+            if overlayStore.enabled {
+                CardOverlays(
+                    data: OverlayData.from(item),
+                    prefs: overlayStore.prefs,
+                    variant: .wide
+                )
+                .frame(width: width, height: height)
+                .clipShape(
+                    RoundedRectangle(
+                        cornerRadius: HomeFeedMetrics.stillRadius,
+                        style: .continuous
+                    )
+                )
+            }
+
+            if let progress = HomeFeedMeta.progress(for: item) {
+                ProgressBar(value: progress)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 7)
+            }
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: HomeFeedMetrics.stillRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: HomeFeedMetrics.stillRadius, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 0.5)
+        )
+        .overlay(alignment: .center) {
+            // A host that picks on tap must not also offer direct playback.
+            if onTap == nil { playBadge }
+        }
+        // A watched item can sit in Continue Watching again on a rewatch —
+        // the check says "you've finished this before" alongside the rail's
+        // "here's where you are now", same as the replaced EpisodeThumbCard.
+        .overlay(alignment: .topTrailing) {
+            if isPlayed {
+                HomeWatchedCheck()
+                    .padding(6)
+            }
+        }
+        // Above the progress rail rather than on it — the rail owns the
+        // bottom edge of a resume still.
+        .overlay {
+            DownloadedBadgeOverlay(contentId: item.contentId, padding: 6)
+                .padding(.bottom, 10)
+        }
+    }
+
+    /// Quick-start affordance. Tapping the badge plays (or resumes) the item
+    /// directly instead of opening its detail page; the rest of the still
+    /// keeps the detail tap. Sized as a real touch target rather than a
+    /// decorative glyph so a thumb lands on it reliably.
+    @ViewBuilder
+    private var playBadge: some View {
+        let badge = Image(systemName: "play.fill")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.white.opacity(0.9))
+            .frame(width: 36, height: 36)
+            .background(Circle().fill(.black.opacity(0.32)))
+            .overlay(Circle().stroke(.white.opacity(0.38), lineWidth: 0.75))
+            .contentShape(Circle())
+
+        if isDirectlyPlayable {
+            Button(action: playItem) { badge }
+                .buttonStyle(.plain)
+                .accessibilityLabel(playActionName)
+        } else {
+            badge.allowsHitTesting(false)
+        }
+    }
+
+    private var isDirectlyPlayable: Bool { SiloMediaType.isDirectlyPlayable(item.type) }
+
+    private var playActionName: String { (item.positionSeconds ?? 0) > 0 ? "Resume" : "Play" }
+
+    private func playItem() {
+        router.presentPlayer(
+            contentId: item.contentId,
+            libraryId: playbackLibraryId,
+            resumePosition: item.positionSeconds,
+            prefersLastUsedVersion: opensResumeContext,
+            posterURL: item.posterUrl,
+            backdropURL: item.backdropUrl
+        )
+    }
+
+    private var caption: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(HomeFeedMeta.cardTitle(for: item))
+                .font(HomeFeedMetrics.captionTitleFont)
+                .foregroundStyle(Color.siloOnSurface)
+                .lineLimit(1)
+
+            if showsMetadata {
+                // Episode code + title (or the year for movies). Space is
+                // reserved even when empty so a row mixing episodes and
+                // movies keeps one caption height.
+                Text(HomeFeedMeta.cardSecondLine(for: item) ?? "")
+                    .font(HomeFeedMetrics.captionMetadataFont)
+                    .foregroundStyle(Color.siloOnSurface.opacity(0.7))
+                    .monospacedDigit()
+                    .lineLimit(1, reservesSpace: true)
+                    .truncationMode(.tail)
+            }
+
+            if showsMetadata,
+               (opensResumeContext && HorizontalMediaRailLayout.isPhone)
+                   || HomeFeedMeta.resumeCaption(for: item) != nil {
+                // Keep phone resume cards the same height when only some items have
+                // a remaining-time caption, including as lazy cards enter/leave.
+                Text(HomeFeedMeta.resumeCaption(for: item) ?? "0m left")
+                    .font(HomeFeedMetrics.captionMetadataFont)
+                    .foregroundStyle(Color.siloOnSurface.opacity(0.55))
+                    .lineLimit(1)
+                    .opacity(HomeFeedMeta.resumeCaption(for: item) == nil ? 0 : 1)
+                    .accessibilityHidden(HomeFeedMeta.resumeCaption(for: item) == nil)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+    }
+
+    private var accessibilityDescription: String {
+        var components = [HomeFeedMeta.cardTitle(for: item)]
+        if let episodeLabel = EpisodeCardCaption.accessibilityLabel(for: item) {
+            components.append(episodeLabel)
+        } else if let year = item.year {
+            components.append(String(year))
+        }
+        if let resumeCaption = HomeFeedMeta.resumeCaption(for: item) {
+            components.append(resumeCaption)
+        }
+        if isPlayed {
+            components.append("Watched")
+        }
+        return components.joined(separator: ", ")
+    }
+}
+
+// MARK: - Section header
+
+/// Section header. Tighter and quieter than the shipping one: negative
+/// tracking at this size stops the label sprawling.
+struct HomeSectionHeader: View {
+    let title: String
+    var icon: String? = nil
+
+    var body: some View {
+        HStack(spacing: 7) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.siloOnSurface.opacity(0.85))
+            }
+
+            Text(title)
+                .font(.siloHeadline)
+                .tracking(-0.3)
+                .foregroundStyle(Color.siloOnSurface)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, HomeFeedMetrics.gutter)
+    }
+}
+
+// MARK: - Hero buttons
+#endif

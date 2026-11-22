@@ -1,0 +1,793 @@
+require "base64"
+require "shellwords"
+
+# iOS and tvOS release automation. CI reserves each platform's build number
+# before launching parallel TestFlight builds. Signing credentials come from
+# the environment; bundle identifiers match the checked-in Apple targets.
+
+default_platform(:ios)
+
+# ── Private helpers ──────────────────────────────────────────────────────────
+
+# Loads the App Store Connect API key.
+#
+# CI path:   base64-decode APP_STORE_CONNECT_API_KEY_KEY env var.
+# Local path: read ~/.appstoreconnect/AuthKey_<KEY_ID>.p8 from disk.
+#
+# Returns the api_key hash produced by app_store_connect_api_key() so callers
+# can pass it explicitly to actions that accept api_key:.
+private_lane :setup_api_key do
+  key_id     = ENV["APP_STORE_CONNECT_API_KEY_KEY_ID"]
+  issuer_id  = ENV["APP_STORE_CONNECT_API_KEY_ISSUER_ID"]
+  key_base64 = ENV["APP_STORE_CONNECT_API_KEY_KEY"]
+
+  if key_base64 && !key_base64.empty?
+    # CI: key content is stored as a base64-encoded environment variable.
+    # Encode with: base64 < AuthKey_XXXX.p8 | tr -d '\n'
+    key_content = Base64.decode64(key_base64)
+  else
+    # Local dev: read the .p8 file from the standard App Store Connect location.
+    p8_path = File.expand_path("~/.appstoreconnect/AuthKey_#{key_id}.p8")
+    UI.user_error!(
+      "ASC API key not found at #{p8_path}. " \
+      "Either place the .p8 file there or set APP_STORE_CONNECT_API_KEY_KEY."
+    ) unless File.exist?(p8_path)
+    key_content = File.read(p8_path)
+  end
+
+  app_store_connect_api_key(
+    key_id:      key_id,
+    issuer_id:   issuer_id,
+    key_content: key_content,
+    in_house:    false,
+    duration:    1200          # Max allowed by Apple — avoids expiry during slow SPM steps
+  )
+end
+
+def env_list(name)
+  ENV[name].to_s.split(",").map(&:strip).reject(&:empty?)
+end
+
+def env_truthy?(name, default:)
+  value = ENV[name]
+  return default if value.nil? || value.strip.empty?
+
+  %w[1 true yes y on].include?(value.strip.downcase)
+end
+
+# Returns an xcarg fragment that overrides MARKETING_VERSION when the CI-provided
+# env var is set; empty string otherwise (local builds keep the project.yml value).
+#
+# The value is appended to xcodebuild's xcargs as a shell string, so it must be a
+# plain dotted version (e.g. 1.4.0). Rejecting anything else here is the last gate
+# against a value with spaces or shell metacharacters injecting extra build
+# settings ("1.4.0 CURRENT_PROJECT_VERSION=999") or running commands on the
+# signing runner ("1.2.3$(cmd)"). CI also validates this in resolve-marketing-version.sh.
+def injected_marketing_version
+  value = ENV["MARKETING_VERSION"].to_s.strip
+  return nil if value.empty?
+
+  unless value.match?(/\A\d+(?:\.\d+){1,2}\z/)
+    UI.user_error!("Invalid MARKETING_VERSION #{value.inspect}; expected a dotted version like 1.4.0")
+  end
+  value
+end
+
+def marketing_version_xcarg
+  value = injected_marketing_version
+  value ? "MARKETING_VERSION=#{value} " : ""
+end
+
+# Returns the CI-injected BUILD_NUMBER, or nil when it is unset or blank.
+#
+# The release workflow passes the build number its prepare job picked for both
+# platforms; the sideload workflow passes its run number. The value flows
+# into xcodebuild's xcargs as CURRENT_PROJECT_VERSION, a shell string, so it
+# must be a plain integer with no spaces or shell metacharacters (same threat
+# model as marketing_version_xcarg).
+def injected_build_number
+  value = ENV["BUILD_NUMBER"].to_s.strip
+  return nil if value.empty?
+
+  unless value.match?(/\A\d+\z/) && value.to_i.positive?
+    UI.user_error!("Invalid BUILD_NUMBER #{value.inspect}; expected a positive integer")
+  end
+  value
+end
+
+# CI restores package downloads at this path; local lanes use Xcode's default
+# when the variable is unset. Every resolve and build must use the same path.
+def source_packages_path
+  value = ENV["SILO_SOURCE_PACKAGES_PATH"].to_s.strip
+  value.empty? ? nil : File.expand_path(value)
+end
+
+def locked_package_xcargs
+  args = %w[-disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile]
+  path = source_packages_path
+  args.concat(["-clonedSourcePackagesDirPath", path]) if path
+  "#{args.shelljoin} "
+end
+
+def resolve_source_packages(project:, scheme:)
+  args = ["xcodebuild", "-project", project, "-scheme", scheme,
+          "-resolvePackageDependencies", "-disableAutomaticPackageResolution",
+          "-onlyUsePackageVersionsFromResolvedFile"]
+  path = source_packages_path
+  args.concat(["-clonedSourcePackagesDirPath", path]) if path
+  sh(*args)
+end
+
+# Optional CURRENT_PROJECT_VERSION override for the unsigned sideload lanes, so
+# each sideload build carries a distinct CFBundleVersion. Empty when
+# BUILD_NUMBER is unset: local builds keep the project.yml value.
+def build_number_xcarg
+  value = injected_build_number
+  value ? "CURRENT_PROJECT_VERSION=#{value} " : ""
+end
+
+# Returns an xcarg fragment that stamps this build's published source archive
+# (SILO_RELEASE_SOURCE_URL, set by release-source.yml) into SILO_SOURCE_URL. The
+# app links it from Settings > About > Source Code; without it the app links
+# the repository. Same threat model as marketing_version_xcarg: the value joins
+# xcodebuild's xcargs as a shell string, so only the exact release-asset shape
+# release-source.yml uploads is accepted. The tag segment allows `+` and its
+# `%2B` encoding for single-platform tags such as v1.4.0+ios.
+SOURCE_ARCHIVE_URL = %r{\Ahttps://github\.com/Silo-Server/silo-apple/releases/download/[A-Za-z0-9._%+-]+/Silo-source-[0-9a-f]{40}\.tar\.gz\z}
+
+def source_url_xcarg
+  value = ENV["SILO_RELEASE_SOURCE_URL"].to_s.strip
+  return "" if value.empty?
+
+  unless value.match?(SOURCE_ARCHIVE_URL)
+    UI.user_error!("Invalid SILO_RELEASE_SOURCE_URL #{value.inspect}; expected a Silo-source-<commit>.tar.gz release asset of Silo-Server/silo-apple")
+  end
+  "SILO_SOURCE_URL=#{value} "
+end
+
+# Overrides the SILO_BUILD_CHANNEL build setting (project.yml default: release)
+# for the unsigned sideload lanes. It reaches the app as the SiloBuildChannel
+# Info.plist key and is reported to the server as X-Silo-Client-Channel, so an
+# operator can tell a re-signed sideload build from the TestFlight build of the
+# same marketing version + build number. Constant, not env-derived: there is no
+# untrusted input to validate.
+SIDELOAD_CHANNEL_XCARG = "SILO_BUILD_CHANNEL=sideload ".freeze
+
+# Turns off the user-independent keychain for the unsigned tvOS sideload lane.
+# SiloTV.xcconfig and SiloTVTopShelf.xcconfig default SILO_USER_INDEPENDENT_KEYCHAIN
+# to YES for builds that carry the user-management entitlement
+# (runs-as-current-user-with-user-independent-keychain). The sideload archive
+# has no entitlements, and re-signers generally cannot grant that one, so the
+# flag goes off here, as Local.xcconfig.sample does for Personal Team builds.
+# Constant, not env-derived, like SIDELOAD_CHANNEL_XCARG.
+TVOS_SIDELOAD_KEYCHAIN_XCARG = "SILO_USER_INDEPENDENT_KEYCHAIN=NO ".freeze
+
+# Returns the build number to stamp on a TestFlight build.
+#
+# In CI the release workflow picks one number for both platforms once and passes
+# it to the (parallel) ios/tvos jobs via BUILD_NUMBER — so the two jobs never
+# race latest_testflight_build_number against each other. Local and
+# ad-hoc runs leave BUILD_NUMBER unset and fall back to querying App Store
+# Connect directly. injected_build_number validates the injected value.
+def resolve_build_number(api_key:, app_identifier:, platform:)
+  injected = injected_build_number
+  if injected
+    UI.message("Using injected BUILD_NUMBER=#{injected} for #{platform}")
+    return injected.to_i
+  end
+
+  latest_testflight_build_number(
+    api_key:        api_key,
+    app_identifier: app_identifier,
+    platform:       platform
+  ) + 1
+end
+
+# Regenerates Silo.xcodeproj from project.yml and resolves SPM packages for the
+# given scheme. Shared by the unsigned IPA lanes.
+# Returns the absolute iosApp directory.
+#
+# Note: testflight_release intentionally does NOT use this helper — it interleaves
+# match() and the build-number query between xcodegen and resolvePackageDependencies,
+# so the three steps are not contiguous there.
+def prepare_xcode_project(scheme:)
+  ios_app_dir = File.expand_path("../iosApp", __dir__)
+  sh("xcodegen generate --spec '#{ios_app_dir}/project.yml'")
+  resolve_source_packages(project: "#{ios_app_dir}/Silo.xcodeproj", scheme: scheme)
+  ios_app_dir
+end
+
+# Fails the lane if the .app or .ipa embeds the subtitle libraries as framework
+# wrappers instead of linking them statically (scripts/ci/validate-subtitle-packaging.py).
+# product is relative to the repo root or absolute. Every TestFlight and unsigned
+# IPA lane runs it.
+def validate_subtitle_packaging(product)
+  script = File.expand_path("../scripts/ci/validate-subtitle-packaging.py", __dir__)
+  product_path = File.expand_path(product, File.expand_path("..", __dir__))
+  sh("python3", script, product_path)
+end
+
+# Repackages a compiled .app from an unsigned .xcarchive into an unsigned .ipa.
+#
+# An .ipa is just a zip with the app under Payload/. We build the archive with
+# code signing disabled (no certs, no match, no ASC secrets needed) and wrap the
+# product here. The resulting IPA is NOT installable as-is — it is meant to be
+# re-signed by the end user with their own certificate via AltStore, Sideloadly,
+# SideStore, etc. before sideloading. See docs/release/sideloading.md.
+def package_unsigned_ipa(archive_path:, app_name:, output_dir:, output_ipa:)
+  app_path = "#{archive_path}/Products/Applications/#{app_name}.app"
+  UI.user_error!("Expected app not found at #{app_path}") unless File.exist?(app_path)
+  validate_subtitle_packaging(app_path)
+
+  # zip must run from output_dir so the archive root is Payload/, not an
+  # absolute path. Rebuild Payload/ from scratch each run for idempotency.
+  sh(<<~SH)
+    set -euo pipefail
+    cd #{output_dir.shellescape}
+    rm -rf Payload #{output_ipa.shellescape}
+    mkdir Payload
+    cp -R #{app_path.shellescape} Payload/
+    zip -qry #{output_ipa.shellescape} Payload
+    rm -rf Payload
+  SH
+
+  UI.success("Unsigned IPA written to #{output_dir}/#{output_ipa}")
+end
+
+def testflight_distribution
+  mode = ENV.fetch("TESTFLIGHT_DISTRIBUTION", "internal").strip.downcase
+
+  case mode
+  when "", "internal", "private"
+    "internal"
+  when "external", "public"
+    "external"
+  else
+    UI.user_error!(
+      "Unsupported TESTFLIGHT_DISTRIBUTION=#{mode.inspect}. " \
+      "Use internal, public, or external."
+    )
+  end
+end
+
+def testflight_upload_config
+  distribution = testflight_distribution
+  internal_groups = env_list("TESTFLIGHT_INTERNAL_GROUPS")
+
+  return {
+    distribution: distribution,
+    groups: internal_groups.any? ? internal_groups : nil,
+    distribute_external: false,
+    notify_external_testers: false,
+  } if distribution == "internal"
+
+  external_groups = env_list("TESTFLIGHT_EXTERNAL_GROUPS")
+  UI.user_error!(
+    "TESTFLIGHT_EXTERNAL_GROUPS must be set to one or more external " \
+    "TestFlight group names when TESTFLIGHT_DISTRIBUTION is public/external."
+  ) if external_groups.empty?
+
+  {
+    distribution: distribution,
+    groups: external_groups,
+    distribute_external: true,
+    notify_external_testers: env_truthy?("TESTFLIGHT_NOTIFY_EXTERNAL_TESTERS", default: true),
+  }
+end
+
+def testflight_changelog
+  changelog = ENV["TESTFLIGHT_CHANGELOG"] || `git log -1 --pretty=format:"%s"`.strip
+  source_url = ENV["SILO_RELEASE_SOURCE_URL"].to_s.strip
+  if testflight_distribution == "external" && source_url.empty?
+    UI.user_error!("Publish the matching release source archive and set SILO_RELEASE_SOURCE_URL before external TestFlight distribution.")
+  end
+  source_url.empty? ? changelog : "#{changelog}\n\nSource and rebuild instructions: #{source_url}"
+end
+
+# ── TestFlight release ────────────────────────────────────────────────────────
+
+# Everything that differs between the iOS and tvOS TestFlight builds.
+# testflight_release reads one entry; sync_signing reads every entry's targets.
+#
+# match_platform:        match's platform ("ios" / "tvos").
+# build_number_platform: latest_testflight_build_number's platform. Each
+#                        platform has its own build-number sequence under
+#                        Universal Purchase ("appletvos" for tvOS).
+# targets:               every signed target in the archive, mapped to its
+#                        bundle ID, app first. Each needs its own App Store
+#                        profile: the bundle IDs differ, and so do the
+#                        entitlements declared on each App ID (the notification
+#                        service extension has its own App Group; the tvOS app
+#                        and Top Shelf both need App Group + Keychain Sharing).
+#                        match, update_code_signing_settings and export_options
+#                        all see the targets in this order.
+TESTFLIGHT_PLATFORMS = {
+  ios: {
+    match_platform:        "ios",
+    build_number_platform: "ios",
+    scheme:                "Silo",
+    destination:           "generic/platform=iOS",
+    output_directory:      "build/ios",
+    output_name:           "Silo.ipa",
+    targets: {
+      "Silo"                    => "org.siloserver.silo",
+      "SiloNotificationService" => "org.siloserver.silo.NotificationService",
+      "SiloDownloadsActivity"   => "org.siloserver.silo.DownloadsActivity",
+    }.freeze,
+  }.freeze,
+  tvos: {
+    match_platform:        "tvos",
+    build_number_platform: "appletvos",
+    scheme:                "SiloTV",
+    destination:           "generic/platform=tvOS",
+    output_directory:      "build/tvos",
+    output_name:           "SiloTV.ipa",
+    targets: {
+      "SiloTV"         => "org.siloserver.silo",
+      "SiloTVTopShelf" => "org.siloserver.silo.topshelf",
+    }.freeze,
+  }.freeze,
+}.freeze
+
+# Builds one platform's app with App Store signing and uploads it to TestFlight.
+# beta_ios and beta_tvos call this with :ios and :tvos.
+def testflight_release(platform)
+  config     = TESTFLIGHT_PLATFORMS.fetch(platform)
+  targets    = config[:targets]
+  bundle_ids = targets.values
+  app_id     = bundle_ids.first
+  defer_distribution = env_truthy?("SILO_DEFER_TESTFLIGHT_DISTRIBUTION", default: false)
+  if defer_distribution
+    UI.user_error!("MARKETING_VERSION is required for deferred TestFlight upload") unless injected_marketing_version
+    UI.user_error!("BUILD_NUMBER is required for deferred TestFlight upload") unless injected_build_number
+  end
+
+  # setup_ci creates a temporary keychain on CI runners; no-op locally.
+  setup_ci if is_ci
+
+  api_key = setup_api_key
+  team_id = ENV["TEAM_ID"]
+  # The release workflow always sets TESTFLIGHT_DISTRIBUTION=external (see
+  # .github/workflows/release.yml): every tag and manual dispatch distributes
+  # to TESTFLIGHT_EXTERNAL_GROUPS and notifies testers. Internal remains the
+  # default only for ad-hoc local runs with the env var unset.
+  testflight_upload = testflight_upload_config
+  # Apple requires a "What to Test" note for every external group build.
+  # Set TESTFLIGHT_CHANGELOG in CI variables for an explicit note;
+  # falls back to the latest git commit subject when not set.
+  changelog   = testflight_changelog
+  ios_app_dir = File.expand_path("../iosApp", __dir__)
+  project     = "#{ios_app_dir}/Silo.xcodeproj"
+  UI.message("TestFlight distribution: #{testflight_upload[:distribution]}")
+
+  # Regenerate Silo.xcodeproj from project.yml first. update_code_signing_settings
+  # below writes each target's profile into the generated project, so xcodegen
+  # must not run again after it. match writes nothing to the project: it
+  # installs the certs and profiles and records their names in lane_context.
+  sh("xcodegen generate --spec '#{ios_app_dir}/project.yml'")
+
+  # Sync the distribution cert and a profile for every signed target. CI is
+  # read-only; run sync_signing locally to create or renew them.
+  match(
+    type:           "appstore",
+    platform:       config[:match_platform],
+    app_identifier: bundle_ids,
+    readonly:       is_ci,
+    api_key:        api_key
+  )
+
+  # Injected by CI's release workflow, or queried directly for local runs.
+  build_number = resolve_build_number(
+    api_key:        api_key,
+    app_identifier: app_id,
+    platform:       config[:build_number_platform]
+  )
+
+  # Resolve SPM packages before building.
+  resolve_source_packages(project: project, scheme: config[:scheme])
+
+  # Profile name for each of this platform's bundle IDs, from match.
+  profile_map = lane_context[SharedValues::MATCH_PROVISIONING_PROFILE_MAPPING]
+  profiles    = bundle_ids.to_h { |bundle_id| [bundle_id, profile_map[bundle_id]] }
+
+  # Patch signing settings per target in the regenerated Xcode project.
+  # xcodebuild needs a per-target PROVISIONING_PROFILE_SPECIFIER during the
+  # archive step; a single global xcarg would apply the app's profile to the
+  # extension targets (different bundle ID → signing failure).
+  targets.each do |target, bundle_id|
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path:                  project,
+      targets:               [target],
+      code_sign_identity:    "Apple Distribution",
+      profile_name:          profiles[bundle_id],
+      team_id:               team_id
+    )
+  end
+
+  ipa = "#{config[:output_directory]}/#{config[:output_name]}"
+
+  build_app(
+    project:          project,
+    scheme:           config[:scheme],
+    destination:      config[:destination],
+    export_method:    "app-store",
+    output_directory: config[:output_directory],
+    output_name:      config[:output_name],
+    cloned_source_packages_path: source_packages_path,
+    skip_package_dependencies_resolution: true,
+    disable_package_automatic_updates: true,
+    build_timing_summary: true,
+    # PROVISIONING_PROFILE_SPECIFIER is intentionally absent from xcargs —
+    # a global value would override every target with the same profile.
+    # Per-target settings were written above via update_code_signing_settings.
+    # Gym emits the package directory and disabled automatic resolution from
+    # the options above. This extra flag makes a stale/missing lockfile fail.
+    xcargs: "-onlyUsePackageVersionsFromResolvedFile #{marketing_version_xcarg}#{source_url_xcarg}" \
+            "CODE_SIGN_STYLE=Manual " \
+            "CODE_SIGN_IDENTITY='Apple Distribution' " \
+            "CURRENT_PROJECT_VERSION=#{build_number} " \
+            "DEVELOPMENT_TEAM=#{team_id}",
+    # export_options.provisioningProfiles maps each bundle ID to its profile
+    # name for the IPA packaging step (separate from the archive step above).
+    export_options: {
+      method:               "app-store",
+      signingStyle:         "manual",
+      provisioningProfiles: profiles
+    }
+  )
+
+  validate_subtitle_packaging(ipa)
+
+  upload_to_testflight(
+    api_key:                 api_key,
+    app_identifier:          app_id,
+    app_platform:            config[:build_number_platform],
+    ipa:                     ipa,
+    # With a changelog, Pilot still waits for the build to appear even when
+    # skip_waiting_for_build_processing is true. The distribution lane supplies
+    # the notes and groups after this upload has released the macOS runner.
+    changelog:               defer_distribution ? nil : changelog,
+    groups:                  defer_distribution ? nil : testflight_upload[:groups],
+    distribute_external:     defer_distribution ? false : testflight_upload[:distribute_external],
+    notify_external_testers: defer_distribution ? false : testflight_upload[:notify_external_testers],
+    skip_submission:        defer_distribution,
+    skip_waiting_for_build_processing: defer_distribution
+  )
+end
+
+def required_testflight_groups(app, distribution)
+  requested = distribution[:groups] || []
+  return [] if requested.empty?
+
+  available = app.get_beta_groups
+  requested.map do |name|
+    matches = available.select { |group| group.id == name || group.name == name }
+    unless matches.length == 1
+      UI.user_error!("TestFlight group #{name.inspect} is missing or ambiguous for this app")
+    end
+    group = matches.first
+    unless group.is_internal_group == !distribution[:distribute_external]
+      UI.user_error!("TestFlight group #{name.inspect} has the wrong internal/external type")
+    end
+    group
+  end.uniq(&:id)
+end
+
+def matching_marketing_versions?(left, right)
+  values = [left, right].map do |value|
+    next unless value.to_s.match?(/\A\d+(?:\.\d+){1,2}\z/)
+    parts = value.split(".").map(&:to_i)
+    parts << 0 if parts.length == 2
+    parts
+  end
+  values.first && values.first == values.last
+end
+
+def validate_testflight_build(app:, build:, platform:, version:, build_number:)
+  asc_platform = Spaceship::ConnectAPI::Platform.map(platform)
+  unless build && build.app && build.app.id == app.id &&
+         matching_marketing_versions?(build.app_version, version) &&
+         build.version.to_s.match?(/\A\d+\z/) && build.version.to_i == build_number.to_i &&
+         build.platform == asc_platform &&
+         build.processing_state == "VALID" && build.expired != true
+    UI.user_error!("TestFlight returned a mismatched, invalid, or expired build for #{platform} #{version} (#{build_number})")
+  end
+end
+
+def verify_testflight_distribution(app:, build:, platform:, version:, build_number:, groups:, distribution:)
+  refreshed = Spaceship::ConnectAPI::Build.get(build_id: build.id)
+  UI.user_error!("TestFlight returned the wrong build ID") unless refreshed && refreshed.id == build.id
+  validate_testflight_build(app: app, build: refreshed, platform: platform, version: version, build_number: build_number)
+
+  groups.each do |group|
+    unless group.fetch_builds.any? { |associated| associated.id == build.id }
+      UI.user_error!("TestFlight build #{version} (#{build_number}) is missing from group #{group.name.inspect}")
+    end
+  end
+  if distribution[:distribute_external]
+    details = refreshed.build_beta_detail
+    unless details && details.auto_notify_enabled == distribution[:notify_external_testers]
+      UI.user_error!("TestFlight notification preference was not applied to #{version} (#{build_number})")
+    end
+  end
+end
+
+# Runs on Linux after upload. Requiring both inputs prevents Pilot from selecting
+# the latest build when an upload is delayed or fails. No signing or Xcode actions
+# belong here, and this lane never allocates another build number.
+def distribute_testflight_release(platform)
+  config = TESTFLIGHT_PLATFORMS.fetch(platform)
+  version = injected_marketing_version
+  build = injected_build_number
+  UI.user_error!("MARKETING_VERSION is required for TestFlight distribution") unless version
+  UI.user_error!("BUILD_NUMBER is required for TestFlight distribution") unless build
+  distribution = testflight_upload_config
+  changelog = testflight_changelog
+  # Validate the release archive URL without sending an invalid link to testers.
+  source_url_xcarg
+
+  api_key = setup_api_key
+  app_id = config[:targets].values.first
+  app = Spaceship::ConnectAPI::App.find(app_id)
+  UI.user_error!("TestFlight app #{app_id} was not found") unless app
+  # Pilot ignores groups it cannot find. Resolve and validate every requested
+  # group before distribution, then verify membership of the pinned build.
+  groups = required_testflight_groups(app, distribution)
+
+  # Fastlane's distribute_only action discards the watched build and queries
+  # again with the raw version. Apple treats 1.4 and 1.4.0 (and leading zeros)
+  # as equivalent. Keep the exact watched build instead, and reject ambiguous
+  # matches. These Pilot APIs are pinned by Gemfile.lock.
+  require "pilot" unless defined?(Pilot::BuildManager)
+  options = FastlaneCore::Configuration.create(Pilot::Options.available_options,
+    api_key: api_key,
+    app_identifier: app_id,
+    app_platform: config[:build_number_platform],
+    app_version: version,
+    build_number: build,
+    distribute_only: true,
+    skip_submission: false,
+    skip_waiting_for_build_processing: false,
+    # The Linux jobs allow 45 minutes; keep 5 minutes for setup and distribution.
+    wait_processing_timeout_duration: 2400,
+    changelog: changelog,
+    groups: groups.empty? ? nil : groups.map(&:id),
+    distribute_external: distribution[:distribute_external],
+    notify_external_testers: distribution[:notify_external_testers]
+  )
+  manager = Pilot::BuildManager.new
+  manager.start(options)
+  processed_build = FastlaneCore::BuildWatcher.wait_for_build_processing_to_be_complete(
+    app_id: app.id,
+    platform: config[:build_number_platform],
+    app_version: version,
+    build_version: build,
+    poll_interval: options[:wait_processing_interval],
+    timeout_duration: options[:wait_processing_timeout_duration],
+    return_when_build_appears: false,
+    return_spaceship_testflight_build: false,
+    select_latest: false,
+    wait_for_build_beta_detail_processing: true
+  )
+  validate_testflight_build(
+    app: app, build: processed_build, platform: config[:build_number_platform], version: version, build_number: build
+  )
+  manager.distribute(options, build: processed_build)
+  verify_testflight_distribution(
+    app: app,
+    build: processed_build,
+    platform: config[:build_number_platform],
+    version: version,
+    build_number: build,
+    groups: groups,
+    distribution: distribution
+  )
+end
+
+# ── CI keychain teardown ──────────────────────────────────────────────────────
+#
+# setup_ci creates fastlane_tmp_keychain and makes it the user default. With
+# no teardown, an interrupted lane leaves the temp keychain as the permanent
+# user default; once its file is later removed, macOS pops "Keychain Not
+# Found" prompts at random for unrelated apps on the runner. Snapshot the
+# original state before any lane runs and restore it on success and error.
+#
+# Keychains only exist on macOS; the next_build_number lane runs on a
+# Linux runner where `security` is absent, so gate every hook on mac? too.
+
+API_ONLY_LANES = %i[next_build_number distribute_ios distribute_tvos].freeze
+
+def ci_keychain_managed?(lane)
+  is_ci && FastlaneCore::Helper.mac? && !API_ONLY_LANES.include?(lane.to_sym)
+end
+
+before_all do |lane, _options|
+  ENV["FL_CI_KEYCHAIN_MANAGED"] = ci_keychain_managed?(lane).to_s
+  next unless ENV["FL_CI_KEYCHAIN_MANAGED"] == "true"
+  ENV["FL_ORIG_DEFAULT_KC"] = `security default-keychain -d user`.scan(/"([^"]+)"/).flatten.first.to_s
+  ENV["FL_ORIG_KC_LIST"]    = `security list-keychains   -d user`.scan(/"([^"]+)"/).flatten.join(":")
+end
+
+after_all do |_lane, _options|
+  restore_ci_keychain_state if ENV["FL_CI_KEYCHAIN_MANAGED"] == "true"
+end
+
+error do |_lane, _exception, _options|
+  # A private-lane error can change the lane name passed here. Cleanup belongs
+  # only to invocations whose before_all actually captured the keychain state.
+  restore_ci_keychain_state if ENV["FL_CI_KEYCHAIN_MANAGED"] == "true"
+end
+
+# Each step is independently rescued so a failure in one doesn't abort the
+# others — the search-list restore is the load-bearing recovery for the
+# original "Keychain Not Found" symptom and must run even if the default
+# restore fails.
+def restore_ci_keychain_state
+  begin
+    delete_keychain(name: "fastlane_tmp_keychain")
+  rescue StandardError
+    # Already removed by another lane / the keychain sweeper — fine.
+  end
+
+  default = ENV["FL_ORIG_DEFAULT_KC"]
+  if default && !default.empty? && File.exist?(default)
+    begin
+      sh("security default-keychain -d user -s #{default.shellescape}")
+    rescue StandardError => e
+      UI.important("Failed to restore default keychain (#{default}): #{e.message}")
+    end
+  end
+
+  list = (ENV["FL_ORIG_KC_LIST"] || "").split(":").reject(&:empty?)
+  unless list.empty?
+    begin
+      sh("security list-keychains   -d user -s #{list.map(&:shellescape).join(' ')}")
+    rescue StandardError => e
+      UI.important("Failed to restore keychain search list: #{e.message}")
+    end
+  end
+end
+
+# ── iOS + tvOS ────────────────────────────────────────────────────────────────
+
+platform :ios do
+
+  # ── Signing maintenance ───────────────────────────────────────────────────
+
+  desc "Generate/refresh all App Store provisioning profiles in the Match repo (run locally, read-write)"
+  lane :sync_signing do
+    api_key = setup_api_key
+
+    # One read-write match per platform (iOS, then tvOS), covering every target
+    # testflight_release signs: iOS has the app plus the notification service
+    # and downloads Live Activity extensions; tvOS has the app plus Top Shelf.
+    TESTFLIGHT_PLATFORMS.each_value do |config|
+      match(
+        type:           "appstore",
+        platform:       config[:match_platform],
+        app_identifier: config[:targets].values,
+        readonly:       false,
+        api_key:        api_key
+      )
+    end
+  end
+
+  # ── TestFlight ────────────────────────────────────────────────────────────
+
+  desc "Build the iOS app and upload to TestFlight"
+  lane :beta_ios do
+    testflight_release(:ios)
+  end
+
+  desc "Build the tvOS app and upload to TestFlight"
+  lane :beta_tvos do
+    testflight_release(:tvos)
+  end
+
+  desc "Wait for the exact uploaded iOS build and distribute it to TestFlight groups"
+  lane :distribute_ios do
+    distribute_testflight_release(:ios)
+  end
+
+  desc "Wait for the exact uploaded tvOS build and distribute it to TestFlight groups"
+  lane :distribute_tvos do
+    distribute_testflight_release(:tvos)
+  end
+
+  # ── Build-number reservation ────────────────────────────────────────────────
+
+  desc "Print the next TestFlight build number, shared by iOS and tvOS (CI)"
+  lane :next_build_number do
+    # Query-only: no keychain/signing setup needed, so this runs on a plain
+    # Linux runner. One number for both platforms, so "1.0.0 (66)" names the
+    # same build on iPhone and Apple TV and in the release tag v1.0.0-beta.66.
+    api_key = setup_api_key
+    app_id  = "org.siloserver.silo"
+
+    latest = %w[ios appletvos].map do |platform|
+      latest_testflight_build_number(api_key: api_key, app_identifier: app_id, platform: platform)
+    end.max
+
+    # Emit a key=value line to BUILD_NUMBERS_FILE (release.yml reads it back).
+    # Append so we never clobber other lines already there.
+    out = ENV.fetch("BUILD_NUMBERS_FILE", "build_numbers.env")
+    File.open(out, "a") { |f| f.puts "next_build=#{latest + 1}" }
+    UI.success("Next build number for iOS and tvOS: #{latest + 1}")
+  end
+
+  # ── Unsigned IPAs for third-party signing / sideloading ─────────────────────
+  #
+  # These lanes build an installable-once-re-signed IPA with NO code signing:
+  # no match, no distribution cert, no App Store Connect key. The user re-signs
+  # the artifact with their own account (AltStore / Sideloadly / SideStore / etc.)
+  # before sideloading. Because nothing is uploaded and no secrets are read, they
+  # run on any macOS runner without release credentials. See
+  # docs/release/sideloading.md for the caveats (entitlement remapping, 7-day
+  # free-account expiry, and the tvOS host-pairing / Top Shelf notes).
+
+  desc "Build an unsigned iOS IPA for third-party signing / sideloading (no upload)"
+  lane :ipa_ios_unsigned do
+    ios_app_dir  = prepare_xcode_project(scheme: "Silo")
+    output_dir   = File.expand_path("../build/ios-unsigned", __dir__)
+    archive_path = "#{output_dir}/Silo.xcarchive"
+
+    # Archive with signing disabled — no certs required. CURRENT_PROJECT_VERSION
+    # comes from CI when set; local runs fall back to the project.yml value.
+    xcodebuild(
+      archive:      true,
+      project:      "#{ios_app_dir}/Silo.xcodeproj",
+      scheme:       "Silo",
+      destination:  "generic/platform=iOS",
+      archive_path: archive_path,
+      xcargs:       "#{locked_package_xcargs}-showBuildTimingSummary " \
+                    "#{marketing_version_xcarg}#{build_number_xcarg}#{source_url_xcarg}" \
+                    "#{SIDELOAD_CHANNEL_XCARG}" \
+                    "CODE_SIGNING_ALLOWED=NO " \
+                    "CODE_SIGNING_REQUIRED=NO " \
+                    "CODE_SIGN_IDENTITY='' " \
+                    "CODE_SIGN_ENTITLEMENTS=''"
+    )
+
+    package_unsigned_ipa(
+      archive_path: archive_path,
+      app_name:     "Silo",
+      output_dir:   output_dir,
+      output_ipa:   "Silo-unsigned.ipa"
+    )
+  end
+
+  desc "Build an unsigned tvOS IPA for third-party signing / sideloading (no upload)"
+  lane :ipa_tvos_unsigned do
+    ios_app_dir  = prepare_xcode_project(scheme: "SiloTV")
+    output_dir   = File.expand_path("../build/tvos-unsigned", __dir__)
+    archive_path = "#{output_dir}/SiloTV.xcarchive"
+
+    # The embedded Top Shelf extension is archived as part of SiloTV.app, so no
+    # per-target signing handling is needed here. Re-signers that cannot sign the
+    # extension (e.g. free accounts) can strip it before sideloading.
+    xcodebuild(
+      archive:      true,
+      project:      "#{ios_app_dir}/Silo.xcodeproj",
+      scheme:       "SiloTV",
+      destination:  "generic/platform=tvOS",
+      archive_path: archive_path,
+      xcargs:       "#{locked_package_xcargs}-showBuildTimingSummary " \
+                    "#{marketing_version_xcarg}#{build_number_xcarg}#{source_url_xcarg}" \
+                    "#{SIDELOAD_CHANNEL_XCARG}" \
+                    "#{TVOS_SIDELOAD_KEYCHAIN_XCARG}" \
+                    "CODE_SIGNING_ALLOWED=NO " \
+                    "CODE_SIGNING_REQUIRED=NO " \
+                    "CODE_SIGN_IDENTITY='' " \
+                    "CODE_SIGN_ENTITLEMENTS=''"
+    )
+
+    package_unsigned_ipa(
+      archive_path: archive_path,
+      app_name:     "SiloTV",
+      output_dir:   output_dir,
+      output_ipa:   "SiloTV-unsigned.ipa"
+    )
+  end
+
+end

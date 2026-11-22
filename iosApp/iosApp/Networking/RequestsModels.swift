@@ -1,0 +1,275 @@
+import Foundation
+
+// MARK: - Wire enums
+
+/// A string enum that decodes an unrecognized wire value as `fallback`
+/// instead of failing the whole payload.
+protocol FallbackDecodable: RawRepresentable<String>, Decodable {
+    static var fallback: Self { get }
+}
+
+extension FallbackDecodable {
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: raw) ?? .fallback
+    }
+}
+
+/// Media type for the requests domain (TMDB-shaped: movies + series only).
+/// `.all` exists solely as a search-filter query value; the server never
+/// returns it on a result. Unrecognized values decode as `.unknown` so a
+/// future server addition can't fail the whole payload.
+enum RequestMediaType: String, Codable, Hashable, CaseIterable, Identifiable, FallbackDecodable {
+    case movie
+    case series
+    case all
+    case unknown
+
+    var id: Self { self }
+
+    static var fallback: Self { .unknown }
+
+    var displayName: String {
+        switch self {
+        case .movie: "Movie"
+        case .series: "Series"
+        case .all: "All"
+        case .unknown: "Title"
+        }
+    }
+}
+
+/// Lifecycle status of a request (or of one fulfillment target). `failed`
+/// only appears on targets; requests express failure via `outcome`.
+enum RequestStatus: String, Codable, Hashable, FallbackDecodable {
+    case pending
+    case approved
+    case queued
+    case downloading
+    case completed
+    case failed
+    case unknown
+
+    static var fallback: Self { .unknown }
+}
+
+/// Terminal-vs-active axis, orthogonal to `RequestStatus`: a declined or
+/// cancelled request keeps its last status but flips its outcome.
+enum RequestOutcome: String, Codable, Hashable, FallbackDecodable {
+    case active
+    case declined
+    case cancelled
+    case failed
+    case unknown
+
+    static var fallback: Self { .unknown }
+}
+
+/// The one state the server says to show a user for a request (v2 `state`),
+/// derived from its status, outcome, servers and library presence. It is
+/// what `status` and `outcome` can't say on their own: a finished download
+/// the library hasn't picked up yet is `processing`, not `available`. Older
+/// servers omit it, so the models carry it as optional; an unrecognized
+/// value decodes as `.unknown`, and both mean "fall back to `status` and
+/// `outcome`".
+enum RequestUserState: String, Codable, Hashable, FallbackDecodable {
+    case pending
+    case approved
+    case processing
+    /// Some of a season request's seasons are in the library, not all.
+    case partiallyAvailable = "partially_available"
+    case available
+    case declined
+    case cancelled
+    case failed
+    case unknown
+
+    static var fallback: Self { .unknown }
+}
+
+enum RequestAvailability: String, Codable, Hashable, FallbackDecodable {
+    case missing
+    case available
+    case unknown
+
+    static var fallback: Self { .unknown }
+}
+
+// MARK: - Feature status
+
+/// `GET /api/v2/requests/status` — drives every entry point's visibility.
+/// The contract requires `allowed`; it decodes as optional so a response
+/// that omits it fails closed ("not allowed") instead of failing to decode.
+struct RequestsFeatureStatus: Decodable {
+    let requestsEnabled: Bool
+    let state: String
+    let allowed: Bool?
+    /// The server offers `PUT`/`DELETE /api/v2/requests/follows/…`, so a
+    /// viewer can ask to hear when someone else's request lands. Absent on
+    /// older servers, which reads as unsupported.
+    var followSupported: Bool? = nil
+
+    /// The feature is on and this profile may use it. A blocked account sees
+    /// `requests_enabled: true` with `allowed: false`.
+    var isAvailable: Bool {
+        requestsEnabled && allowed == true && state == "available"
+    }
+}
+
+// MARK: - Search / discover results
+
+/// The compact per-item request state embedded on every search/discover/
+/// detail result, computed server-side for the signed-in user — the client
+/// never has to reason about duplicates or quotas itself.
+struct RequestState: Codable, Hashable {
+    let status: RequestStatus?
+    /// The active request's user-facing state; absent on older servers.
+    let state: RequestUserState?
+    let requestable: Bool
+    /// Raw server token (`already_requested`, `quota_exceeded`, …) when not
+    /// requestable. Translated to copy via `RequestErrorCopy` — never
+    /// rendered verbatim.
+    let reason: String?
+    let requestId: String?
+    /// The viewer hears when the title becomes available: they requested it
+    /// or follow it. Absent on older servers.
+    var following: Bool? = nil
+    /// The viewing profile made the active request, so there is nothing to
+    /// follow. Absent on older servers.
+    var requestedByViewer: Bool? = nil
+}
+
+/// One TMDB search/discover result annotated with this server's
+/// availability + request state.
+struct RequestMediaResult: Codable, Identifiable, Hashable {
+    let mediaType: RequestMediaType
+    let tmdbId: Int
+    let title: String
+    let year: Int?
+    let overview: String?
+    let posterPath: String?
+    let backdropPath: String?
+    let releaseDate: String?
+    let voteAverage: Double?
+    let availability: RequestAvailability
+    let libraryContentId: String?
+    /// Mutable so a follow toggle can patch the viewer's state in place.
+    var request: RequestState
+
+    var id: String { "\(mediaType.rawValue):\(tmdbId)" }
+}
+
+struct RequestMediaPage: Codable {
+    let page: Int
+    let totalPages: Int
+    let totalResults: Int
+    let results: [RequestMediaResult]
+}
+
+/// One curated TMDB carousel from `GET /api/v2/requests/discover`. Keys are
+/// server-fixed (`trending_movies`, `popular_series`, …).
+struct RequestDiscoverySection: Codable, Identifiable {
+    let key: String
+    let title: String
+    let page: Int
+    let totalPages: Int
+    let totalResults: Int
+    let results: [RequestMediaResult]
+    /// The provider page to ask for next when rating backfill consumed more
+    /// than one; absent when `page + 1` applies.
+    let nextPage: Int?
+
+    var id: String { key }
+}
+
+// MARK: - Detail
+
+/// Full TMDB detail for a requestable title, annotated like `RequestMediaResult`.
+/// The wire payload also carries a `cast` array — not modeled until a
+/// requests surface renders it.
+struct RequestMediaDetail: Codable {
+    let mediaType: RequestMediaType
+    let tmdbId: Int
+    let imdbId: String?
+    let tvdbId: Int?
+    let title: String
+    let tagline: String?
+    let overview: String?
+    let posterPath: String?
+    let backdropPath: String?
+    let releaseDate: String?
+    let year: Int?
+    let runtime: Int?
+    let genres: [String]?
+    let voteAverage: Double?
+    let voteCount: Int?
+    let contentRating: String?
+    let numberOfSeasons: Int?
+    let numberOfEpisodes: Int?
+    let networks: [String]?
+    let director: String?
+    let creators: [String]?
+    let recommendations: [RequestMediaResult]?
+    let availability: RequestAvailability
+    let libraryContentId: String?
+    /// Mutable so a follow toggle can patch the viewer's state in place.
+    var request: RequestState
+}
+
+// MARK: - Request records
+
+/// One fulfillment of a request against a single integration at a single
+/// quality; a request fans out to one target per resolved quality.
+struct RequestTarget: Codable, Hashable {
+    let quality: String?
+    let status: RequestStatus
+    let lastError: String?
+}
+
+/// Full request record from `/api/v2/requests/mine` and the create/cancel
+/// responses.
+struct MediaRequest: Codable, Identifiable, Hashable {
+    let id: String
+    let mediaType: RequestMediaType
+    let tmdbId: Int
+    let title: String
+    let year: Int?
+    let overview: String?
+    let posterPath: String?
+    let backdropPath: String?
+    let status: RequestStatus
+    let outcome: RequestOutcome
+    /// What to show the user; absent on older servers.
+    let state: RequestUserState?
+    let targets: [RequestTarget]?
+    let libraryContentId: String?
+    let lastError: String?
+    let createdAt: Date
+    let updatedAt: Date
+    let completedAt: Date?
+    /// When an admin (or auto-approval) approved it; drives the detail
+    /// page's stage timestamps. Defaulted so fixtures can omit it.
+    var approvedAt: Date? = nil
+    /// Who asked for it. Admin lists show the requester; `/requests/mine`
+    /// always names the signed-in user.
+    var requestedByUserId: String? = nil
+    var requestedByProfileId: String? = nil
+}
+
+// MARK: - Mutations
+
+struct CreateRequestInput: Encodable {
+    let mediaType: RequestMediaType
+    let tmdbId: Int
+    let tvdbId: Int?
+    let imdbId: String?
+    let title: String
+    let year: Int?
+    let overview: String?
+    let posterPath: String?
+    let backdropPath: String?
+}
+
+struct CancelRequestBody: Encodable {
+    let reason: String?
+}

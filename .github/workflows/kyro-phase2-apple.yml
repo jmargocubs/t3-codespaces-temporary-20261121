@@ -1,0 +1,45 @@
+name: Kyro Phase 2 Apple validation
+
+on:
+  push:
+    branches: [kyro-phase2-stable-integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode and generate project
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          cd iosApp
+          xcodegen generate
+      - name: Build iOS app
+        run: >-
+          xcodebuild -project iosApp/Silo.xcodeproj -scheme Silo
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Build tvOS app
+        run: >-
+          xcodebuild -project iosApp/Silo.xcodeproj -scheme SiloTV
+          -destination 'generic/platform=tvOS Simulator'
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Run Swift package tests, including Keychain tests
+        run: swift test --package-path Packages/KyroMediaCore -j 2
+      # Keep Phase 2 identity and launch regressions separate from the
+      # broader existing app test suite.
+      - name: Run iOS unit tests
+        run: >-
+          xcodebuild test -project iosApp/Silo.xcodeproj -scheme Silo
+          -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
+          -parallel-testing-enabled NO
+          -only-testing:SiloTests/KyroLocalIdentityRuntimeTests
+          -only-testing:SiloTests/RestoredSessionValidatorTests/testNoSiloServerCanResolveToKyroLocalProfilePicker
+          -only-testing:SiloTests/KyroIntroductionTests
+          CODE_SIGNING_ALLOWED=NO

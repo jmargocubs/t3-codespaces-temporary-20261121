@@ -1,0 +1,176 @@
+#if os(macOS)
+import AppKit
+import Foundation
+import SwiftUI
+
+struct MacPlayerControls: View {
+    let viewModel: PlayerViewModel
+    @Binding var isOptionsPresented: Bool
+    @Binding var selectedOptionsTab: MacPlayerOptionsPanel.Tab
+
+    // The title and format line live in the window's title bar, beside the
+    // back button, so the picture carries only the transport controls.
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            bottomControls
+        }
+        .padding(20)
+    }
+
+    private var bottomControls: some View {
+        VStack(spacing: 12) {
+            MacPlayerTimeline(viewModel: viewModel)
+
+            // Transport sits in the middle of the bar; options stay on the
+            // leading side and speed and full screen on the trailing side.
+            ZStack {
+                HStack(spacing: 10) {
+                    iconButton("captions.bubble", help: "Audio and subtitle options") {
+                        showOptions(.subtitles)
+                    }
+                    .disabled(!viewModel.hasTrackSelectionOptions)
+                    .opacity(viewModel.hasTrackSelectionOptions ? 1 : 0.45)
+
+                    iconButton("list.bullet", help: "Chapters") {
+                        showOptions(.chapters)
+                    }
+                    .disabled(viewModel.chapters.isEmpty)
+                    .opacity(viewModel.chapters.isEmpty ? 0.45 : 1)
+
+                    iconButton("speedometer", help: "Playback speed, stats and route") {
+                        showOptions(.playback)
+                    }
+
+                    if viewModel.hasQualityChoice {
+                        qualityButton
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Text(speedLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.70))
+                        .monospacedDigit()
+
+                    iconButton("arrow.up.left.and.arrow.down.right", help: "Fullscreen") {
+                        NSApp.keyWindow?.toggleFullScreen(nil)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    iconButton(
+                        SeekIntervalLabel.symbolName(.backward, seconds: viewModel.skipIntervals.backward),
+                        help: SeekIntervalLabel.accessibilityLabel(.backward, seconds: viewModel.skipIntervals.backward)
+                    ) {
+                        viewModel.skipBackward()
+                    }
+
+                    Button {
+                        viewModel.togglePlayPause()
+                    } label: {
+                        Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 18, weight: .semibold))
+                            .frame(width: 38, height: 32)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.black)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.white)
+                    )
+                    .help(viewModel.isPlaying ? "Pause" : "Play")
+
+                    iconButton(
+                        SeekIntervalLabel.symbolName(.forward, seconds: viewModel.skipIntervals.forward),
+                        help: SeekIntervalLabel.accessibilityLabel(.forward, seconds: viewModel.skipIntervals.forward)
+                    ) {
+                        viewModel.skipForward()
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(Color.black.opacity(0.42))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    private func iconButton(
+        _ systemName: String,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 31, height: 30)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+        )
+        .help(help)
+    }
+
+    /// Opens the options panel on `tab`. With the panel already open on
+    /// another tab it switches tabs; on the same tab it closes the panel.
+    private func showOptions(_ tab: MacPlayerOptionsPanel.Tab) {
+        let switchesTab = isOptionsPresented && selectedOptionsTab != tab
+        selectedOptionsTab = tab
+        if !switchesTab {
+            isOptionsPresented.toggle()
+        }
+    }
+
+    /// Opens the Quality tab and names the active choice, like the quality
+    /// pill on iOS.
+    private var qualityButton: some View {
+        Button {
+            showOptions(.quality)
+        } label: {
+            HStack(spacing: 6) {
+                if viewModel.isQualitySwitching {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "slider.horizontal.3")
+                }
+                Text(activeQualityLabel)
+                    .lineLimit(1)
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+        )
+        .help("Quality")
+        .accessibilityLabel("Playback Quality")
+        .accessibilityValue(activeQualityLabel)
+    }
+
+    private var activeQualityLabel: String {
+        viewModel.activeQualityOption?.label
+            ?? ApplePlaybackQuality.displayName(for: viewModel.activeQualityId)
+    }
+
+    private var speedLabel: String {
+        let speed = viewModel.settings.playbackSpeed
+        if abs(speed - 1.0) < 0.01 { return "1x" }
+        return String(format: "%.2gx", speed)
+    }
+}
+#endif

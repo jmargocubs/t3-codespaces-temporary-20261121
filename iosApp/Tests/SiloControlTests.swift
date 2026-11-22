@@ -1,0 +1,410 @@
+import XCTest
+@testable import Silo
+
+final class SiloControlTests: XCTestCase {
+    private func roundTrip(_ message: SiloControlMessage) throws -> SiloControlMessage {
+        let data = try JSONEncoder().encode(message)
+        return try JSONDecoder().decode(SiloControlMessage.self, from: data)
+    }
+
+    func testPingPongRoundTrip() throws {
+        XCTAssertEqual(try roundTrip(.ping), .ping)
+        XCTAssertEqual(try roundTrip(.pong), .pong)
+    }
+
+    func testVolumeMuteNextCommandsRoundTrip() throws {
+        let setVol = SiloControlCommand.setVolume(0.4)
+        XCTAssertEqual(try roundTrip(.control(setVol)), .control(setVol))
+        let mute = SiloControlCommand.setMuted(true)
+        XCTAssertEqual(try roundTrip(.control(mute)), .control(mute))
+        XCTAssertEqual(try roundTrip(.control(.playNext)), .control(.playNext))
+    }
+
+    func testProtocolNegotiatesHighestCommonVersion() {
+        XCTAssertEqual(SiloControlProtocol.negotiatedVersion(with: [1]), 1)
+        XCTAssertEqual(SiloControlProtocol.negotiatedVersion(with: [1, 2]), 2)
+        XCTAssertNil(SiloControlProtocol.negotiatedVersion(with: [3]))
+    }
+
+    func testRemoteIdentityHandoffMessagesRoundTrip() throws {
+        let offer = SiloControlHandoffOffer(
+            requestId: "request-1",
+            serverId: "server-1",
+            serverURL: "https://silo.example",
+            serverName: "Home",
+            profileId: "profile-1",
+            profileName: "Alex"
+        )
+        let challenge = SiloControlHandoffChallenge(
+            requestId: "request-1",
+            userCode: "ABCD-EFGH",
+            matchCode: "WXYZ",
+            expiresAt: "2026-07-09T20:00:00Z"
+        )
+        let ready = SiloControlHandoffReady(
+            requestId: "request-1",
+            serverId: "server-1",
+            profileId: "profile-1",
+            sessionExpiresAt: "2026-07-10T20:00:00Z",
+            reused: false
+        )
+        let cancel = SiloControlHandoffCancel(
+            requestId: "request-1",
+            reason: "denied",
+            message: "The handoff was denied."
+        )
+
+        XCTAssertEqual(try roundTrip(.handoffOffer(offer)), .handoffOffer(offer))
+        XCTAssertEqual(try roundTrip(.handoffChallenge(challenge)), .handoffChallenge(challenge))
+        XCTAssertEqual(try roundTrip(.handoffReady(ready)), .handoffReady(ready))
+        XCTAssertEqual(try roundTrip(.handoffCancel(cancel)), .handoffCancel(cancel))
+    }
+
+    /// The phone approves only the request the TV challenged with: same
+    /// match code, opened for remote playback, ending in a temporary session.
+    /// A full device sign-in with the same code is never approved here.
+    @MainActor func testHandoffApprovesOnlyATemporaryRemotePlaybackRequest() {
+        let challenge = SiloControlHandoffChallenge(requestId: "request-1", userCode: "ABCD-1234",
+            matchCode: "42", expiresAt: "2026-01-02T03:14:05Z")
+        func lookup(match: String = "42", purpose: String = "remote_playback", temporary: Bool = true) -> DeviceLookupResponse {
+            DeviceLookupResponse(matchCode: match, deviceName: "TV", devicePlatform: "tvos", status: "pending",
+                clientPurpose: purpose, temporary: temporary)
+        }
+        XCTAssertTrue(SiloControlClient.isRemotePlaybackHandoff(lookup(), answering: challenge))
+        XCTAssertFalse(SiloControlClient.isRemotePlaybackHandoff(lookup(match: "43"), answering: challenge))
+        XCTAssertFalse(SiloControlClient.isRemotePlaybackHandoff(lookup(purpose: "device_login"), answering: challenge))
+        XCTAssertFalse(SiloControlClient.isRemotePlaybackHandoff(lookup(temporary: false), answering: challenge))
+    }
+
+    func testHandoffOfferDecodesWithoutDisplayMetadata() throws {
+        let data = Data(
+            #"{"type":"handoff_offer","v":2,"handoffOffer":{"requestId":"request-1","serverId":"server-1","serverURL":"https://silo.example","profileId":"profile-1"}}"#
+                .utf8
+        )
+        guard case .handoffOffer(let offer) = try JSONDecoder().decode(SiloControlMessage.self, from: data) else {
+            return XCTFail("Expected a handoff offer")
+        }
+        XCTAssertNil(offer.serverName)
+        XCTAssertNil(offer.profileName)
+    }
+
+    func testHandoffOfferCarriesIdentityAndEndpointsOptionally() throws {
+        let offer = SiloControlHandoffOffer(
+            requestId: "request-1",
+            serverId: "server-1",
+            serverURL: "https://silo.overlay.example",
+            serverName: "Home",
+            profileId: "profile-1",
+            profileName: "Alex",
+            serverIdentity: "96c1bd08-b839-4d47-980e-57d4e7a44cfa",
+            serverEndpoints: [
+                ServerEndpoint(url: "https://silo.example", kind: .public),
+                ServerEndpoint(url: "https://silo.overlay.example", kind: .provider, provider: "tailscale", displayName: "Tailscale"),
+            ]
+        )
+        XCTAssertEqual(try roundTrip(.handoffOffer(offer)), .handoffOffer(offer))
+
+        let hello = SiloControlHello(
+            role: .tv, deviceName: "TV", deviceId: "tv-1", serverId: "server-1", serverName: "Home",
+            supportedVersions: [1, 2], serverIdentity: "96c1bd08-b839-4d47-980e-57d4e7a44cfa"
+        )
+        XCTAssertEqual(try roundTrip(.hello(hello)), .hello(hello))
+
+        // The keys stay off the wire when unset, so a v2 peer that predates
+        // them never sees an unexpected value.
+        let legacyOffer = SiloControlHandoffOffer(
+            requestId: "r", serverId: "s", serverURL: "https://silo.example",
+            serverName: nil, profileId: "p", profileName: nil
+        )
+        let data = try JSONEncoder().encode(SiloControlMessage.handoffOffer(legacyOffer))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let body = try XCTUnwrap(json["handoffOffer"] as? [String: Any])
+        XCTAssertNil(body["serverIdentity"])
+        XCTAssertNil(body["serverEndpoints"])
+    }
+
+    func testServerIdentityMatchesURLCapitalizationAcrossDevices() {
+        let phone = ServerRegistry.serverId(for: "https://Media.Example.test")
+        let tv = ServerRegistry.serverId(for: "HTTPS://media.example.test/")
+
+        XCTAssertNotEqual(phone, tv, "persisted registry keys remain unchanged")
+        XCTAssertTrue(ServerRegistry.serverIdsMatch(phone, tv))
+    }
+
+    func testServerIdentityMatchesDefaultPortsButNotDifferentOrigins() {
+        let canonical = ServerRegistry.serverId(for: "https://media.example.test/library")
+        let explicitDefault = ServerRegistry.serverId(for: "https://MEDIA.example.test:443/library/")
+        let otherPort = ServerRegistry.serverId(for: "https://media.example.test:8443/library")
+        let otherScheme = ServerRegistry.serverId(for: "http://media.example.test/library")
+        let pathCase = ServerRegistry.serverId(for: "https://media.example.test/Library")
+
+        XCTAssertTrue(ServerRegistry.serverIdsMatch(canonical, explicitDefault))
+        XCTAssertFalse(ServerRegistry.serverIdsMatch(canonical, otherPort))
+        XCTAssertFalse(ServerRegistry.serverIdsMatch(canonical, otherScheme))
+        XCTAssertFalse(ServerRegistry.serverIdsMatch(canonical, pathCase))
+    }
+
+    func testServerIdentityDecoderRequiresAValidRoundTrippingHTTPURL() {
+        let original = "https://Média.example.test:443/silo?mode=A#top"
+        let serverId = ServerRegistry.serverId(for: original)
+
+        XCTAssertEqual(ServerRegistry.url(forServerId: serverId), original)
+        XCTAssertNil(ServerRegistry.url(forServerId: "not-a-registry-id"))
+        XCTAssertNil(ServerRegistry.url(forServerId: ServerRegistry.serverId(for: "file:///tmp/silo")))
+        XCTAssertFalse(ServerRegistry.serverIdsMatch(nil, serverId))
+        XCTAssertTrue(ServerRegistry.serverIdsMatch("future-format", "future-format"))
+        XCTAssertFalse(ServerRegistry.serverIdsMatch("future-format-a", "future-format-b"))
+    }
+}
+
+extension SiloControlTests {
+    @MainActor func testClockInterpolatesWhilePlaying() {
+        let clock = RemotePlaybackClock()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        clock.ingest(.fixture(), asOf: t0)
+        XCTAssertEqual(clock.displayTime(asOf: t0.addingTimeInterval(3)), 3, accuracy: 0.01)
+    }
+
+    @MainActor func testClockClampsToDuration() {
+        let clock = RemotePlaybackClock()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        clock.ingest(.fixture(), asOf: t0)
+        XCTAssertEqual(clock.displayTime(asOf: t0.addingTimeInterval(999)), 100, accuracy: 0.01)
+    }
+
+    @MainActor func testOptimisticPlayingWinsUntilConfirmed() {
+        let clock = RemotePlaybackClock()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        clock.ingest(.fixture(isPlaying: false), asOf: t0)
+        clock.setOptimisticPlaying(true, asOf: t0)
+        // Optimistic override wins within the window (evaluated against the
+        // injected clock, not the wall clock).
+        XCTAssertTrue(clock.isPlaying(asOf: t0))
+        clock.ingest(.fixture(isPlaying: true), asOf: t0.addingTimeInterval(0.5))
+        XCTAssertTrue(clock.isPlaying(asOf: t0.addingTimeInterval(0.5)))
+    }
+
+    @MainActor func testOptimisticSeekHoldsUntilSnapshotCatchesUp() {
+        let clock = RemotePlaybackClock()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        clock.ingest(.fixture(isPlaying: false, currentTime: 10), asOf: t0)
+        // Scrub to 1200s; a stale snapshot still reporting ~10s must not snap
+        // the scrubber back.
+        clock.setOptimisticTime(1200, asOf: t0)
+        clock.ingest(.fixture(isPlaying: false, currentTime: 10, duration: 3000),
+                     asOf: t0.addingTimeInterval(0.5))
+        XCTAssertEqual(clock.displayTime(asOf: t0.addingTimeInterval(0.5)), 1200, accuracy: 0.01)
+        // Once the TV confirms the seek, the clock tracks it again.
+        clock.ingest(.fixture(isPlaying: false, currentTime: 1200, duration: 3000),
+                     asOf: t0.addingTimeInterval(1.0))
+        XCTAssertEqual(clock.displayTime(asOf: t0.addingTimeInterval(1.0)), 1200, accuracy: 0.01)
+    }
+}
+
+extension SiloControlTests {
+    func testHeldVolumeSurvivesAStaleReplyMidBurst() {
+        var reconciler = RemoteVolumeReconciler()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        // Two hardware steps before the TV answers either one.
+        reconciler.requested(0.5625, at: t0)
+        reconciler.requested(0.625, at: t0.addingTimeInterval(0.1))
+        // The reply to the first step must not rewind the level, or the next
+        // step would recompute 0.625 and the second press would be lost.
+        XCTAssertEqual(reconciler.reconcile(inbound: 0.5625, at: t0.addingTimeInterval(0.2)),
+                       0.625, accuracy: 0.0001)
+        // Once the TV catches up, its value is authoritative again.
+        XCTAssertEqual(reconciler.reconcile(inbound: 0.625, at: t0.addingTimeInterval(0.3)),
+                       0.625, accuracy: 0.0001)
+        XCTAssertEqual(reconciler.reconcile(inbound: 0.2, at: t0.addingTimeInterval(0.4)),
+                       0.2, accuracy: 0.0001)
+    }
+
+    func testHeldVolumeIsReleasedWhenTheWindowLapses() {
+        var reconciler = RemoteVolumeReconciler()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        reconciler.requested(0.9, at: t0)
+        // A dropped command, or a change made on the TV itself, must not leave
+        // the remote showing a level the TV does not have.
+        let lapsed = t0.addingTimeInterval(RemoteVolumeReconciler.window + 0.1)
+        XCTAssertEqual(reconciler.reconcile(inbound: 0.3, at: lapsed), 0.3, accuracy: 0.0001)
+    }
+
+    func testMuteClearsTheHeldVolume() {
+        var reconciler = RemoteVolumeReconciler()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        reconciler.requested(0.9, at: t0)
+        reconciler.clear()
+        XCTAssertEqual(reconciler.reconcile(inbound: 0.3, at: t0.addingTimeInterval(0.1)),
+                       0.3, accuracy: 0.0001)
+    }
+}
+
+private extension SiloControlPlaybackState {
+    static func fixture(isPlaying: Bool = true, currentTime: Double = 0, duration: Double = 100,
+                        playbackSpeed: Double = 1.0) -> SiloControlPlaybackState {
+        SiloControlPlaybackState(
+            contentId: "c", sessionId: nil, title: "T", subtitle: nil,
+            isPlaying: isPlaying, isLoading: false, isBuffering: false,
+            currentTime: currentTime, duration: duration,
+            audioTracks: [], subtitleTracks: [],
+            selectedAudioTrackId: nil, selectedSubtitleTrackId: nil,
+            qualityOptions: [], activeQualityId: "auto", isQualitySwitching: false,
+            playbackSpeed: playbackSpeed, videoGravity: "fit", hdrEnabled: false,
+            supportsVideoGravity: false,
+            volume: 1.0, isMuted: false, hasNextEpisode: false, nextEpisodeTitle: nil,
+            error: nil)
+    }
+}
+
+// MARK: - Several controllers on one TV (phone side)
+
+final class SiloControlPhoneMultiControllerTests: XCTestCase {
+    func testOlderTVsCloseOnlyForATakeoverOrDisconnectSoThePhoneForgetsThem() {
+        for reason in [nil, SiloControlCloseReason.timeout, SiloControlCloseReason.replaced] {
+            XCTAssertEqual(
+                SiloControlClosePolicy.response(reason: reason, tvKeepsOtherControllers: false),
+                .letGo(forgetTarget: true)
+            )
+        }
+    }
+
+    func testMultiControllerTVsSayWhyTheyClosed() {
+        func response(_ reason: String?) -> SiloControlCloseResponse {
+            SiloControlClosePolicy.response(reason: reason, tvKeepsOtherControllers: true)
+        }
+        XCTAssertEqual(response(SiloControlCloseReason.timeout), .reconnect)
+        XCTAssertEqual(response(SiloControlCloseReason.tvDisconnected), .letGo(forgetTarget: true))
+        XCTAssertEqual(response(nil), .letGo(forgetTarget: true))
+        XCTAssertEqual(response(SiloControlCloseReason.replaced), .letGo(forgetTarget: false))
+        XCTAssertEqual(response(SiloControlCloseReason.tooManyControllers), .letGo(forgetTarget: false))
+        XCTAssertEqual(response("from_a_newer_tv"), .letGo(forgetTarget: false))
+    }
+
+    func testReplacePromptNamesWhoIsWatchingWhat() {
+        let pending = SiloControlPendingReplace(
+            request: Self.request,
+            nowPlaying: SiloControlNowPlayingSummary(
+                contentId: "e1", title: "Pilot", subtitle: "Severance · S1E1",
+                profileName: "Alex", controllerName: nil
+            ),
+            tvName: "Living Room",
+            fallbackMessage: "unused"
+        )
+        XCTAssertEqual(pending.message, "Alex is watching Severance · S1E1 · Pilot on Living Room. Play yours instead?")
+    }
+
+    func testReplacePromptFallsBackToTheTVsWording() {
+        let pending = SiloControlPendingReplace(
+            request: Self.request, nowPlaying: nil, tvName: "Living Room",
+            fallbackMessage: "Someone is watching a title on this TV."
+        )
+        XCTAssertEqual(pending.message, "Someone is watching a title on this TV.")
+    }
+
+    func testResumeTokenIsOfferedOnlyForTheSameTVServerAndProfile() {
+        var tokens = SiloControlResumeTokens()
+        tokens.store("tok", tvId: "tv1", serverId: "srv", profileId: "alex")
+        XCTAssertEqual(tokens.token(tvId: "tv1", serverId: "srv", profileId: "alex"), "tok")
+        XCTAssertNil(tokens.token(tvId: "tv2", serverId: "srv", profileId: "alex"))
+        XCTAssertNil(tokens.token(tvId: "tv1", serverId: "srv", profileId: "sam"))
+        XCTAssertNil(tokens.token(tvId: "tv1", serverId: "other", profileId: "alex"))
+    }
+
+    /// A ready from an older TV carries no token and must not erase one.
+    func testAMissingTokenKeepsTheStoredOne() {
+        var tokens = SiloControlResumeTokens()
+        tokens.store("tok", tvId: "tv1", serverId: "srv", profileId: "alex")
+        tokens.store(nil, tvId: "tv1", serverId: "srv", profileId: "alex")
+        XCTAssertEqual(tokens.token(tvId: "tv1", serverId: "srv", profileId: "alex"), "tok")
+    }
+
+    /// The same words silo-android's phone sends, so either TV shows the same "Starting" line.
+    func testOfferTitleNamesAnEpisodeBySeriesAndNumber() {
+        XCTAssertEqual(
+            SiloControlOfferTitle.make(type: "episode", title: "Pilot", seriesTitle: "Severance", seasonNumber: 1, episodeNumber: 2),
+            "Severance · S1 · E2"
+        )
+        XCTAssertEqual(
+            SiloControlOfferTitle.make(type: "Episodes", title: "Pilot", seriesTitle: "Severance", seasonNumber: 1, episodeNumber: 2),
+            "Severance · S1 · E2"
+        )
+        XCTAssertEqual(
+            SiloControlOfferTitle.make(type: "episode", title: "Pilot", seriesTitle: " ", seasonNumber: 1, episodeNumber: 2),
+            "Pilot"
+        )
+        XCTAssertEqual(
+            SiloControlOfferTitle.make(type: "movie", title: "Oak Street", seriesTitle: "Ignored", seasonNumber: nil, episodeNumber: nil),
+            "Oak Street"
+        )
+        XCTAssertNil(SiloControlOfferTitle.make(type: "movie", title: "  ", seriesTitle: nil, seasonNumber: nil, episodeNumber: nil))
+    }
+
+    func testOfferTitleTravelsOnTheWireOnlyWhenSet() throws {
+        let offer = SiloControlHandoffOffer(
+            requestId: "r", serverId: "s", serverURL: "https://silo.example",
+            serverName: nil, profileId: "p", profileName: nil, title: "Oak Street"
+        )
+        let data = try JSONEncoder().encode(SiloControlMessage.handoffOffer(offer))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((json["handoffOffer"] as? [String: Any])?["title"] as? String, "Oak Street")
+
+        var untitled = offer
+        untitled.title = nil
+        let bare = try JSONEncoder().encode(SiloControlMessage.handoffOffer(untitled))
+        let bareJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: bare) as? [String: Any])
+        XCTAssertNil((bareJSON["handoffOffer"] as? [String: Any])?["title"])
+    }
+
+    @MainActor func testHandshakeRecordsTheTVsFeatures() {
+        let handshake = SiloControlHandshake()
+        XCTAssertFalse(handshake.tvSupports(SiloControlFeature.presence))
+        handshake.receive(.hello(SiloControlHello(
+            role: .tv, deviceName: "Living Room", deviceId: "tv1", serverId: "srv", serverName: nil,
+            supportedVersions: [2], features: [SiloControlFeature.presence]
+        )))
+        XCTAssertTrue(handshake.tvSupports(SiloControlFeature.presence))
+        XCTAssertFalse(handshake.tvSupports(SiloControlFeature.multiController))
+    }
+
+    @MainActor func testReplaceRefusalSurfacesWhatIsPlaying() async {
+        let handshake = SiloControlHandshake()
+        let nowPlaying = SiloControlNowPlayingSummary(
+            contentId: "c1", title: "Dune", subtitle: nil, profileName: "Alex", controllerName: nil
+        )
+        handshake.beginHandoff(requestId: "r1")
+        handshake.receive(.handoffCancel(SiloControlHandoffCancel(
+            requestId: "r1",
+            reason: SiloControlHandoffCancelReason.replaceConfirmationRequired,
+            message: "Alex is watching Dune on this TV.",
+            nowPlaying: nowPlaying
+        )))
+        do {
+            _ = try await handshake.firstReply(to: "r1", within: .seconds(1))
+            XCTFail("expected a replace refusal")
+        } catch {
+            XCTAssertEqual(
+                error as? SiloControlHandoffError,
+                .replaceConfirmationRequired(nowPlaying, message: "Alex is watching Dune on this TV.")
+            )
+        }
+    }
+
+    @MainActor func testOtherRefusalsStayPlainCancellations() async {
+        let handshake = SiloControlHandshake()
+        handshake.beginHandoff(requestId: "r1")
+        handshake.receive(.handoffCancel(SiloControlHandoffCancel(
+            requestId: "r1", reason: SiloControlHandoffCancelReason.superseded, message: "Sam started playing."
+        )))
+        do {
+            _ = try await handshake.firstReply(to: "r1", within: .seconds(1))
+            XCTFail("expected a cancellation")
+        } catch {
+            XCTAssertEqual(error as? SiloControlHandoffError, .cancelled("Sam started playing."))
+        }
+    }
+
+    private static let request = SiloControlPlaybackRequest(
+        contentId: "c2", fileId: nil, audioTrackIndex: nil, subtitleTrackIndex: nil,
+        startFromBeginning: false, resumePosition: nil
+    )
+}

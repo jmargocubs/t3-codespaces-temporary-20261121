@@ -1,0 +1,17 @@
+{
+  "events": [],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "post",
+          "id": "3",
+          "name": "Postseason",
+          "type": 3
+        },
+        "year": 2026
+      }
+    }
+  ],
+  "week": null
+}

@@ -1,0 +1,542 @@
+import Foundation
+
+enum PlaybackRealtimeMessageType: String, Codable {
+    case command
+    case event
+    case hello
+    case ack
+    case result
+}
+
+enum PlaybackRealtimeCommandName: String, Codable, CaseIterable {
+    case pause
+    case unpause
+    case playPause = "play_pause"
+    case seek
+    case setVolume = "set_volume"
+    case stop
+    case terminate
+    case displayMessage = "display_message"
+    case serverRestarting = "server_restarting"
+    case serverShuttingDown = "server_shutting_down"
+    case playMedia = "play_media"
+    case setAudioTrack = "set_audio_track"
+    case setSubtitleTrack = "set_subtitle_track"
+}
+
+let supportedApplePlaybackRealtimeCommands: [PlaybackRealtimeCommandName] = [
+    .pause,
+    .unpause,
+    .playPause,
+    .seek,
+    .stop,
+    .terminate,
+    .displayMessage,
+    .serverRestarting,
+    .serverShuttingDown,
+]
+
+/// Names of `type:"event"` envelopes the server pushes over the playback
+/// control websocket.
+///
+/// Decodes unknown event names to ``unknown(_:)`` so a newer server event
+/// never fails the whole envelope. Consumers switch on the known cases and
+/// ignore ``unknown(_:)``.
+enum PlaybackRealtimeEventName: Codable, Equatable {
+    case chapterThumbnailReady
+    case markersUpdated
+    // AI subtitle live-streaming events (Milestone 4). These ride the same
+    // socket; payloads are decoded by `PlaybackRealtimeSubtitleEvent`.
+    case subtitleTranslationStarted
+    case subtitleTranslationCues
+    case subtitleTranslationCompleted
+    case subtitleTranslationFailed
+    case subtitleReady
+    /// A subtitle of the file (stored or a sidecar) was retimed: a sync was
+    /// applied, or its timing was set or reset. Its stream URL is unchanged
+    /// and already serves the new timing.
+    case subtitleTimingChanged
+    /// A sync job of one of the file's subtitles was queued, progressed, or
+    /// ended.
+    case subtitleSyncUpdated
+    /// Any event name not recognized above. Carries the raw wire string so
+    /// nothing is lost; current consumers ignore it.
+    case unknown(String)
+
+    /// The wire string for this event name.
+    var rawValue: String {
+        switch self {
+        case .chapterThumbnailReady: return "chapter_thumbnail_ready"
+        case .markersUpdated: return "markers_updated"
+        case .subtitleTranslationStarted: return "subtitle_translation_started"
+        case .subtitleTranslationCues: return "subtitle_translation_cues"
+        case .subtitleTranslationCompleted: return "subtitle_translation_completed"
+        case .subtitleTranslationFailed: return "subtitle_translation_failed"
+        case .subtitleReady: return "subtitle_ready"
+        case .subtitleTimingChanged: return "subtitle_timing_changed"
+        case .subtitleSyncUpdated: return "subtitle_sync_updated"
+        case .unknown(let raw): return raw
+        }
+    }
+
+    init(rawValue: String) {
+        switch rawValue {
+        case "chapter_thumbnail_ready": self = .chapterThumbnailReady
+        case "markers_updated": self = .markersUpdated
+        case "subtitle_translation_started": self = .subtitleTranslationStarted
+        case "subtitle_translation_cues": self = .subtitleTranslationCues
+        case "subtitle_translation_completed": self = .subtitleTranslationCompleted
+        case "subtitle_translation_failed": self = .subtitleTranslationFailed
+        case "subtitle_ready": self = .subtitleReady
+        case "subtitle_timing_changed": self = .subtitleTimingChanged
+        case "subtitle_sync_updated": self = .subtitleSyncUpdated
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = PlaybackRealtimeEventName(rawValue: raw)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+enum PlaybackRealtimeAckStatus: String, Codable {
+    case accepted
+}
+
+enum PlaybackRealtimeResultStatus: String, Codable {
+    case completed
+    case rejected
+}
+
+enum PlaybackRealtimeCommandExecutionError: Error {
+    case unsupportedCommand
+    case playerNotReady
+    case missingSeekPosition
+    case commandFailed
+
+    var rejectionReason: String {
+        switch self {
+        case .unsupportedCommand:
+            return "unsupported_command"
+        case .playerNotReady:
+            return "player_not_ready"
+        case .missingSeekPosition:
+            return "missing_seek_position"
+        case .commandFailed:
+            return "command_failed"
+        }
+    }
+}
+
+enum PlaybackRealtimeValue: Codable, Equatable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: PlaybackRealtimeValue])
+    case array([PlaybackRealtimeValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([String: PlaybackRealtimeValue].self) {
+            self = .object(value)
+        } else if let value = try? container.decode([PlaybackRealtimeValue].self) {
+            self = .array(value)
+        } else {
+            throw DecodingError.typeMismatch(
+                PlaybackRealtimeValue.self,
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Unsupported realtime JSON payload value"
+                )
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value):
+            try container.encode(value)
+        case .number(let value):
+            try container.encode(value)
+        case .bool(let value):
+            try container.encode(value)
+        case .object(let value):
+            try container.encode(value)
+        case .array(let value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+typealias PlaybackRealtimePayload = [String: PlaybackRealtimeValue]
+
+extension Dictionary where Key == String, Value == PlaybackRealtimeValue {
+    func string(forKeys keys: String...) -> String? {
+        for key in keys {
+            if case .string(let value)? = self[key] {
+                return value
+            }
+        }
+        return nil
+    }
+
+    func number(forKeys keys: String...) -> Double? {
+        for key in keys {
+            if case .number(let value)? = self[key] {
+                return value
+            }
+        }
+        return nil
+    }
+
+    /// The first of `keys` holding a number, truncated toward zero as
+    /// before; nil when that number is not finite or no `Int` can hold it,
+    /// rather than trapping on a malformed event.
+    func int(forKeys keys: String...) -> Int? {
+        for key in keys {
+            if case .number(let value)? = self[key], value.isFinite {
+                return Int(exactly: value.rounded(.towardZero))
+            }
+        }
+        return nil
+    }
+
+    func timeRange(forKey key: String) -> TimeRange? {
+        guard case .object(let object)? = self[key],
+              case .number(let start)? = object["start"],
+              case .number(let end)? = object["end"],
+              start.isFinite,
+              end.isFinite,
+              end > start else {
+            return nil
+        }
+        return TimeRange(start: start, end: end)
+    }
+
+    func markerRangeUpdate(forKey key: String) -> PlaybackRealtimeMarkerRangeUpdate {
+        guard let value = self[key] else {
+            return .unchanged
+        }
+        if case .null = value {
+            return .clear
+        }
+        guard let range = timeRange(forKey: key) else {
+            return .unchanged
+        }
+        return .set(range)
+    }
+}
+
+struct PlaybackRealtimeCommandEnvelope: Decodable, Equatable {
+    let type: PlaybackRealtimeMessageType
+    let commandId: String
+    let sessionId: String
+    let name: PlaybackRealtimeCommandName
+    let reason: String?
+    let issuedBy: PlaybackRealtimeIssuedBy?
+    let deadlineMS: Int?
+    let payload: PlaybackRealtimePayload
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case commandId = "command_id"
+        case sessionId = "session_id"
+        case name
+        case reason
+        case issuedBy = "issued_by"
+        case deadlineMS = "deadline_ms"
+        case payload
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(PlaybackRealtimeMessageType.self, forKey: .type)
+        commandId = try container.decode(String.self, forKey: .commandId)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        name = try container.decode(PlaybackRealtimeCommandName.self, forKey: .name)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        issuedBy = try container.decodeIfPresent(PlaybackRealtimeIssuedBy.self, forKey: .issuedBy)
+        deadlineMS = try container.decodeIfPresent(Int.self, forKey: .deadlineMS)
+        payload = try container.decodeIfPresent(PlaybackRealtimePayload.self, forKey: .payload) ?? [:]
+    }
+}
+
+struct PlaybackRealtimeIssuedBy: Decodable, Equatable {
+    let kind: String
+}
+
+struct PlaybackRealtimeEventEnvelope: Decodable, Equatable {
+    let type: PlaybackRealtimeMessageType
+    let sessionId: String
+    let name: PlaybackRealtimeEventName
+    let payload: PlaybackRealtimePayload
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case sessionId = "session_id"
+        case name
+        case payload
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(PlaybackRealtimeMessageType.self, forKey: .type)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        name = try container.decode(PlaybackRealtimeEventName.self, forKey: .name)
+        payload = try container.decodeIfPresent(PlaybackRealtimePayload.self, forKey: .payload) ?? [:]
+    }
+}
+
+struct PlaybackRealtimeMarkersUpdatedPayload: Equatable {
+    let sessionId: String?
+    let fileId: Int
+    let intro: TimeRange?
+    let credits: TimeRange?
+    let recap: TimeRange?
+    let introUpdate: PlaybackRealtimeMarkerRangeUpdate
+    let creditsUpdate: PlaybackRealtimeMarkerRangeUpdate
+    let recapUpdate: PlaybackRealtimeMarkerRangeUpdate
+
+    init?(payload: PlaybackRealtimePayload) {
+        guard let fileId = payload.int(forKeys: "file_id", "fileId") else {
+            return nil
+        }
+        self.sessionId = payload.string(forKeys: "session_id", "sessionId")
+        self.fileId = fileId
+        introUpdate = payload.markerRangeUpdate(forKey: "intro")
+        creditsUpdate = payload.markerRangeUpdate(forKey: "credits")
+        recapUpdate = payload.markerRangeUpdate(forKey: "recap")
+        self.intro = introUpdate.range
+        self.credits = creditsUpdate.range
+        self.recap = recapUpdate.range
+    }
+}
+
+/// `subtitle_timing_changed`: `{session_id, file_id, sync_key, subtitle_id?,
+/// track?}`. The sync key is all a player needs; `track` is not read. A
+/// server that predates sync keys sends only `subtitle_id`, which names a
+/// stored subtitle.
+struct PlaybackRealtimeSubtitleTimingChangedPayload: Equatable {
+    let sessionId: String?
+    let fileId: Int
+    let syncKey: String
+    /// The stored subtitle's ID; absent for a sidecar.
+    let subtitleId: String?
+
+    init?(payload: PlaybackRealtimePayload) {
+        guard let fileId = payload.int(forKeys: "file_id", "fileId") else { return nil }
+        let subtitleId = payload.subtitleSyncStoredId()
+        guard let syncKey = payload.subtitleSyncKey() ?? subtitleId.map(SubtitleSyncState.storedKey) else {
+            return nil
+        }
+        sessionId = payload.string(forKeys: "session_id", "sessionId")
+        self.fileId = fileId
+        self.syncKey = syncKey
+        self.subtitleId = subtitleId
+    }
+}
+
+/// `subtitle_sync_updated`: `{session_id, file_id, sync_key, subtitle_id?,
+/// timing, job}`, sent at each step of a sync job: queued, every progress
+/// update, and the outcome. `job` has the `SubtitleSyncJobState` shape.
+struct PlaybackRealtimeSubtitleSyncUpdatedPayload: Equatable {
+    let sessionId: String?
+    let fileId: Int
+    let syncKey: String
+    let subtitleId: String?
+    /// The subtitle's correction after this step.
+    let timing: SubtitleTiming
+    let job: SubtitleSyncJob
+
+    init?(payload: PlaybackRealtimePayload) {
+        guard let fileId = payload.int(forKeys: "file_id", "fileId"),
+              let syncKey = payload.subtitleSyncKey(),
+              case .object(let timing)? = payload["timing"],
+              case .number(let offset)? = timing["offset_ms"], let offsetMs = Int(exactly: offset),
+              SubtitleTiming.offsetRange.contains(offsetMs),
+              case .number(let scale)? = timing["scale"], SubtitleTiming.scaleRange.contains(scale),
+              let jobValue = payload["job"],
+              let jobData = try? JSONEncoder().encode(jobValue),
+              let job = try? HTTPClient.makeJSONDecoder().decode(SubtitleSyncJob.self, from: jobData),
+              !job.id.isEmpty else {
+            return nil
+        }
+        sessionId = payload.string(forKeys: "session_id", "sessionId")
+        self.fileId = fileId
+        self.syncKey = syncKey
+        subtitleId = payload.subtitleSyncStoredId()
+        self.timing = SubtitleTiming(offsetMs: offsetMs, scale: scale)
+        self.job = job
+    }
+}
+
+private extension Dictionary where Key == String, Value == PlaybackRealtimeValue {
+    func subtitleSyncKey() -> String? {
+        string(forKeys: "sync_key", "syncKey").flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    func subtitleSyncStoredId() -> String? {
+        int(forKeys: "subtitle_id", "subtitleId").flatMap { $0 > 0 ? String($0) : nil }
+    }
+}
+
+enum PlaybackRealtimeMarkerRangeUpdate: Equatable {
+    case unchanged
+    case clear
+    case set(TimeRange)
+
+    var range: TimeRange? {
+        guard case .set(let range) = self else {
+            return nil
+        }
+        return range
+    }
+
+    func resolving(current: TimeRange?) -> TimeRange? {
+        switch self {
+        case .unchanged:
+            return current
+        case .clear:
+            return nil
+        case .set(let range):
+            return range
+        }
+    }
+}
+
+enum PlaybackRealtimeInboundMessage: Equatable {
+    case command(PlaybackRealtimeCommandEnvelope)
+    case event(PlaybackRealtimeEventEnvelope)
+}
+
+struct PlaybackRealtimeHelloEnvelope: Encodable {
+    let type: PlaybackRealtimeMessageType = .hello
+    let sessionId: String
+    let client: PlaybackRealtimeClientInfo
+    let capabilities: PlaybackRealtimeCapabilities
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case sessionId = "session_id"
+        case client
+        case capabilities
+    }
+}
+
+struct PlaybackRealtimeClientInfo: Encodable {
+    let name: String
+    let version: String
+}
+
+struct PlaybackRealtimeCapabilities: Encodable {
+    let commands: [PlaybackRealtimeCommandName]
+}
+
+struct PlaybackRealtimeAckEnvelope: Encodable {
+    let type: PlaybackRealtimeMessageType = .ack
+    let commandId: String
+    let sessionId: String
+    let status: PlaybackRealtimeAckStatus = .accepted
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case commandId = "command_id"
+        case sessionId = "session_id"
+        case status
+    }
+}
+
+struct PlaybackRealtimeResultEnvelope: Encodable {
+    let type: PlaybackRealtimeMessageType = .result
+    let commandId: String
+    let sessionId: String
+    let status: PlaybackRealtimeResultStatus
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case commandId = "command_id"
+        case sessionId = "session_id"
+        case status
+        case error
+    }
+}
+
+func parsePlaybackRealtimeInboundMessage(_ data: Data) -> PlaybackRealtimeInboundMessage? {
+    do {
+        let decoder = JSONDecoder()
+        let base = try decoder.decode(PlaybackRealtimeBaseEnvelope.self, from: data)
+        switch base.type {
+        case .command:
+            return .command(try decoder.decode(PlaybackRealtimeCommandEnvelope.self, from: data))
+        case .event:
+            return .event(try decoder.decode(PlaybackRealtimeEventEnvelope.self, from: data))
+        default:
+            return nil
+        }
+    } catch {
+        return nil
+    }
+}
+
+func makePlaybackRealtimeHello(sessionId: String) -> PlaybackRealtimeHelloEnvelope {
+    PlaybackRealtimeHelloEnvelope(
+        sessionId: sessionId,
+        client: PlaybackRealtimeClientInfo(
+            name: applePlaybackRealtimeClientName,
+            version: "1"
+        ),
+        capabilities: PlaybackRealtimeCapabilities(commands: supportedApplePlaybackRealtimeCommands)
+    )
+}
+
+func makePlaybackRealtimeAck(sessionId: String, commandId: String) -> PlaybackRealtimeAckEnvelope {
+    PlaybackRealtimeAckEnvelope(commandId: commandId, sessionId: sessionId)
+}
+
+func makePlaybackRealtimeResult(
+    sessionId: String,
+    commandId: String,
+    status: PlaybackRealtimeResultStatus,
+    error: String? = nil
+) -> PlaybackRealtimeResultEnvelope {
+    PlaybackRealtimeResultEnvelope(
+        commandId: commandId,
+        sessionId: sessionId,
+        status: status,
+        error: error
+    )
+}
+
+private struct PlaybackRealtimeBaseEnvelope: Decodable {
+    let type: PlaybackRealtimeMessageType
+}
+
+// Each platform sends its own stable protocol client id. These are not the
+// human-facing `X-Silo-Client` product names; the server stores them and only
+// checks that they are non-empty.
+#if os(tvOS)
+private let applePlaybackRealtimeClientName = "silo-tvos"
+#elseif os(macOS)
+private let applePlaybackRealtimeClientName = "silo-macos"
+#else
+private let applePlaybackRealtimeClientName = "silo-ios"
+#endif

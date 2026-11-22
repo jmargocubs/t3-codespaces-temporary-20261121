@@ -1,0 +1,850 @@
+import SwiftUI
+
+func libraryCollectionAccessibilityLabel(_ collection: LibraryCollection, showItemCount: Bool = true) -> String {
+    let type = collection.kind == .userCollections
+        ? "User collection"
+        : collection.collectionType?.capitalized ?? "Collection"
+    let count = if let itemCount = collection.itemCount {
+        "\(itemCount) item\(itemCount == 1 ? "" : "s")"
+    } else {
+        "Smart"
+    }
+    return (showItemCount ? [collection.name, type, count] : [collection.name, type]).joined(separator: ", ")
+}
+
+/// List of user-created collections, grouped into named buckets +
+/// "Ungrouped". Mirrors the web app's `Collections` page.
+struct CollectionsView: View {
+    @State private var viewModel = CollectionsViewModel()
+    @Environment(AppRouter.self) private var router
+
+    var body: some View {
+        Group {
+            if !viewModel.collections.isEmpty || !viewModel.groups.isEmpty {
+                sectionedList
+            } else if let error = viewModel.error {
+                ErrorView(state: error, onRetry: { Task { await viewModel.loadCollections() } })
+            } else if viewModel.isLoading {
+                Color.clear
+            } else {
+                EmptyStateView(
+                    icon: "square.stack",
+                    title: "No collections",
+                    subtitle: "Create a collection to organize your media"
+                )
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if case .unknown(let message) = viewModel.groupSupport {
+                groupSupportNotice(message)
+            }
+        }
+        .siloPageBackground()
+        .navigationTitle("Collections")
+        .siloNavigationTitleDisplayMode(.large)
+        .toolbar {
+            #if os(macOS)
+            if viewModel.canManageGroups {
+                ToolbarItem {
+                    Button {
+                        viewModel.pendingGroupAction = .create
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                            .foregroundColor(.siloPrimary)
+                    }
+                }
+            }
+            ToolbarItem {
+                Button {
+                    viewModel.showCreateSheet = true
+                } label: {
+                    Image(systemName: "plus")
+                        .foregroundColor(.siloPrimary)
+                }
+            }
+            #else
+            if viewModel.canManageGroups {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        viewModel.pendingGroupAction = .create
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                            .foregroundColor(.siloPrimary)
+                    }
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    viewModel.showCreateSheet = true
+                } label: {
+                    Image(systemName: "plus")
+                        .foregroundColor(.siloPrimary)
+                }
+            }
+            #endif
+        }
+        .sheet(isPresented: $viewModel.showCreateSheet) {
+            createSheet
+        }
+        .sheet(item: $viewModel.pendingGroupAction) { action in
+            GroupActionSheet(action: action, viewModel: viewModel)
+        }
+        .task {
+            await viewModel.loadCollections()
+        }
+        .refreshable {
+            await viewModel.loadCollections()
+        }
+    }
+
+    // MARK: - Sectioned list
+
+    private var sectionedList: some View {
+        List {
+            ForEach(viewModel.sections) { section in
+                Section {
+                    if section.collections.isEmpty {
+                        Text(emptyGroupHint)
+                            .font(.siloSmall)
+                            .foregroundColor(.siloSecondaryText)
+                            .listRowBackground(Color.siloSurface)
+                    } else {
+                        ForEach(section.collections) { collection in
+                            collectionRow(collection)
+                                .listRowBackground(Color.siloSurface)
+                                #if !os(tvOS)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) {
+                                        viewModel.pendingGroupAction = .deleteCollection(collection)
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                    if viewModel.canManageGroups {
+                                        Button {
+                                            viewModel.pendingGroupAction = .move(collection)
+                                        } label: {
+                                            Label("Move", systemImage: "folder")
+                                        }
+                                        .tint(.siloPrimary)
+                                    }
+                                }
+                                #endif
+                        }
+                    }
+                } header: {
+                    sectionHeader(section)
+                }
+            }
+        }
+        #if os(tvOS) || os(macOS)
+        .listStyle(.plain)
+        #else
+        .listStyle(.insetGrouped)
+        #endif
+        .siloScrollContentBackgroundHidden()
+    }
+
+    /// tvOS has no Move action, so it only notes the group is empty.
+    private var emptyGroupHint: String {
+        #if os(tvOS)
+        "No collections in this group yet."
+        #else
+        "Use Move on a collection to add it to this group."
+        #endif
+    }
+
+    @ViewBuilder
+    private func sectionHeader(_ section: UserCollectionSection) -> some View {
+        HStack {
+            Text(section.name)
+                .font(.siloCaption)
+                .foregroundColor(.siloSecondaryText)
+            Spacer()
+            if viewModel.canManageGroups, let groupId = section.groupId,
+               let group = viewModel.groups.first(where: { $0.id == groupId }) {
+                Menu {
+                    Button {
+                        viewModel.pendingGroupAction = .rename(group)
+                    } label: {
+                        Label("Rename", systemImage: "pencil")
+                    }
+                    Button(role: .destructive) {
+                        viewModel.pendingGroupAction = .delete(group)
+                    } label: {
+                        Label("Delete group", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundColor(.siloSecondaryText)
+                }
+            }
+        }
+    }
+
+    /// The capability read failed: groups can't be managed until it is
+    /// retried, but nothing concludes they are unsupported.
+    private func groupSupportNotice(_ message: String) -> some View {
+        HStack(spacing: SiloTheme.padding) {
+            Text(message)
+                .font(.siloCaption)
+                .foregroundColor(.siloSecondaryText)
+            Spacer()
+            Button("Retry") {
+                Task { await viewModel.retryGroupSupport() }
+            }
+            .foregroundColor(.siloPrimary)
+        }
+        .padding(.horizontal, SiloTheme.padding)
+        .padding(.vertical, 8)
+        .background(Color.siloSurface)
+    }
+
+    private func collectionRow(_ collection: UserCollection) -> some View {
+        Button {
+            router.navigate(to: .collectionDetail(collectionId: collection.id))
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(collection.name)
+                        .font(.siloBody)
+                        .foregroundColor(.siloOnSurface)
+
+                    Text(rowSubtitle(for: collection))
+                        .font(.siloCaption)
+                        .foregroundColor(.siloSecondaryText)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.siloCaption)
+                    .foregroundColor(.siloSecondaryText)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private func rowSubtitle(for collection: UserCollection) -> String {
+        let kind = (collection.collectionType ?? "custom").capitalized
+        if let count = collection.itemCount, count > 0 {
+            return "\(kind) · \(count) item\(count == 1 ? "" : "s")"
+        }
+        return kind
+    }
+
+    // MARK: - Create Sheet
+
+    private var createSheet: some View {
+        NavigationStack {
+            VStack(spacing: SiloTheme.largePadding) {
+                TextField("Collection name", text: $viewModel.newCollectionName)
+                    .textFieldStyle(SiloTextFieldStyle())
+
+                if let message = viewModel.createError {
+                    Text(message)
+                        .font(.siloCaption)
+                        .foregroundColor(.siloError)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Button("Create Collection") {
+                    Task { await viewModel.createCollection() }
+                }
+                .siloPrimaryButton()
+                .disabled(viewModel.isSaving
+                    || viewModel.newCollectionName.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                Spacer()
+            }
+            .padding(SiloTheme.padding)
+            .siloSheetBackground()
+            .navigationTitle("New Collection")
+            .siloNavigationTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        viewModel.showCreateSheet = false
+                    }
+                    .foregroundColor(.siloSecondaryText)
+                }
+            }
+            .siloNavigationBarSurfaceBackground()
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+/// Modal for create-group / rename-group / delete-group / move-collection /
+/// delete-collection. Edits of an existing item read its current version when
+/// the sheet opens and send that version; after a conflict or an unknown
+/// outcome the sheet offers Reload instead of resending.
+private struct GroupActionSheet: View {
+    let action: CollectionsViewModel.GroupAction
+    let viewModel: CollectionsViewModel
+
+    @State private var name: String = ""
+    @State private var pendingMoveTarget: String? = nil
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            content
+                .siloSheetBackground()
+                .siloNavigationTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { dismiss() }
+                            .foregroundColor(.siloSecondaryText)
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(confirmLabel) { Task { await confirm() } }
+                            .foregroundColor(.siloPrimary)
+                            .disabled(!canConfirm)
+                    }
+                }
+                .siloNavigationBarSurfaceBackground()
+        }
+        .presentationDetents([.medium])
+        .task {
+            await viewModel.loadEditor()
+        }
+        .onAppear {
+            switch action {
+            case .rename(let g): name = g.name
+            case .move(let c): pendingMoveTarget = c.groupId
+            default: break
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch action {
+        case .create:
+            nameForm(title: "New group", prompt: "Group name")
+        case .rename(let group):
+            nameForm(title: "Rename “\(group.name)”", prompt: "Group name")
+        case .delete(let group):
+            VStack(spacing: SiloTheme.padding) {
+                Text("Delete “\(group.name)”?")
+                    .font(.siloTitle)
+                    .foregroundStyle(Color.siloOnSurface)
+                Text("Collections in this group will move to Ungrouped. This cannot be undone.")
+                    .font(.siloBody)
+                    .foregroundStyle(Color.siloSecondaryText)
+                    .multilineTextAlignment(.center)
+                errorBanner
+                Spacer()
+            }
+            .padding(SiloTheme.padding)
+            .navigationTitle("Delete group")
+        case .deleteCollection(let collection):
+            VStack(spacing: SiloTheme.padding) {
+                Text("Delete “\(collection.name)”?")
+                    .font(.siloTitle)
+                    .foregroundStyle(Color.siloOnSurface)
+                Text("This cannot be undone.")
+                    .font(.siloBody)
+                    .foregroundStyle(Color.siloSecondaryText)
+                    .multilineTextAlignment(.center)
+                errorBanner
+                Spacer()
+            }
+            .padding(SiloTheme.padding)
+            .navigationTitle("Delete collection")
+        case .move(let collection):
+            VStack(spacing: 0) {
+                List {
+                    Section("Move “\(collection.name)” to") {
+                        Button {
+                            pendingMoveTarget = nil
+                        } label: {
+                            moveOptionRow(label: "Ungrouped", selected: pendingMoveTarget == nil)
+                        }
+                        .listRowBackground(Color.siloSurface)
+                        ForEach(viewModel.groups) { group in
+                            Button {
+                                pendingMoveTarget = group.id
+                            } label: {
+                                moveOptionRow(label: group.name, selected: pendingMoveTarget == group.id)
+                            }
+                            .listRowBackground(Color.siloSurface)
+                        }
+                    }
+                }
+                #if os(tvOS) || os(macOS)
+                .listStyle(.plain)
+                #else
+                .listStyle(.insetGrouped)
+                #endif
+                .siloScrollContentBackgroundHidden()
+                errorBanner
+                    .padding(.horizontal, SiloTheme.padding)
+                    .padding(.bottom, SiloTheme.padding)
+            }
+            .navigationTitle("Move collection")
+        }
+    }
+
+    private func nameForm(title: String, prompt: String) -> some View {
+        VStack(spacing: SiloTheme.largePadding) {
+            TextField(prompt, text: $name)
+                .textFieldStyle(SiloTextFieldStyle())
+            errorBanner
+            Spacer()
+        }
+        .padding(SiloTheme.padding)
+        .navigationTitle(title)
+    }
+
+    @ViewBuilder
+    private var errorBanner: some View {
+        if let message = viewModel.groupError {
+            Text(message)
+                .font(.siloCaption)
+                .foregroundColor(.siloError)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        if viewModel.editorNeedsReload {
+            Button("Reload") {
+                Task { await viewModel.loadEditor() }
+            }
+            .foregroundColor(.siloPrimary)
+            .disabled(viewModel.isLoadingEditor)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func moveOptionRow(label: String, selected: Bool) -> some View {
+        HStack {
+            Text(label)
+                .font(.siloBody)
+                .foregroundColor(.siloOnSurface)
+            Spacer()
+            if selected {
+                Image(systemName: "checkmark")
+                    .foregroundColor(.siloPrimary)
+            }
+        }
+    }
+
+    private var confirmLabel: String {
+        switch action {
+        case .create: return "Create"
+        case .rename: return "Save"
+        case .delete, .deleteCollection: return "Delete"
+        case .move: return "Move"
+        }
+    }
+
+    private var canConfirm: Bool {
+        guard viewModel.canSubmitGroupAction else { return false }
+        switch action {
+        case .create, .rename:
+            return !name.trimmingCharacters(in: .whitespaces).isEmpty
+        case .delete, .move, .deleteCollection:
+            return true
+        }
+    }
+
+    private func confirm() async {
+        switch action {
+        case .create:
+            await viewModel.createGroup(name: name)
+        case .rename:
+            await viewModel.renameGroup(name: name)
+        case .delete(let group):
+            await viewModel.deleteGroup(id: group.id)
+        case .move:
+            await viewModel.moveCollection(toGroupId: pendingMoveTarget)
+        case .deleteCollection(let collection):
+            await viewModel.deleteCollection(id: collection.id)
+        }
+        // The view model clears `pendingGroupAction` only on success;
+        // keep the sheet open on error so the failure and any Reload
+        // action show in the sheet, with the draft intact.
+        if viewModel.pendingGroupAction == nil {
+            dismiss()
+        }
+    }
+}
+
+@Observable
+@MainActor
+private class LibraryCollectionsViewModel {
+    /// Ordered render sections — either named groups from the server or
+    /// a single anonymous section synthesized from a flat response.
+    var sections: [LibraryCollectionSection] = []
+    var isLoading = false
+    var isRefreshing = false
+    var error: ErrorState?
+
+    var isEmpty: Bool { sections.allSatisfy { $0.collections.isEmpty } }
+
+    func loadCollections(libraryId: Int) async {
+        let key = "library:\(libraryId):collections"
+        if sections.isEmpty,
+           let cached: [LibraryCollectionSection] = ResponseCache.shared.get(key) {
+            sections = cached
+        }
+        if sections.isEmpty {
+            isLoading = true
+        } else {
+            isRefreshing = true
+        }
+        error = nil
+
+        do {
+            let response = try await SiloAPI.shared.libraryCollections(libraryId: libraryId)
+            let resolved = response.resolvedSections
+            ResponseCache.shared.set(resolved, for: key)
+            sections = resolved
+        } catch let err {
+            if sections.isEmpty {
+                error = ErrorState(err)
+            }
+        }
+
+        isLoading = false
+        isRefreshing = false
+    }
+}
+
+struct LibraryCollectionsView: View {
+    let libraryId: Int
+    var mediaScope: LibraryVideoScope? = nil
+
+    @State private var viewModel = LibraryCollectionsViewModel()
+    @State private var uiCustomization = UICustomizationPreferences.shared
+    @State private var gridWidth: CGFloat = 0
+    @Environment(AppRouter.self) private var router
+    @Environment(\.horizontalSizeClass) private var hSize
+    @Environment(\.verticalSizeClass) private var vSize
+
+    private var columns: [GridItem] {
+        if let fit = widePhonePosterFit {
+            return fit.columns
+        }
+        if usesThreeColumnPhoneLayout {
+            return Array(
+                repeating: GridItem(.flexible(), spacing: 8),
+                count: 3
+            )
+        }
+        return AdaptiveColumns.posters(
+            for: hSize,
+            posterSize: uiCustomization.cardPresentation.posterSize
+        )
+    }
+
+    var body: some View {
+        // One scroll container for every state: an empty or failed Collections tab still leads
+        // with the page controls, so Recommended and Library stay one tap away.
+        LibraryPageScrollContainer(showsIndicators: false) {
+            if !viewModel.isEmpty {
+                VStack(alignment: .leading, spacing: SiloTheme.padding) {
+                    ForEach(viewModel.sections) { section in
+                        sectionView(section)
+                    }
+                }
+                // Only the sections are inset; the page controls above keep the page's margins.
+                .padding(.horizontal, SiloTheme.padding)
+                .padding(.bottom, SiloTheme.largePadding)
+            } else if let error = viewModel.error {
+                ErrorView(state: error, onRetry: { Task { await viewModel.loadCollections(libraryId: libraryId) } })
+                    .frame(maxWidth: .infinity, minHeight: 320)
+            } else if viewModel.isLoading {
+                Color.clear.frame(height: 0)
+            } else {
+                EmptyStateView(
+                    icon: "square.stack.3d.up.fill",
+                    title: "No collections yet",
+                    subtitle: "Create library collections in the web app to feature curated shelves here."
+                )
+                .frame(minHeight: 320)
+            }
+        }
+        .siloPageBackground()
+        .task(id: libraryId) {
+            await viewModel.loadCollections(libraryId: libraryId)
+        }
+        .refreshable {
+            await viewModel.loadCollections(libraryId: libraryId)
+        }
+    }
+
+    @ViewBuilder
+    private func sectionView(_ section: LibraryCollectionSection) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if !section.name.isEmpty {
+                Text(section.name)
+                    .font(.siloTitle)
+                    .foregroundColor(.siloOnSurface)
+            }
+            LazyVGrid(columns: columns, spacing: 16) {
+                ForEach(section.collections) { collection in
+                    // Through the router, not NavigationLink(value:), so the
+                    // router's record of pushed routes stays in step with the
+                    // stack: the Mac sidebar highlights from it, and closing
+                    // Requests screens reads it.
+                    Button {
+                        router.navigate(to: .libraryCollection(
+                            libraryId: libraryId,
+                            collectionId: collection.id,
+                            title: collection.name,
+                            kind: collection.kind,
+                            mediaScope: mediaScope
+                        ))
+                    } label: {
+                        LibraryCollectionCard(
+                            collection: collection,
+                            cardWidthOverride: libraryCollectionCardWidthOverride,
+                            showItemCount: mediaScope == nil
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(libraryCollectionAccessibilityLabel(collection, showItemCount: mediaScope == nil))
+                }
+            }
+            #if os(iOS)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.width
+            } action: { width in
+                guard abs(width - gridWidth) >= 0.5 else { return }
+                gridWidth = width
+            }
+            #endif
+        }
+    }
+
+    private var usesThreeColumnPhoneLayout: Bool {
+        #if os(iOS)
+        UIDevice.current.userInterfaceIdiom == .phone
+        #else
+        false
+        #endif
+    }
+
+    /// A phone window too wide for three-up cards (the iPhone Duo's inner
+    /// display) fills the row with more columns.
+    private var widePhonePosterFit: AdaptiveColumns.PosterGridFit? {
+        guard usesThreeColumnPhoneLayout else { return nil }
+        return AdaptiveColumns.widePhonePosterFit(
+            containerWidth: gridWidth,
+            posterSize: uiCustomization.cardPresentation.posterSize,
+            verticalSizeClass: vSize
+        )
+    }
+
+    private var libraryCollectionCardWidthOverride: CGFloat? {
+        if let fit = widePhonePosterFit { return fit.cardWidth }
+        guard usesThreeColumnPhoneLayout else { return nil }
+        return AdaptiveColumns.fittedPosterWidth(
+            containerWidth: gridWidth,
+            columnCount: 3,
+            spacing: 8
+        )
+    }
+}
+
+private struct LibraryCollectionCard: View {
+    let collection: LibraryCollection
+    let cardWidthOverride: CGFloat?
+    var showItemCount = true
+    @State private var uiCustomization = UICustomizationPreferences.shared
+
+    private var cardWidth: CGFloat {
+        cardWidthOverride
+            ?? (SiloTheme.posterCardWidth * uiCustomization.cardPresentation.posterSize.scale)
+    }
+    private var cardHeight: CGFloat {
+        cardWidth * (SiloTheme.posterCardHeight / SiloTheme.posterCardWidth)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ZStack(alignment: .bottomTrailing) {
+                poster
+
+                if showItemCount {
+                    Text(countLabel)
+                        .font(.siloSmall)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.black.opacity(0.65))
+                        .clipShape(Capsule())
+                        .padding(8)
+                }
+            }
+            .frame(width: cardWidth, height: cardHeight)
+            .clipShape(RoundedRectangle(cornerRadius: SiloTheme.smallCornerRadius))
+
+            if uiCustomization.cardPresentation.caption.showsTitle {
+                Text(collection.name)
+                    .font(.siloCaption)
+                    .foregroundStyle(Color.siloOnSurface)
+                    #if os(iOS)
+                    // One line, like the 2:3 cards in the other iOS grids.
+                    .lineLimit(1)
+                    #else
+                    .lineLimit(2, reservesSpace: true)
+                    #endif
+            }
+
+            if uiCustomization.cardPresentation.caption.showsMetadata {
+                Text(typeLabel)
+                    .font(.siloSmall)
+                    .foregroundStyle(Color.siloSecondaryText)
+                    .lineLimit(1)
+            }
+        }
+        .frame(width: cardWidth, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var poster: some View {
+        if let posterUrl = collection.posterUrl, !posterUrl.isEmpty {
+            AsyncImageView(
+                url: posterUrl,
+                thumbhash: collection.posterThumbhash,
+                targetSize: CGSize(width: cardWidth, height: cardHeight),
+                contentMode: .fill
+            )
+            .frame(width: cardWidth, height: cardHeight)
+        } else {
+            ZStack {
+                Color.siloSurfaceVariant
+                Image(systemName: "square.stack.3d.up.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundColor(.siloSecondaryText)
+            }
+            .frame(width: cardWidth, height: cardHeight)
+        }
+    }
+
+    private var countLabel: String {
+        if let itemCount = collection.itemCount {
+            return "\(itemCount)"
+        }
+        return "Smart"
+    }
+
+    private var typeLabel: String {
+        if collection.kind == .userCollections {
+            return "User collection"
+        }
+        return collection.collectionType?.capitalized ?? "Collection"
+    }
+}
+
+struct LibraryCollectionDetailView: View {
+    let libraryId: Int
+    let collectionId: String
+    let title: String?
+    let kind: LibraryCollectionKind?
+    var mediaScope: LibraryVideoScope? = nil
+
+    @State private var viewModel = LibraryCollectionDetailViewModel()
+    @State private var shuffleLauncher = ShuffleLauncher()
+    @Environment(AppRouter.self) private var router
+
+    private var shuffleKind: ShuffleScopeKind {
+        (kind ?? .regular).shuffleScopeKind
+    }
+
+    /// A shuffle scope has no media type, so a Movies or Series view of a
+    /// mixed library's collection would shuffle titles of both types.
+    private var offersShuffle: Bool {
+        mediaScope == nil && ShuffleFeatureStore.shared.supports(shuffleKind)
+    }
+
+    var body: some View {
+        Group {
+            if !viewModel.items.isEmpty {
+                content
+            } else if let error = viewModel.error {
+                ErrorView(state: error, onRetry: { Task { await loadItems(reset: true) } })
+            } else if viewModel.isLoading {
+                Color.clear
+            } else {
+                EmptyStateView(
+                    icon: "square.stack.3d.up.fill",
+                    title: "Collection is empty",
+                    subtitle: "This collection does not have any items yet."
+                )
+            }
+        }
+        .siloPageBackground()
+        // Collection items can live in other libraries, and a library-scoped
+        // item read 404s for those. Keep cards and play actions unscoped, like
+        // the web client.
+        .environment(\.browseLibraryId, nil)
+        .navigationTitle(title ?? "Collection")
+        .siloNavigationTitleDisplayMode(.large)
+        .task(id: "\(libraryId)-\(collectionId)-\(mediaScope?.rawValue ?? "all")-\(kind?.rawValue ?? "regular")") {
+            await loadItems(reset: true)
+        }
+        .shuffleFailureAlert(shuffleLauncher)
+        .refreshable {
+            await loadItems(reset: true)
+        }
+    }
+
+    private var content: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: SiloTheme.padding) {
+                HStack(spacing: SiloTheme.padding) {
+                    if offersShuffle {
+                        ShuffleButton(isStarting: shuffleLauncher.isStarting) {
+                            shuffleLauncher.start(ShuffleScopeRequest(kind: shuffleKind, id: collectionId), router: router)
+                        }
+                    }
+                    Text(countLabel)
+                        .font(.siloCaption)
+                        .foregroundColor(.siloSecondaryText)
+                }
+                #if os(tvOS)
+                // Up from any grid column reaches the Shuffle button.
+                .focusSection()
+                #endif
+
+                CatalogGrid(
+                    items: viewModel.items,
+                    isLoading: viewModel.isLoading,
+                    hasMore: viewModel.hasMore,
+                    forcesThreeColumnsOnPhone: true,
+                    onItemTap: { item in
+                        router.navigate(to: .itemDetail(browseItem: item))
+                    },
+                    onLoadMore: {
+                        Task { await loadMoreIfNeeded() }
+                    }
+                )
+            }
+            .padding(.horizontal, SiloTheme.padding)
+            .padding(.top, SiloTheme.smallPadding)
+            .padding(.bottom, SiloTheme.largePadding)
+        }
+    }
+
+    private var countLabel: String {
+        if let totalItems = viewModel.totalItems, !viewModel.hasMore {
+            return "\(totalItems) item\(totalItems == 1 ? "" : "s")"
+        }
+        let suffix = viewModel.hasMore ? "+" : ""
+        return "\(viewModel.items.count)\(suffix) item\(viewModel.items.count == 1 && !viewModel.hasMore ? "" : "s")"
+    }
+
+    private func loadMoreIfNeeded() async {
+        guard viewModel.hasMore, !viewModel.isLoading else { return }
+        await loadItems(reset: false)
+    }
+
+    private func loadItems(reset: Bool) async {
+        await viewModel.load(libraryId: libraryId, collectionId: collectionId,
+                             kind: kind ?? .regular, mediaScope: mediaScope, reset: reset)
+    }
+}

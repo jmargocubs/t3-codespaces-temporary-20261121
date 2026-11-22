@@ -1,0 +1,384 @@
+import SwiftUI
+
+/// Week navigator.
+///
+/// - iOS / macOS: prev/next chevrons around seven rich day cells (weekday,
+///   boxed number, event count), shown inside the pinned calendar card.
+/// - tvOS: focusable chevrons, seven day buttons and Today.
+struct CalendarWeekStrip: View {
+    let week: CalendarWeek
+    let selectedDay: Date
+    let isCurrentWeek: Bool
+    let hasEvents: (Date) -> Bool
+    /// Number of airings on a day — drives the per-cell count badge.
+    let eventCount: (Date) -> Int
+    let onSelectDay: (Date) -> Void
+    let onPreviousWeek: () -> Void
+    let onNextWeek: () -> Void
+    let onToday: () -> Void
+    /// tvOS: called when focus enters the strip from outside it.
+    var onFocusGained: (() -> Void)? = nil
+
+    #if os(tvOS)
+    @FocusState private var focusedControl: StripControl?
+    #endif
+
+    var body: some View {
+        #if os(tvOS)
+        tvBody
+        #else
+        phoneBody
+        #endif
+    }
+
+    // MARK: - iOS / macOS
+
+    #if !os(tvOS)
+    /// The week-cells row: seven full-width rich cells flanked by prev/next
+    /// chevrons. The month label, Today button and top-bar actions live in
+    /// the card chrome above this (assembled by `CalendarView`).
+    private var phoneBody: some View {
+        HStack(spacing: 6) {
+            phoneNavButton(systemImage: "chevron.left", action: onPreviousWeek)
+                .accessibilityLabel("Previous week")
+
+            HStack(spacing: 0) {
+                ForEach(week.days, id: \.self) { date in
+                    CalendarRichDayCell(
+                        date: date,
+                        isSelected: Calendar.current.isDate(date, inSameDayAs: selectedDay),
+                        isToday: Calendar.current.isDateInToday(date),
+                        eventCount: eventCount(date),
+                        action: { onSelectDay(date) }
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+            }
+
+            phoneNavButton(systemImage: "chevron.right", action: onNextWeek)
+                .accessibilityLabel("Next week")
+        }
+        .animation(SiloTheme.springAnimation, value: selectedDay)
+    }
+
+    private func phoneNavButton(
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.siloOnSurface.opacity(0.8))
+                .frame(width: 30, height: 30)
+                .background(Circle().fill(Color.white.opacity(0.07)))
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+        }
+        .buttonStyle(.siloFlat)
+    }
+    #endif
+
+    // MARK: - tvOS
+
+    #if os(tvOS)
+    private var tvBody: some View {
+        HStack(spacing: stripSpacing) {
+            chevronButton(systemImage: "chevron.left", control: .previous, action: onPreviousWeek)
+                .accessibilityLabel("Previous week")
+
+            HStack(spacing: dayButtonSpacing) {
+                ForEach(week.days, id: \.self) { date in
+                    CalendarDayButton(
+                        date: date,
+                        isSelected: Calendar.current.isDate(date, inSameDayAs: selectedDay),
+                        isToday: Calendar.current.isDateInToday(date),
+                        hasEvents: hasEvents(date),
+                        isFocused: isFocused(.day(date)),
+                        action: { onSelectDay(date) }
+                    )
+                    .applyStripFocus(self, control: .day(date))
+                }
+            }
+
+            chevronButton(systemImage: "chevron.right", control: .next, action: onNextWeek)
+                .accessibilityLabel("Next week")
+
+            if !isCurrentWeek {
+                Button("Today", action: onToday)
+                    .font(todayFont)
+                    .foregroundColor(isFocused(.today) ? .siloBackground : .siloOnSurface)
+                    .buttonStyle(.siloFlat)
+                    .padding(.horizontal, todayHorizontalPadding)
+                    .frame(height: chevronHeight)
+                    .background(
+                        Capsule().fill(
+                            isFocused(.today)
+                                ? Color.siloOnSurface.opacity(0.94)
+                                : Color.white.opacity(0.08)
+                        )
+                    )
+                    .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1))
+                    .applyStripFocus(self, control: .today)
+                    .accessibilityLabel("Jump to today")
+            }
+
+            Spacer(minLength: 0)
+
+            Text(week.monthLabel)
+                .font(monthFont)
+                .foregroundColor(.siloSecondaryText)
+        }
+        .padding(.horizontal, SiloTheme.safePadding)
+        .focusSection()
+        // Entering the strip from the filter bar or the first shelf lands
+        // on the selected day, not the day button nearest the old focus.
+        .defaultFocus($focusedControl, .day(selectedStripDay), priority: .userInitiated)
+        .animation(SiloTheme.springAnimation, value: isCurrentWeek)
+        .onChange(of: focusedControl) { oldControl, newControl in
+            if oldControl == nil, newControl != nil { onFocusGained?() }
+        }
+    }
+
+    /// The strip's day-button focus values are the exact `week.days` dates;
+    /// `selectedDay` is same-day but not guaranteed same-instant, so resolve
+    /// it back to the matching strip date for default focus.
+    private var selectedStripDay: Date {
+        week.days.first { Calendar.current.isDate($0, inSameDayAs: selectedDay) }
+            ?? week.days.first
+            ?? selectedDay
+    }
+
+    private func chevronButton(
+        systemImage: String,
+        control: StripControl,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(chevronFont)
+                .foregroundColor(
+                    isFocused(control) ? .siloBackground : .siloOnSurface.opacity(0.7)
+                )
+                .frame(width: chevronWidth, height: chevronHeight)
+                .background(
+                    Circle().fill(
+                        isFocused(control)
+                            ? Color.siloOnSurface.opacity(0.94)
+                            : Color.white.opacity(0.08)
+                    )
+                )
+        }
+        .buttonStyle(.siloFlat)
+        .applyStripFocus(self, control: control)
+    }
+
+    // MARK: - Focus plumbing
+
+    enum StripControl: Hashable {
+        case previous
+        case next
+        case today
+        case day(Date)
+    }
+
+    fileprivate func isFocused(_ control: StripControl) -> Bool {
+        return focusedControl == control
+    }
+
+    fileprivate var focusBinding: FocusState<StripControl?>.Binding { $focusedControl }
+
+    // MARK: - Metrics
+
+    private var stripSpacing: CGFloat { 18 }
+    private var dayButtonSpacing: CGFloat { 10 }
+    private var chevronFont: Font { .system(size: 24, weight: .semibold) }
+    private var chevronWidth: CGFloat { 64 }
+    private var chevronHeight: CGFloat { 64 }
+    private var todayFont: Font { .system(size: 22, weight: .semibold) }
+    private var todayHorizontalPadding: CGFloat { 24 }
+    private var monthFont: Font { .system(size: 24, weight: .semibold) }
+    #endif
+}
+
+#if os(tvOS)
+private extension View {
+    /// tvOS: bind a strip control to the shared `@FocusState`.
+    @ViewBuilder
+    func applyStripFocus(
+        _ strip: CalendarWeekStrip,
+        control: CalendarWeekStrip.StripControl
+    ) -> some View {
+        self.focused(strip.focusBinding, equals: control)
+    }
+}
+#endif
+
+// MARK: - iOS rich day cell
+
+#if !os(tvOS)
+/// Trakt-style day cell: weekday over a boxed day-number over an event-count
+/// badge. Selected fills the number box; today outlines it.
+private struct CalendarRichDayCell: View {
+    let date: Date
+    let isSelected: Bool
+    let isToday: Bool
+    let eventCount: Int
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Text(weekdayLabel)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.siloSecondaryText)
+
+                Text(dayNumber)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(isSelected ? .siloBackground : .siloOnSurface)
+                    .frame(width: 34, height: 34)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(isSelected ? Color.siloOnSurface : Color.clear)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(
+                                isToday && !isSelected
+                                    ? Color.siloOnSurface.opacity(0.45)
+                                    : Color.clear,
+                                lineWidth: 1.5
+                            )
+                    )
+
+                countIndicator
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.siloFlat)
+        .animation(.easeInOut(duration: 0.15), value: isSelected)
+        .accessibilityLabel(accessibilityDescription)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var countIndicator: some View {
+        if eventCount > 0 {
+            Text("\(eventCount)")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.siloOnSurface.opacity(0.85))
+                .padding(.horizontal, 6)
+                .frame(height: 16)
+                .background(Capsule().fill(Color.white.opacity(0.10)))
+        } else {
+            Color.clear.frame(height: 16)
+        }
+    }
+
+    private var weekdayLabel: String {
+        date.formatted(.dateTime.weekday(.abbreviated))
+    }
+
+    private var dayNumber: String {
+        date.formatted(.dateTime.day())
+    }
+
+    private var accessibilityDescription: String {
+        let base = date.formatted(.dateTime.weekday(.wide).month(.wide).day())
+        guard eventCount > 0 else { return base }
+        return base + ", \(eventCount) event\(eventCount == 1 ? "" : "s")"
+    }
+}
+#endif
+
+// MARK: - tvOS day button
+
+#if os(tvOS)
+private struct CalendarDayButton: View {
+    let date: Date
+    let isSelected: Bool
+    let isToday: Bool
+    let hasEvents: Bool
+    let isFocused: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: labelSpacing) {
+                Text(weekdayLabel)
+                    .font(weekdayFont)
+                    .foregroundColor(secondaryColor)
+
+                Text(dayNumber)
+                    .font(numberFont)
+                    .foregroundColor(primaryColor)
+
+                Circle()
+                    .fill(hasEvents ? dotColor : .clear)
+                    .frame(width: dotSize, height: dotSize)
+            }
+            .frame(width: buttonWidth, height: buttonHeight)
+            .background(
+                RoundedRectangle(cornerRadius: SiloTheme.cornerRadius, style: .continuous)
+                    .fill(backgroundFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: SiloTheme.cornerRadius, style: .continuous)
+                    .stroke(
+                        isToday && !isSelected && !isFocused
+                            ? Color.white.opacity(0.35)
+                            : .clear,
+                        lineWidth: 1
+                    )
+            )
+            .scaleEffect(isFocused ? 1.06 : 1.0)
+        }
+        .buttonStyle(.siloFlat)
+        .animation(SiloTheme.springAnimation, value: isFocused)
+        .animation(.easeInOut(duration: 0.15), value: isSelected)
+        .accessibilityLabel(accessibilityDescription)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var weekdayLabel: String {
+        date.formatted(.dateTime.weekday(.abbreviated))
+    }
+
+    private var dayNumber: String {
+        date.formatted(.dateTime.day())
+    }
+
+    private var accessibilityDescription: String {
+        date.formatted(.dateTime.weekday(.wide).month(.wide).day())
+            + (hasEvents ? ", has events" : "")
+    }
+
+    private var inverted: Bool { isSelected || isFocused }
+
+    private var primaryColor: Color {
+        inverted ? .siloBackground : .siloOnSurface
+    }
+
+    private var secondaryColor: Color {
+        inverted ? Color.siloBackground.opacity(0.7) : .siloSecondaryText
+    }
+
+    private var dotColor: Color {
+        inverted ? .siloBackground : .siloOnSurface.opacity(0.8)
+    }
+
+    private var backgroundFill: Color {
+        if isFocused { return Color.siloOnSurface.opacity(0.94) }
+        if isSelected { return Color.siloOnSurface.opacity(0.88) }
+        return Color.white.opacity(0.05)
+    }
+
+    // MARK: - Metrics
+
+    private var labelSpacing: CGFloat { 6 }
+    private var weekdayFont: Font { .system(size: 18, weight: .semibold) }
+    private var numberFont: Font { .system(size: 26, weight: .bold) }
+    private var dotSize: CGFloat { 8 }
+    private var buttonWidth: CGFloat { 84 }
+    private var buttonHeight: CGFloat { 96 }
+}
+#endif

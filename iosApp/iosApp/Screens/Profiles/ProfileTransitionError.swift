@@ -1,0 +1,43 @@
+import Foundation
+
+enum ProfileTransitionError: LocalizedError {
+    case noActiveAccount
+    case temporaryIdentityActive
+    case missingPINProof
+    /// The server checked the PIN and it did not match.
+    case incorrectPIN
+    /// The server locked the profile after repeated wrong PINs (429), for
+    /// `retryAfter` seconds when it said how long.
+    case pinLockedOut(retryAfter: TimeInterval?)
+    case noActiveServer
+    case identityChanged
+    case accountEpochUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .noActiveAccount:
+            return "Sign in before selecting a profile."
+        case .temporaryIdentityActive:
+            return "End remote playback before switching profiles."
+        case .missingPINProof:
+            return "\(AppBrand.name) couldn't verify that profile's PIN. Please try again."
+        case .incorrectPIN:
+            return "That PIN is incorrect. Try again."
+        case .pinLockedOut(let retryAfter):
+            // The header is server input: "inf" and "1e300" parse as numbers
+            // and would trap in the Int conversion. A day is far past any
+            // real lockout.
+            guard let retryAfter, retryAfter > 0, retryAfter <= 86_400 else {
+                return "Too many incorrect PINs. Try again later."
+            }
+            let minutes = Int((retryAfter / 60).rounded(.up))
+            return "Too many incorrect PINs. Try again in \(minutes) \(minutes == 1 ? "minute" : "minutes")."
+        case .noActiveServer:
+            return "Choose a server before selecting a profile."
+        case .identityChanged:
+            return "The active account changed while selecting the profile. Please try again."
+        case .accountEpochUnavailable:
+            return "\(AppBrand.name) couldn't securely remember this profile. Please try again."
+        }
+    }
+}

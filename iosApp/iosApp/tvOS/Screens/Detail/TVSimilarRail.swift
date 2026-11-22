@@ -1,0 +1,196 @@
+#if os(tvOS)
+import SwiftUI
+
+/// Horizontal poster rail of "More Like This" items used at the bottom
+/// of the tvOS Movie / Series detail pages. Mirrors `PhoneSimilarRail`
+/// — same single similar-cards request — but renders `TVMediaCard`
+/// posters at the 10-foot scale so cards focus-lift consistently with
+/// the rest of the detail body.
+///
+/// The rail self-loads on appear and silently hides if the request
+/// fails or returns nothing — recommendations are non-essential, so a
+/// missing rail is preferable to an error placeholder. The section
+/// header lives in here (not the parent) for the same reason: when
+/// recommendations are disabled or empty, an orphaned "More Like This"
+/// title must vanish along with the cards.
+struct TVSimilarRail: View {
+    let contentId: String
+    let title: String
+    let onSelect: (String) -> Void
+    var focusRequest = 0
+    var onFocusChange: ((Bool) -> Void)? = nil
+
+    @State private var items: [SimilarPosterItem] = []
+    @State private var isLoading = true
+    @State private var loadedFor: String? = nil
+    @State private var lastAppliedFocusRequest = 0
+    @State private var focusRequestedAt: ContinuousClock.Instant?
+    /// A request that waits for items longer than this is dropped: by then the
+    /// viewer has moved on, and focus must not jump to a late-loading rail.
+    private static let pendingFocusRequestLifetime: Duration = .seconds(1)
+    @FocusState private var focusedItemId: String?
+
+    private let cardWidth: CGFloat = 220
+    private let cardSpacing: CGFloat = 44
+    private let railVerticalPadding: CGFloat = 12
+    private let headerSpacing: CGFloat = TVDetailLayout.sectionHeaderSpacing
+
+    var body: some View {
+        Group {
+            if isLoading {
+                section { loadingPlaceholder }
+            } else if !items.isEmpty {
+                section { rail }
+            }
+        }
+        .task(id: contentId, priority: .background) { await load() }
+        .onChange(of: focusedItemId != nil) { _, focused in
+            onFocusChange?(focused)
+        }
+        .onChange(of: focusRequest, initial: true) { _, _ in
+            focusRequestedAt = .now
+            applyFocusRequestIfPossible()
+        }
+        .onChange(of: items) { _, _ in
+            applyFocusRequestIfPossible()
+        }
+    }
+
+    private func section(@ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: headerSpacing) {
+            TVSectionHeader(title: title)
+            content()
+        }
+    }
+
+    // MARK: - Rail
+
+    private var rail: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: cardSpacing) {
+                ForEach(items) { item in
+                    TVMediaCard(
+                        title: item.title,
+                        posterUrl: item.posterUrl ?? "",
+                        posterThumbhash: item.posterThumbhash,
+                        year: item.year,
+                        action: { onSelect(item.contentId) },
+                        cardWidth: cardWidth,
+                        focusTreatment: .ring,
+                        focusBinding: $focusedItemId,
+                        focusContentId: item.contentId
+                    )
+                }
+            }
+            .padding(.vertical, railVerticalPadding)
+        }
+        .focusSection()
+        // Land d-pad entry on the first card (like the cast/episode rails)
+        // instead of letting tvOS pick the geometrically-nearest middle card.
+        .tvDefaultFocus(items.first?.contentId, in: $focusedItemId)
+        .scrollClipDisabled()
+    }
+
+    // MARK: - Loading placeholder
+
+    private var loadingPlaceholder: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: cardSpacing) {
+                ForEach(0..<4, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: SiloTheme.cornerRadius)
+                        .fill(Color.siloSurfaceElevated)
+                        .frame(
+                            width: cardWidth,
+                            height: cardWidth * 1.5
+                        )
+                }
+            }
+            .padding(.vertical, railVerticalPadding)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func applyFocusRequestIfPossible() {
+        guard focusRequest > 0,
+              focusRequest != lastAppliedFocusRequest,
+              let firstContentId = items.first?.contentId else { return }
+        lastAppliedFocusRequest = focusRequest
+        if let focusRequestedAt,
+           ContinuousClock.now - focusRequestedAt > Self.pendingFocusRequestLifetime {
+            return
+        }
+        focusedItemId = firstContentId
+    }
+
+    // MARK: - Data loading
+
+    private func load() async {
+        guard loadedFor != contentId else { return }
+        let requestedContentId = contentId
+        loadedFor = requestedContentId
+        var completed = false
+        defer {
+            if !completed, loadedFor == requestedContentId {
+                loadedFor = nil
+            }
+        }
+        lastAppliedFocusRequest = 0
+        let cacheKey = CacheKey.similar(contentId)
+        let cached: [SimilarPosterItem]? = ResponseCache.shared.get(cacheKey)
+        if let cached {
+            items = cached
+            isLoading = false
+        } else {
+            items = []
+            isLoading = true
+        }
+
+        // This rail sits below the primary detail content. Give the hero,
+        // selected season, and their artwork a head start before spending
+        // bandwidth on recommendations that may never enter the viewport.
+        do {
+            try await Task.sleep(for: .milliseconds(cached == nil ? 900 : 1_500))
+        } catch {
+            return
+        }
+
+        do {
+            let cards = try await SiloAPI.shared.recommendationsSimilar(
+                contentId: contentId,
+                limit: 12
+            )
+            guard !Task.isCancelled else { return }
+            let refreshed = cards.map(SimilarPosterItem.init(card:))
+            items = refreshed
+            ResponseCache.shared.set(refreshed, for: cacheKey)
+        } catch {
+            guard !Task.isCancelled else { return }
+            if cached == nil { items = [] }
+        }
+        isLoading = false
+        completed = true
+    }
+}
+
+// MARK: - Card model
+
+/// View-side projection of a recommendation card containing only what
+/// the poster card needs. Decoupled so the card never re-renders when
+/// unrelated card fields change.
+struct SimilarPosterItem: Identifiable, Hashable {
+    let contentId: String
+    let title: String
+    let posterUrl: String?
+    let posterThumbhash: String?
+    let year: Int?
+    var id: String { contentId }
+
+    init(card: BrowseItem) {
+        self.contentId = card.contentId
+        self.title = card.title
+        self.posterUrl = card.posterUrl
+        self.posterThumbhash = card.posterThumbhash
+        self.year = card.year
+    }
+}
+#endif

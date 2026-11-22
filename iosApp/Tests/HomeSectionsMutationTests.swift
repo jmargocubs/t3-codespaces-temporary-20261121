@@ -1,0 +1,633 @@
+import Foundation
+import XCTest
+@testable import Silo
+
+final class HomeSectionsMutationTests: XCTestCase {
+    private enum TestError: Error {
+        case failed
+    }
+
+    func testRemovesItemOnlyFromContinueWatchingSections() throws {
+        let target = try makeItem(contentId: "target")
+        let other = try makeItem(contentId: "other")
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 2, items: [target, other]),
+            makeSection(id: "watchlist", type: "watchlist", totalCount: 1, items: [target]),
+        ]
+
+        let result = HomeSectionsMutation.removingDismissedItem(target, from: sections)
+
+        XCTAssertEqual(result[0].items.map(\.contentId), ["other"])
+        XCTAssertEqual(result[0].totalCount, 1)
+        XCTAssertEqual(result[1].items.map(\.contentId), ["target"])
+        XCTAssertEqual(result[1].totalCount, 1)
+    }
+
+    func testLegacyInProgressSectionUsesSameRemovalSemantics() throws {
+        let target = try makeItem(contentId: "target")
+        let section = makeSection(id: "progress", type: "in_progress", totalCount: 1, items: [target])
+
+        let result = HomeSectionsMutation.removingDismissedItem(target, from: [section])
+
+        XCTAssertTrue(result[0].items.isEmpty)
+        XCTAssertEqual(result[0].totalCount, 0)
+    }
+
+    func testTotalCountIsClampedAtZero() throws {
+        let target = try makeItem(contentId: "target")
+        let section = makeSection(id: "continue", type: "continue_watching", totalCount: 0, items: [target])
+
+        let result = HomeSectionsMutation.removingDismissedItem(target, from: [section])
+
+        XCTAssertEqual(result[0].totalCount, 0)
+    }
+
+    func testUnknownContentIdLeavesSectionUnchanged() throws {
+        let item = try makeItem(contentId: "other")
+        let section = makeSection(id: "continue", type: "continue_watching", totalCount: 1, items: [item])
+
+        let result = HomeSectionsMutation.removingDismissedItem(
+            try makeItem(contentId: "missing"),
+            from: [section]
+        )
+
+        XCTAssertEqual(result[0].items, section.items)
+        XCTAssertEqual(result[0].totalCount, section.totalCount)
+    }
+
+    func testCompletedItemIsRemovedFromPlaybackDrivenSections() throws {
+        let target = try makeItem(contentId: "target")
+        let other = try makeItem(contentId: "other")
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 2, items: [target, other]),
+            makeSection(id: "next", type: "next_up", totalCount: 1, items: [target]),
+            makeSection(id: "trending", type: "trending", totalCount: 1, items: [target]),
+        ]
+
+        let result = HomeSectionsMutation.removingCompletedItem(
+            contentId: target.contentId,
+            from: sections
+        )
+
+        XCTAssertEqual(result[0].items.map(\.contentId), ["other"])
+        XCTAssertEqual(result[0].totalCount, 1)
+        XCTAssertTrue(result[1].items.isEmpty)
+        XCTAssertEqual(result[1].totalCount, 0)
+        XCTAssertEqual(result[2].items.map(\.contentId), ["target"])
+        XCTAssertEqual(result[2].totalCount, 1)
+    }
+
+    @MainActor
+    func testSuccessfulDismissalUpdatesVisibleAndCachedSections() async throws {
+        let target = try makeItem(contentId: "target")
+        let other = try makeItem(contentId: "other")
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 2, items: [target, other]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        var receivedContentId: String?
+        var receivedProgressTimestamp: String?
+        let viewModel = HomeViewModel(
+            dismissContinueWatching: { contentId, progressUpdatedAt in
+                receivedContentId = contentId
+                receivedProgressTimestamp = progressUpdatedAt
+            },
+            // A reconciliation failure must not undo the committed local update.
+            fetchHomeSections: { throw TestError.failed }
+        )
+
+        await viewModel.dismissContinueWatchingItem(target)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertEqual(receivedContentId, "target")
+        XCTAssertEqual(receivedProgressTimestamp, target.progressUpdatedAt)
+        XCTAssertEqual(viewModel.sections[0].items.map(\.contentId), ["other"])
+        XCTAssertEqual(cached?.sections[0].items.map(\.contentId), ["other"])
+        XCTAssertNil(viewModel.actionError)
+    }
+
+    @MainActor
+    func testNextUpCardDismissesOnNextUpSurfaceAndClearsBothRows() async throws {
+        // A Next Up episode merged into Continue Watching has a series but no
+        // progress row. It must not be sent to the continue_watching surface
+        // with a fabricated timestamp, which the server would never match.
+        let target = try makeItem(contentId: "target", type: "episode", progressUpdatedAt: nil, seriesId: "series-1")
+        let other = try makeItem(contentId: "other")
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 2, items: [target, other]),
+            makeSection(id: "next", type: "next_up", totalCount: 1, items: [target]),
+            makeSection(id: "trending", type: "trending", totalCount: 1, items: [target]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        var continueWatchingCalls = 0
+        var receivedContentId: String?
+        var receivedSeriesId: String?
+        let viewModel = HomeViewModel(
+            dismissContinueWatching: { _, _ in
+                continueWatchingCalls += 1
+            },
+            dismissNextUp: { contentId, seriesId in
+                receivedContentId = contentId
+                receivedSeriesId = seriesId
+            },
+            fetchHomeSections: { throw TestError.failed }
+        )
+
+        await viewModel.dismissContinueWatchingItem(target)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertEqual(continueWatchingCalls, 0)
+        XCTAssertEqual(receivedContentId, "target")
+        XCTAssertEqual(receivedSeriesId, "series-1")
+        // The emptied Next Up row leaves Home rather than showing a bare header.
+        XCTAssertEqual(viewModel.sections.map(\.id), ["continue", "trending"])
+        XCTAssertEqual(viewModel.sections.map { $0.items.map(\.contentId) }, [["other"], ["target"]])
+        XCTAssertEqual(cached?.sections.map { $0.items.map(\.contentId) }, [["other"], [], ["target"]])
+        XCTAssertNil(viewModel.actionError)
+    }
+
+    @MainActor
+    func testEpisodeDismissalDropsTheWholeShowFromPlaybackRows() async throws {
+        // The server drops the whole show when one of its episodes is
+        // dismissed, so an older partial episode of it in Continue Watching
+        // must leave with the Next Up card instead of lingering until refresh.
+        let nextUp = try makeItem(contentId: "s1e2", type: "episode", progressUpdatedAt: nil, seriesId: "series-1")
+        let partial = try makeItem(contentId: "s1e5", type: "episode", seriesId: "series-1")
+        let otherShow = try makeItem(contentId: "s2e2", type: "episode", progressUpdatedAt: nil, seriesId: "series-2")
+        let movie = try makeItem(contentId: "movie")
+        let show = try makeItem(contentId: "series-1", type: "series", progressUpdatedAt: nil)
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 2, items: [partial, movie]),
+            makeSection(id: "next", type: "next_up", totalCount: 2, items: [nextUp, otherShow]),
+            makeSection(id: "trending", type: "trending", totalCount: 1, items: [show]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        var receivedSeriesId: String?
+        let viewModel = HomeViewModel(
+            dismissContinueWatching: { _, _ in XCTFail("unexpected continue_watching dismissal") },
+            dismissNextUp: { _, seriesId in receivedSeriesId = seriesId },
+            fetchHomeSections: { throw TestError.failed }
+        )
+
+        await viewModel.dismissContinueWatchingItem(nextUp)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        let expected = [["movie"], ["s2e2"], ["series-1"]]
+        XCTAssertEqual(receivedSeriesId, "series-1")
+        XCTAssertEqual(viewModel.sections.map { $0.items.map(\.contentId) }, expected)
+        XCTAssertEqual(viewModel.sections.map(\.totalCount), [1, 1, 1])
+        XCTAssertEqual(cached?.sections.map { $0.items.map(\.contentId) }, expected)
+    }
+
+    func testBookDismissalLeavesOtherBooksOfItsSeries() throws {
+        // Book series are not shows: the server dismisses one book at a time.
+        let target = try makeItem(contentId: "book-1", type: "audiobook", seriesId: "saga")
+        let sequel = try makeItem(contentId: "book-2", type: "audiobook", seriesId: "saga")
+        let section = makeSection(id: "continue", type: "continue_watching", totalCount: 2, items: [target, sequel])
+
+        let result = HomeSectionsMutation.removingDismissedItem(target, from: [section])
+
+        XCTAssertEqual(result[0].items.map(\.contentId), ["book-2"])
+    }
+
+    func testDismissalSurfaceFollowsTheCard() throws {
+        let inProgress = try makeItem(contentId: "s1e3", type: "episode", seriesId: "series-1")
+        let nextUp = try makeItem(contentId: "s1e4", type: "episode", progressUpdatedAt: nil, seriesId: "series-1")
+        // The network layer treats an empty stamp as absent; so does the menu.
+        let blankStamp = try makeItem(contentId: "s1e5", type: "episode", progressUpdatedAt: "", seriesId: "series-1")
+        let neither = try makeItem(contentId: "movie", progressUpdatedAt: nil)
+
+        XCTAssertEqual(HomeDismissal(inProgress), .continueWatching(progressUpdatedAt: "2026-07-10T12:00:00Z"))
+        XCTAssertEqual(HomeDismissal(nextUp), .nextUp(seriesId: "series-1"))
+        XCTAssertEqual(HomeDismissal(blankStamp), .nextUp(seriesId: "series-1"))
+        XCTAssertNil(HomeDismissal(neither))
+    }
+
+    @MainActor
+    func testDismissalReloadsHomeFromTheServer() async throws {
+        // The server refills Next Up after a show is dropped; Home shows the
+        // refilled row instead of staying one card short until a manual refresh.
+        let dismissed = try makeItem(contentId: "s1e2", type: "episode", progressUpdatedAt: nil, seriesId: "series-1")
+        let kept = try makeItem(contentId: "s2e2", type: "episode", progressUpdatedAt: nil, seriesId: "series-2")
+        let refill = try makeItem(contentId: "s3e2", type: "episode", progressUpdatedAt: nil, seriesId: "series-3")
+        let sections = [makeSection(id: "next", type: "next_up", totalCount: 2, items: [dismissed, kept])]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        let viewModel = HomeViewModel(
+            dismissNextUp: { _, _ in },
+            fetchHomeSections: {
+                SectionsResponse(sections: [
+                    self.makeSection(id: "next", type: "next_up", totalCount: 2, items: [kept, refill]),
+                ])
+            }
+        )
+
+        await viewModel.dismissContinueWatchingItem(dismissed)
+
+        XCTAssertEqual(viewModel.sections.map { $0.items.map(\.contentId) }, [["s2e2", "s3e2"]])
+    }
+
+    func testOnlyContinueWatchingAndNextUpRowsOfferDismissal() {
+        let offering = ["continue_watching", "in_progress", "next_up", "Next_Up"]
+        let notOffering = ["next_in_series", "trending_on_server", "recently_added", "watchlist"]
+
+        for type in offering {
+            XCTAssertTrue(makeSection(id: type, type: type, totalCount: 0, items: []).offersHomeDismissal, type)
+        }
+        for type in notOffering {
+            XCTAssertFalse(makeSection(id: type, type: type, totalCount: 0, items: []).offersHomeDismissal, type)
+        }
+    }
+
+    @MainActor
+    func testCardWithoutProgressOrSeriesIsLeftInPlace() async throws {
+        let target = try makeItem(contentId: "target", progressUpdatedAt: nil, seriesId: nil)
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 1, items: [target]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        let viewModel = HomeViewModel(
+            dismissContinueWatching: { _, _ in XCTFail("unexpected continue_watching dismissal") },
+            dismissNextUp: { _, _ in XCTFail("unexpected next_up dismissal") }
+        )
+
+        await viewModel.dismissContinueWatchingItem(target)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertEqual(viewModel.sections[0].items.map(\.contentId), ["target"])
+        XCTAssertEqual(cached?.sections[0].items.map(\.contentId), ["target"])
+        XCTAssertNil(viewModel.actionError)
+    }
+
+    @MainActor
+    func testFailedDismissalPreservesStateAndSurfacesError() async throws {
+        let target = try makeItem(contentId: "target")
+        let sections = [
+            makeSection(id: "continue", type: "continue_watching", totalCount: 1, items: [target]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        let viewModel = HomeViewModel(
+            dismissContinueWatching: { _, _ in
+                throw TestError.failed
+            }
+        )
+
+        await viewModel.dismissContinueWatchingItem(target)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertEqual(viewModel.sections[0].items.map(\.contentId), ["target"])
+        XCTAssertEqual(cached?.sections[0].items.map(\.contentId), ["target"])
+        XCTAssertNotNil(viewModel.actionError)
+        XCTAssertTrue(viewModel.isShowingActionError)
+    }
+
+    @MainActor
+    func testSuccessfulWatchedUpdateRemovesItemFromNextUpAndCache() async throws {
+        let target = try makeItem(contentId: "target")
+        let other = try makeItem(contentId: "other")
+        let sections = [
+            makeSection(id: "next", type: "next_up", totalCount: 2, items: [target, other]),
+            makeSection(id: "trending", type: "trending", totalCount: 1, items: [target]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        var receivedContentId: String?
+        var receivedPlayed: Bool?
+        let viewModel = HomeViewModel(
+            setWatched: { contentId, played in
+                receivedContentId = contentId
+                receivedPlayed = played
+            },
+            fetchHomeSections: {
+                // A reconciliation failure must not undo the committed local
+                // update or require a manual pull-to-refresh.
+                throw TestError.failed
+            }
+        )
+
+        let succeeded = await viewModel.setWatched(target, played: true)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(receivedContentId, "target")
+        XCTAssertEqual(receivedPlayed, true)
+        XCTAssertEqual(viewModel.sections[0].items.map(\.contentId), ["other"])
+        XCTAssertEqual(viewModel.sections[0].totalCount, 1)
+        XCTAssertEqual(viewModel.sections[1].items.map(\.contentId), ["target"])
+        XCTAssertEqual(cached?.sections[0].items.map(\.contentId), ["other"])
+        XCTAssertEqual(cached?.sections[0].totalCount, 1)
+        XCTAssertEqual(cached?.sections[1].items.map(\.contentId), ["target"])
+        XCTAssertNil(viewModel.actionError)
+    }
+
+    @MainActor
+    func testFailedWatchedUpdatePreservesStateAndSurfacesError() async throws {
+        let target = try makeItem(contentId: "target")
+        let sections = [
+            makeSection(id: "next", type: "next_up", totalCount: 1, items: [target]),
+        ]
+        ResponseCache.shared.set(SectionsResponse(sections: sections), for: CacheKey.homeSections)
+        defer { ResponseCache.shared.remove(CacheKey.homeSections) }
+
+        let viewModel = HomeViewModel(
+            setWatched: { _, _ in
+                throw TestError.failed
+            }
+        )
+
+        let succeeded = await viewModel.setWatched(target, played: true)
+
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertFalse(succeeded)
+        XCTAssertEqual(viewModel.sections[0].items.map(\.contentId), ["target"])
+        XCTAssertEqual(cached?.sections[0].items.map(\.contentId), ["target"])
+        XCTAssertNotNil(viewModel.actionError)
+        XCTAssertTrue(viewModel.isShowingActionError)
+    }
+
+    @MainActor
+    func testPlaybackWriteRefreshReloadsResumeAndSuccessorWithoutManualRefresh() async throws {
+        for (contentId, position) in [("episode-one", 450), ("episode-two", 30)] {
+            let oldItem = try makeItem(contentId: "episode-one")
+            let stale = SectionsResponse(sections: [makeSection(
+                id: "continue", type: "continue_watching", totalCount: 1, items: [oldItem]
+            )])
+            let updated = try JSONDecoder().decode(SectionItem.self, from: Data(
+                "{\"contentId\":\"\(contentId)\",\"type\":\"episode\",\"title\":\"Synthetic episode\",\"positionSeconds\":\(position),\"durationSeconds\":1200}".utf8
+            ))
+            let fresh = SectionsResponse(sections: [makeSection(
+                id: "continue", type: "continue_watching", totalCount: 1, items: [updated]
+            )])
+            ResponseCache.shared.set(stale, for: CacheKey.homeSections)
+            let model = HomeViewModel(fetchHomeSections: { fresh })
+            let refresh = StartupContentPrefetcher.homeRefreshAfterPlaybackWrite()
+            let received = expectation(description: "Home refresh after \(contentId) progress write")
+            let observer = NotificationCenter.default.addObserver(
+                forName: .homeSectionsShouldRefresh, object: nil, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated {
+                    let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+                    XCTAssertNil(cached, "Invalidate stale cache before notifying the visible Home view")
+                    Task { @MainActor in
+                        await model.loadSections()
+                        received.fulfill()
+                    }
+                }
+            }
+            defer {
+                NotificationCenter.default.removeObserver(observer)
+                ResponseCache.shared.remove(CacheKey.homeSections)
+            }
+            // Capturing the completion must not refresh before the write.
+            XCTAssertEqual(model.sections.first?.items.first?.contentId, "episode-one")
+            XCTAssertNotNil(ResponseCache.shared.get(CacheKey.homeSections, as: SectionsResponse.self))
+            refresh()
+            await fulfillment(of: [received], timeout: 2)
+            XCTAssertEqual(model.sections.first?.items.first?.contentId, contentId)
+            XCTAssertEqual(model.sections.first?.items.first?.positionSeconds, Double(position))
+        }
+    }
+
+    /// Marking a series unwatched on its detail page leaves Home mounted under
+    /// the pushed page. The change must reach that Home without a manual
+    /// refresh, and library grids must not repaint their old badges.
+    @MainActor
+    func testWatchedChangeRefreshesMountedHomeAndDropsLibraryGrids() async throws {
+        let stale = SectionsResponse(sections: [makeSection(
+            id: "continue", type: "continue_watching", totalCount: 1,
+            items: [try makeItem(contentId: "episode-s2e1", seriesId: "series-one")]
+        )])
+        let fresh = SectionsResponse(sections: [makeSection(
+            id: "continue", type: "continue_watching", totalCount: 1,
+            items: [try makeItem(contentId: "other-episode")]
+        )])
+        let browseKey = CacheKey.browse(libraryId: 9_001, filterKey: "home-refresh-test")
+        let gridKey = CacheKey.tvLibrary(libraryId: 9_001, filterKey: "home-refresh-test")
+        ResponseCache.shared.set(stale, for: CacheKey.homeSections)
+        ResponseCache.shared.set("stale-browse", for: browseKey)
+        ResponseCache.shared.set("stale-grid", for: gridKey)
+        let model = HomeViewModel(fetchHomeSections: { fresh })
+        XCTAssertEqual(model.sections.first?.items.first?.contentId, "episode-s2e1")
+
+        let refreshed = expectation(description: "mounted Home re-reads its rows")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .homeSectionsShouldRefresh, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                XCTAssertNil(ResponseCache.shared.get(CacheKey.homeSections, as: SectionsResponse.self),
+                             "Drop the stale rows before asking Home to re-read them")
+                Task { @MainActor in
+                    await model.loadSections()
+                    refreshed.fulfill()
+                }
+            }
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            ResponseCache.shared.remove(CacheKey.homeSections)
+            ResponseCache.shared.remove(browseKey)
+            ResponseCache.shared.remove(gridKey)
+        }
+
+        PersonalStateSync.invalidateItemState(contentId: "series-one")
+
+        await fulfillment(of: [refreshed], timeout: 2)
+        XCTAssertEqual(model.sections.first?.items.map(\.contentId), ["other-episode"])
+        XCTAssertNil(ResponseCache.shared.get(browseKey, as: String.self))
+        XCTAssertNil(ResponseCache.shared.get(gridKey, as: String.self))
+    }
+
+    /// A finished or stopped playback changes progress and possibly watched
+    /// state on library cards too, not only on Home.
+    @MainActor
+    func testPlaybackWriteRefreshAlsoDropsLibraryGrids() {
+        let browseKey = CacheKey.browse(libraryId: 9_002, filterKey: "playback-refresh-test")
+        ResponseCache.shared.set("stale-browse", for: browseKey)
+        defer { ResponseCache.shared.remove(browseKey) }
+        let refreshed = expectation(forNotification: .homeSectionsShouldRefresh, object: nil)
+
+        StartupContentPrefetcher.homeRefreshAfterPlaybackWrite()()
+
+        wait(for: [refreshed], timeout: 1)
+        XCTAssertNil(ResponseCache.shared.get(browseKey, as: String.self))
+    }
+
+    @MainActor
+    func testLatePlaybackWriteCannotInvalidateAnotherProfileHome() throws {
+        let refresh = StartupContentPrefetcher.homeRefreshAfterPlaybackWrite()
+        StartupContentPrefetcher.resetProfileScopedPrefetches()
+        let current = SectionsResponse(sections: [makeSection(
+            id: "new-profile", type: "continue_watching", totalCount: 1,
+            items: [try makeItem(contentId: "new-profile-item")]
+        )])
+        ResponseCache.shared.set(current, for: CacheKey.homeSections)
+        var notifications = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .homeSectionsShouldRefresh, object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { notifications += 1 } }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            ResponseCache.shared.remove(CacheKey.homeSections)
+        }
+        refresh()
+        XCTAssertEqual(notifications, 0)
+        let cached: SectionsResponse? = ResponseCache.shared.get(CacheKey.homeSections)
+        XCTAssertEqual(cached?.sections.first?.items.first?.contentId, "new-profile-item")
+    }
+
+    /// A Home load that fails while the app is in the background (cut off
+    /// when the app was suspended, or with no network while a push woke it)
+    /// leaves no error waiting for the person. Home keeps its placeholder
+    /// and loads again when the app returns.
+    @MainActor
+    func testLoadFailingInTheBackgroundShowsNoErrorAndRunsAgainOnReturn() async throws {
+        ResponseCache.shared.remove(CacheKey.homeSections)
+        let section = makeSection(id: "continue", type: "continue_watching", totalCount: 1,
+                                  items: [try makeItem(contentId: "target")])
+        let replies: [Result<SectionsResponse, Error>] = [
+            .failure(URLError(.networkConnectionLost)), .success(SectionsResponse(sections: [section])),
+        ]
+        var fetches = 0
+        let viewModel = HomeViewModel(fetchHomeSections: {
+            fetches += 1
+            return try replies[min(fetches, replies.count) - 1].get()
+        })
+        viewModel.isInBackground = true
+
+        await viewModel.loadSections()
+
+        XCTAssertNil(viewModel.error)
+        XCTAssertTrue(viewModel.isLoading)
+        XCTAssertEqual(fetches, 1)
+
+        viewModel.isInBackground = false
+        await viewModel.reloadIfInterrupted()
+
+        XCTAssertNil(viewModel.error)
+        XCTAssertFalse(viewModel.isLoading)
+        XCTAssertEqual(viewModel.sections.map(\.id), ["continue"])
+    }
+
+    /// Home stays mounted while the app is away, so returning to the app
+    /// retries a load that ended in an error, and leaves a Home that loaded
+    /// fine alone.
+    @MainActor
+    func testReturningToTheAppRetriesOnlyAFailedLoad() async throws {
+        ResponseCache.shared.remove(CacheKey.homeSections)
+        let section = makeSection(id: "continue", type: "continue_watching", totalCount: 1,
+                                  items: [try makeItem(contentId: "target")])
+        let replies: [Result<SectionsResponse, Error>] = [
+            .failure(APIv2Error.httpStatus(404)), .success(SectionsResponse(sections: [section])),
+        ]
+        var fetches = 0
+        let viewModel = HomeViewModel(fetchHomeSections: {
+            fetches += 1
+            return try replies[min(fetches, replies.count) - 1].get()
+        })
+        await viewModel.loadSections()
+        XCTAssertNotNil(viewModel.error)
+
+        await viewModel.reloadIfInterrupted()
+
+        XCTAssertNil(viewModel.error)
+        XCTAssertEqual(viewModel.sections.map(\.id), ["continue"])
+
+        await viewModel.reloadIfInterrupted()
+
+        XCTAssertEqual(fetches, 2)
+    }
+
+    /// A load still waiting when the app leaves may have had its request cut
+    /// off by suspension, with the failure delivered only after the app
+    /// returns. Returning replaces that load, and its late failure leaves no
+    /// error over the rows the new load brought.
+    @MainActor
+    func testReturningReplacesALoadCutOffInTheBackground() async throws {
+        ResponseCache.shared.remove(CacheKey.homeSections)
+        let section = makeSection(id: "continue", type: "continue_watching", totalCount: 1,
+                                  items: [try makeItem(contentId: "target")])
+        var fetches = 0
+        var cutOffRequest: CheckedContinuation<SectionsResponse, Error>?
+        var cutOffRequestStarted: CheckedContinuation<Void, Never>?
+        let viewModel = HomeViewModel(fetchHomeSections: {
+            fetches += 1
+            switch fetches {
+            case 1:
+                throw URLError(.networkConnectionLost)
+            case 2:
+                // The transient retry: held until the app has left and returned.
+                return try await withCheckedThrowingContinuation { continuation in
+                    cutOffRequest = continuation
+                    cutOffRequestStarted?.resume()
+                }
+            default:
+                return SectionsResponse(sections: [section])
+            }
+        })
+        let firstLoad = Task { await viewModel.loadSections() }
+        await withCheckedContinuation { cutOffRequestStarted = $0 }
+
+        viewModel.isInBackground = true
+        viewModel.isInBackground = false
+        await viewModel.reloadIfInterrupted()
+        cutOffRequest?.resume(throwing: URLError(.networkConnectionLost))
+        await firstLoad.value
+
+        XCTAssertEqual(fetches, 3)
+        XCTAssertNil(viewModel.error)
+        XCTAssertFalse(viewModel.isLoading)
+        XCTAssertEqual(viewModel.sections.map(\.id), ["continue"])
+    }
+
+    private func makeItem(
+        contentId: String,
+        type: String = "movie",
+        progressUpdatedAt: String? = "2026-07-10T12:00:00Z",
+        seriesId: String? = nil
+    ) throws -> SectionItem {
+        var fields: [String: Any] = [
+            "contentId": contentId,
+            "type": type,
+            "title": "Test Item",
+        ]
+        if let progressUpdatedAt {
+            fields["progressUpdatedAt"] = progressUpdatedAt
+        }
+        if let seriesId {
+            fields["seriesId"] = seriesId
+        }
+        let data = try JSONSerialization.data(withJSONObject: fields)
+        return try JSONDecoder().decode(SectionItem.self, from: data)
+    }
+
+    private func makeSection(
+        id: String,
+        type: String,
+        totalCount: Int?,
+        items: [SectionItem]
+    ) -> ResolvedSection {
+        ResolvedSection(
+            id: id,
+            sectionType: type,
+            title: id,
+            featured: false,
+            itemLimit: nil,
+            totalCount: totalCount,
+            isCustom: false,
+            customized: false,
+            items: items
+        )
+    }
+}

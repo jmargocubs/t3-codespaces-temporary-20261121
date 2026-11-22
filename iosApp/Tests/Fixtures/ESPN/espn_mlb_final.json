@@ -1,0 +1,221 @@
+{
+  "events": [
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "MLB.TV"
+              ]
+            },
+            {
+              "names": [
+                "Padres.TV"
+              ]
+            },
+            {
+              "names": [
+                "Reds.TV"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": null,
+              "homeAway": "home",
+              "id": "17",
+              "linescores": [
+                {
+                  "displayValue": "0",
+                  "period": 1,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "4",
+                  "period": 2,
+                  "value": 4.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 3,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 4,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 5,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "1",
+                  "period": 6,
+                  "value": 1.0
+                },
+                {
+                  "displayValue": "2",
+                  "period": 7,
+                  "value": 2.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 8,
+                  "value": 0.0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "67-73",
+                  "type": "total"
+                }
+              ],
+              "score": "7",
+              "team": {
+                "abbreviation": "CIN",
+                "color": "c6011f",
+                "displayName": "Cincinnati Reds",
+                "id": "17",
+                "location": "Cincinnati",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/cin.png",
+                "name": "Reds",
+                "shortDisplayName": "Reds"
+              }
+            },
+            {
+              "curatedRank": null,
+              "homeAway": "away",
+              "id": "25",
+              "linescores": [
+                {
+                  "displayValue": "2",
+                  "period": 1,
+                  "value": 2.0
+                },
+                {
+                  "displayValue": "1",
+                  "period": 2,
+                  "value": 1.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 3,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 4,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 5,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 6,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 7,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 8,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 9,
+                  "value": 0.0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "73-67",
+                  "type": "total"
+                }
+              ],
+              "score": "3",
+              "team": {
+                "abbreviation": "SD",
+                "color": "2f241d",
+                "displayName": "San Diego Padres",
+                "id": "25",
+                "location": "San Diego",
+                "logo": "https://a.espncdn.com/i/teamlogos/mlb/500/scoreboard/sd.png",
+                "name": "Padres",
+                "shortDisplayName": "Padres"
+              }
+            }
+          ],
+          "date": "2026-09-02T16:40Z",
+          "id": "401816775",
+          "notes": [],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 9,
+            "type": {
+              "completed": true,
+              "description": "Final",
+              "detail": "Final",
+              "id": "3",
+              "name": "STATUS_FINAL",
+              "shortDetail": "Final",
+              "state": "post"
+            }
+          },
+          "venue": {
+            "fullName": "Great American Ball Park"
+          }
+        }
+      ],
+      "date": "2026-09-02T16:40Z",
+      "id": "401816775",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2026
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 9,
+        "type": {
+          "completed": true,
+          "description": "Final",
+          "detail": "Final",
+          "id": "3",
+          "name": "STATUS_FINAL",
+          "shortDetail": "Final",
+          "state": "post"
+        }
+      },
+      "week": null
+    }
+  ],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "post",
+          "id": "3",
+          "name": "Postseason",
+          "type": 3
+        },
+        "year": 2026
+      }
+    }
+  ],
+  "week": null
+}

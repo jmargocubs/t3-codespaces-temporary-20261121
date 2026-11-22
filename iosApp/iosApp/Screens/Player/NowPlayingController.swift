@@ -1,0 +1,346 @@
+#if os(iOS)
+import Foundation
+import MediaPlayer
+import Nuke
+import OSLog
+import UIKit
+
+/// Bridges a SiloControl remote-media session into `MPNowPlayingInfoCenter` +
+/// the shared `MPRemoteCommandCenter`. Library video and audiobook playback
+/// use their Aether-scoped coordinators instead.
+///
+/// The owner supplies command handlers as closures via `attach(handlers:)`.
+///
+/// Single ownership: the SiloControl client owns one instance and attaches it
+/// only for the lifetime of a remote-media session.
+///
+/// Both centers are process-wide and may also be bound by a local audiobook
+/// or software-route video, so this controller claims them through
+/// `SharedNowPlayingArbiter` while attached, publishes only its own metadata
+/// and only while it is the newest claimant, and releases them through the
+/// arbiter on `detach()`.
+@MainActor
+final class NowPlayingController {
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.cubbiestream.kyro",
+        category: "NowPlaying"
+    )
+
+    /// Command handlers the view model supplies. All fire on the main queue
+    /// (the OS already dispatches remote commands there).
+    struct Handlers {
+        /// Called when the user presses Play on the lock screen / remote.
+        var play: () -> Void
+        /// Called when the user presses Pause.
+        var pause: () -> Void
+        /// True if currently paused. Used by togglePlayPause to decide
+        /// which verb to fire.
+        var isPaused: () -> Bool
+        /// Absolute playback time in seconds, used by skip commands to
+        /// compute the seek target.
+        var currentTime: () -> Double
+        /// Called with an absolute seek target in seconds.
+        var seek: (Double) -> Void
+        /// Called when the user presses Stop, when the system exposes it.
+        var stop: (() -> Void)?
+        /// Called when the user presses Next, when the active session has one.
+        var next: (() -> Void)?
+        /// True when `next` should be exposed as an enabled command.
+        var isNextEnabled: () -> Bool = { false }
+    }
+
+    private struct SkipIntervals {
+        var backward: TimeInterval
+        var forward: TimeInterval
+    }
+
+    private var handlers: Handlers?
+    private var isActive = false
+    private var remoteCommandTargets: [(command: MPRemoteCommand, target: Any)] = []
+    /// URL of the artwork most recently requested. Used to dedupe fetches
+    /// when `setArtworkURL` is called repeatedly with the same source while
+    /// a fetch is already in flight or has already published.
+    private var currentArtworkURL: URL?
+    private var artworkFetchTask: Task<Void, Never>?
+    private var preferredSkipIntervals = SkipIntervals(backward: 10, forward: 10)
+    /// This session's metadata. Published as a whole so fields another
+    /// owner left in the shared dictionary never leak into it, and kept so
+    /// the arbiter can ask for it to be republished.
+    private var nowPlayingInfo: [String: Any] = [:]
+
+    enum MediaKind {
+        case video
+        case audio
+
+        var nowPlayingValue: NSNumber {
+            switch self {
+            case .video:
+                NSNumber(value: MPNowPlayingInfoMediaType.video.rawValue)
+            case .audio:
+                NSNumber(value: MPNowPlayingInfoMediaType.audio.rawValue)
+            }
+        }
+    }
+
+    // MARK: - Lifecycle
+
+    /// Attach command handlers. Idempotent and safe to call more than once
+    /// when the remote-control session changes.
+    func attach(handlers: Handlers) {
+        self.handlers = handlers
+        if !isActive {
+            // Claiming suspends any local audiobook or software-route video
+            // on the shared centers, so lock-screen commands reach only the
+            // TV session whose metadata is shown.
+            SharedNowPlayingArbiter.shared.claim(
+                self,
+                suspend: { [weak self] in self?.unregisterRemoteCommands() },
+                restore: { [weak self] in self?.restoreSharedBinding() }
+            )
+            isActive = true
+            registerRemoteCommands()
+        } else {
+            updateCommandAvailability()
+        }
+    }
+
+    func detach() {
+        guard isActive else { return }
+        isActive = false
+        handlers = nil
+
+        artworkFetchTask?.cancel()
+        artworkFetchTask = nil
+        currentArtworkURL = nil
+
+        unregisterRemoteCommands()
+        nowPlayingInfo = [:]
+        SharedNowPlayingArbiter.shared.releaseSharedCenters(self)
+    }
+
+    /// Re-registers targets and republishes metadata once this session is
+    /// again the newest claimant. No-op unless attached.
+    private func restoreSharedBinding() {
+        guard isActive else { return }
+        unregisterRemoteCommands()
+        registerRemoteCommands()
+        publishNowPlayingInfo()
+    }
+
+    /// False while detached or suspended behind a newer claimant, whose
+    /// metadata and command state this session must not overwrite.
+    private var drivesSharedCenters: Bool {
+        isActive && SharedNowPlayingArbiter.shared.isCurrentClaimant(self)
+    }
+
+    func setPreferredSkipIntervals(backward: TimeInterval, forward: TimeInterval) {
+        preferredSkipIntervals = SkipIntervals(
+            backward: max(1, backward),
+            forward: max(1, forward)
+        )
+        guard drivesSharedCenters else { return }
+        let center = MPRemoteCommandCenter.shared()
+        center.skipForwardCommand.preferredIntervals = [NSNumber(value: preferredSkipIntervals.forward)]
+        center.skipBackwardCommand.preferredIntervals = [NSNumber(value: preferredSkipIntervals.backward)]
+    }
+
+    // MARK: - State updates
+
+    /// Refresh the Now Playing dictionary. Call on file-loaded, on
+    /// time-change (≤1 Hz — do not flood), and on pause change. `isPlaying`
+    /// feeds the playback-rate field which the OS uses to animate the
+    /// scrubber between time updates.
+    func update(
+        title: String,
+        duration: Double,
+        position: Double,
+        isPlaying: Bool,
+        mediaKind: MediaKind = .video,
+        artist: String? = nil,
+        albumTitle: String? = nil,
+        playbackRate: Double = 1.0
+    ) {
+        guard isActive else { return }
+        nowPlayingInfo[MPMediaItemPropertyTitle] = title
+        // Clear omitted fields so a previous remote item's values do not linger.
+        if let artist, !artist.isEmpty {
+            nowPlayingInfo[MPMediaItemPropertyArtist] = artist
+        } else {
+            nowPlayingInfo[MPMediaItemPropertyArtist] = nil
+        }
+        if let albumTitle, !albumTitle.isEmpty {
+            nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = albumTitle
+        } else {
+            nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = nil
+        }
+        if duration > 0 {
+            nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration
+        } else {
+            nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = nil
+        }
+        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? playbackRate : 0.0
+        nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = playbackRate
+        nowPlayingInfo[MPNowPlayingInfoPropertyMediaType] = mediaKind.nowPlayingValue
+        publishNowPlayingInfo()
+        updateCommandAvailability()
+    }
+
+    /// Fetch and publish poster artwork for the active item. Idempotent for
+    /// the same URL — repeated calls with an unchanged URL no-op rather than
+    /// re-fetching. Pass `nil` to clear the artwork field. The fetch goes
+    /// through the shared Nuke pipeline, so a poster already in its disk
+    /// cache is not downloaded again; failures are logged and leave the
+    /// existing artwork (if any) unchanged.
+    func setArtworkURL(_ url: URL?) {
+        guard isActive else { return }
+        if currentArtworkURL == url {
+            return
+        }
+        currentArtworkURL = url
+        artworkFetchTask?.cancel()
+        artworkFetchTask = nil
+        guard let url else {
+            applyArtwork(nil)
+            return
+        }
+        artworkFetchTask = Task { [weak self] in
+            await self?.fetchAndApplyArtwork(url: url)
+        }
+    }
+
+    private func fetchAndApplyArtwork(url: URL) async {
+        do {
+            let image = try await ImagePipeline.shared.image(
+                for: PosterImageCache.nowPlayingArtworkRequest(for: url)
+            )
+            try Task.checkCancellation()
+            guard isActive, currentArtworkURL == url else { return }
+            applyArtwork(image)
+        } catch is CancellationError {
+            return
+        } catch ImagePipeline.Error.cancelled {
+            return
+        } catch {
+            Self.logger.warning(
+                "Artwork fetch failed: \(String(describing: error), privacy: .private)"
+            )
+        }
+    }
+
+    private func applyArtwork(_ image: UIImage?) {
+        if let image {
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            nowPlayingInfo[MPMediaItemPropertyArtwork] = artwork
+        } else {
+            nowPlayingInfo[MPMediaItemPropertyArtwork] = nil
+        }
+        publishNowPlayingInfo()
+    }
+
+    private func publishNowPlayingInfo() {
+        guard drivesSharedCenters else { return }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo =
+            nowPlayingInfo.isEmpty ? nil : nowPlayingInfo
+    }
+
+    // MARK: - Remote commands
+
+    private func registerRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+
+        center.playCommand.isEnabled = true
+        addTarget(to: center.playCommand) { [weak self] _ in
+            self?.handlers?.play()
+            return .success
+        }
+
+        center.pauseCommand.isEnabled = true
+        addTarget(to: center.pauseCommand) { [weak self] _ in
+            self?.handlers?.pause()
+            return .success
+        }
+
+        center.togglePlayPauseCommand.isEnabled = true
+        addTarget(to: center.togglePlayPauseCommand) { [weak self] _ in
+            guard let h = self?.handlers else { return .commandFailed }
+            if h.isPaused() {
+                h.play()
+            } else {
+                h.pause()
+            }
+            return .success
+        }
+
+        center.skipForwardCommand.preferredIntervals = [NSNumber(value: preferredSkipIntervals.forward)]
+        center.skipForwardCommand.isEnabled = true
+        addTarget(to: center.skipForwardCommand) { [weak self] event in
+            guard let h = self?.handlers else { return .commandFailed }
+            let fallback = self?.preferredSkipIntervals.forward ?? 10
+            let skip = (event as? MPSkipIntervalCommandEvent)?.interval ?? fallback
+            h.seek(h.currentTime() + skip)
+            return .success
+        }
+
+        center.skipBackwardCommand.preferredIntervals = [NSNumber(value: preferredSkipIntervals.backward)]
+        center.skipBackwardCommand.isEnabled = true
+        addTarget(to: center.skipBackwardCommand) { [weak self] event in
+            guard let h = self?.handlers else { return .commandFailed }
+            let fallback = self?.preferredSkipIntervals.backward ?? 10
+            let skip = (event as? MPSkipIntervalCommandEvent)?.interval ?? fallback
+            h.seek(max(0, h.currentTime() - skip))
+            return .success
+        }
+
+        center.changePlaybackPositionCommand.isEnabled = true
+        addTarget(to: center.changePlaybackPositionCommand) { [weak self] event in
+            guard let h = self?.handlers,
+                  let positionEvent = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            h.seek(positionEvent.positionTime)
+            return .success
+        }
+
+        addTarget(to: center.stopCommand) { [weak self] _ in
+            guard let stop = self?.handlers?.stop else { return .noSuchContent }
+            stop()
+            return .success
+        }
+
+        addTarget(to: center.nextTrackCommand) { [weak self] _ in
+            guard let h = self?.handlers,
+                  h.isNextEnabled(),
+                  let next = h.next else {
+                return .noSuchContent
+            }
+            next()
+            return .success
+        }
+
+        updateCommandAvailability()
+    }
+
+    private func addTarget(
+        to command: MPRemoteCommand,
+        handler: @escaping (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus
+    ) {
+        let target = command.addTarget(handler: handler)
+        remoteCommandTargets.append((command, target))
+    }
+
+    private func unregisterRemoteCommands() {
+        for target in remoteCommandTargets {
+            target.command.removeTarget(target.target)
+        }
+        remoteCommandTargets.removeAll()
+    }
+
+    private func updateCommandAvailability() {
+        guard drivesSharedCenters else { return }
+        let center = MPRemoteCommandCenter.shared()
+        center.stopCommand.isEnabled = handlers?.stop != nil
+        center.nextTrackCommand.isEnabled = handlers.map { $0.next != nil && $0.isNextEnabled() } ?? false
+    }
+}
+#endif

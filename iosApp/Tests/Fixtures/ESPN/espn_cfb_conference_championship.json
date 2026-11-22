@@ -1,0 +1,178 @@
+{
+  "events": [
+    {
+      "competitions": [
+        {
+          "broadcasts": [
+            {
+              "names": [
+                "Fox"
+              ]
+            }
+          ],
+          "competitors": [
+            {
+              "curatedRank": {
+                "current": 1
+              },
+              "homeAway": "home",
+              "id": "194",
+              "linescores": [
+                {
+                  "displayValue": "7",
+                  "period": 1,
+                  "value": 7.0
+                },
+                {
+                  "displayValue": "3",
+                  "period": 2,
+                  "value": 3.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 3,
+                  "value": 0.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 4,
+                  "value": 0.0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "12-1",
+                  "type": "total"
+                }
+              ],
+              "score": "10",
+              "team": {
+                "abbreviation": "OSU",
+                "color": "ba0c2f",
+                "displayName": "Ohio State Buckeyes",
+                "id": "194",
+                "location": "Ohio State",
+                "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/194.png",
+                "name": "Buckeyes",
+                "shortDisplayName": "Ohio State"
+              }
+            },
+            {
+              "curatedRank": {
+                "current": 2
+              },
+              "homeAway": "away",
+              "id": "84",
+              "linescores": [
+                {
+                  "displayValue": "3",
+                  "period": 1,
+                  "value": 3.0
+                },
+                {
+                  "displayValue": "3",
+                  "period": 2,
+                  "value": 3.0
+                },
+                {
+                  "displayValue": "7",
+                  "period": 3,
+                  "value": 7.0
+                },
+                {
+                  "displayValue": "0",
+                  "period": 4,
+                  "value": 0.0
+                }
+              ],
+              "records": [
+                {
+                  "name": "overall",
+                  "summary": "13-0",
+                  "type": "total"
+                }
+              ],
+              "score": "13",
+              "team": {
+                "abbreviation": "IU",
+                "color": "970310",
+                "displayName": "Indiana Hoosiers",
+                "id": "84",
+                "location": "Indiana",
+                "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/84.png",
+                "name": "Hoosiers",
+                "shortDisplayName": "Indiana"
+              }
+            }
+          ],
+          "date": "2025-12-07T01:00Z",
+          "id": "401777353",
+          "notes": [
+            {
+              "headline": "Big Ten Championship"
+            }
+          ],
+          "situation": null,
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 4,
+            "type": {
+              "completed": true,
+              "description": "Final",
+              "detail": "Final",
+              "id": "3",
+              "name": "STATUS_FINAL",
+              "shortDetail": "Final",
+              "state": "post"
+            }
+          },
+          "venue": {
+            "fullName": "Lucas Oil Stadium"
+          }
+        }
+      ],
+      "date": "2025-12-07T01:00Z",
+      "id": "401777353",
+      "season": {
+        "slug": "regular-season",
+        "type": 2,
+        "year": 2025
+      },
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 4,
+        "type": {
+          "completed": true,
+          "description": "Final",
+          "detail": "Final",
+          "id": "3",
+          "name": "STATUS_FINAL",
+          "shortDetail": "Final",
+          "state": "post"
+        }
+      },
+      "week": {
+        "number": 15
+      }
+    }
+  ],
+  "leagues": [
+    {
+      "season": {
+        "type": {
+          "abbreviation": "post",
+          "id": "3",
+          "name": "Postseason",
+          "type": 3
+        },
+        "year": 2025
+      }
+    }
+  ],
+  "week": {
+    "number": 15
+  }
+}
